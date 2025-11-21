@@ -1,10 +1,12 @@
 'use client'
 
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import useAuth from '@/hooks/useAuth'
 
 export default function AuthPanel() {
   const { user, loading, signOut } = useAuth()
+  const router = useRouter()
 
   if (loading) return <div className="text-sm text-gray-700">Loading…</div>
 
@@ -19,11 +21,17 @@ export default function AuthPanel() {
     )
   }
 
+  const handleSignOut = async () => {
+    await signOut()
+    // Redirect to home page (which will show landing page for unauthenticated users)
+    router.push('/')
+  }
+
   return (
     <div className="flex items-center gap-3">
       <span className="text-sm text-black font-medium">{user.email}</span>
       <button
-        onClick={signOut}
+        onClick={handleSignOut}
         className="px-3 py-2 rounded-lg border-2 border-gray-300 hover:bg-gray-100 transition text-sm text-black font-medium"
       >
         Log out

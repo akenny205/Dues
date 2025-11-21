@@ -59,6 +59,7 @@ ALTER TABLE public."Session" ENABLE ROW LEVEL SECURITY;
 -- Drop existing policies if they exist
 DROP POLICY IF EXISTS "Users can read all sessions" ON public."Session";
 DROP POLICY IF EXISTS "Users can create sessions" ON public."Session";
+DROP POLICY IF EXISTS "Users can update sessions" ON public."Session";
 
 -- Policy: Allow authenticated users to read all sessions
 CREATE POLICY "Users can read all sessions"
@@ -74,6 +75,13 @@ FOR INSERT
 TO authenticated
 WITH CHECK (true);
 
+-- Policy: Allow authenticated users to update sessions
+CREATE POLICY "Users can update sessions"
+ON public."Session"
+FOR UPDATE
+TO authenticated
+USING (true);
+
 -- Enable RLS on SessionPayment table
 ALTER TABLE public."SessionPayment" ENABLE ROW LEVEL SECURITY;
 
@@ -81,6 +89,7 @@ ALTER TABLE public."SessionPayment" ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Users can read all payments" ON public."SessionPayment";
 DROP POLICY IF EXISTS "Users can create payments" ON public."SessionPayment";
 DROP POLICY IF EXISTS "Users can update own payments" ON public."SessionPayment";
+DROP POLICY IF EXISTS "Users can delete payments" ON public."SessionPayment";
 
 -- Policy: Allow authenticated users to read all session payments
 CREATE POLICY "Users can read all payments"
@@ -100,6 +109,13 @@ WITH CHECK (true);
 CREATE POLICY "Users can update own payments"
 ON public."SessionPayment"
 FOR UPDATE
+TO authenticated
+USING (true);
+
+-- Policy: Allow authenticated users to delete payments
+CREATE POLICY "Users can delete payments"
+ON public."SessionPayment"
+FOR DELETE
 TO authenticated
 USING (true);
 

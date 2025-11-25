@@ -2,7 +2,7 @@
   command = "npm run build"
   # Publish directory is handled by @netlify/plugin-nextjs
   # Setting to empty string to override UI setting
-  publish = ""
+  # publish = ""
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"

@@ -12,13 +12,34 @@ export default function useAuth() {
   useEffect(() => {
     let mounted = true
 
+    // Set a timeout to prevent infinite loading
+    const timeout = setTimeout(() => {
+      if (mounted) {
+        console.warn('Auth loading timeout - setting loading to false')
+        setLoading(false)
+      }
+    }, 10000) // 10 second timeout
+
     // Get initial session
-    supabase.auth.getSession().then(({ data }) => {
-      if (!mounted) return
-      setSession(data.session ?? null)
-      setUser(data.session?.user ?? null)
-      setLoading(false)
-    })
+    supabase.auth.getSession()
+      .then(({ data, error }) => {
+        if (!mounted) return
+        clearTimeout(timeout)
+        if (error) {
+          console.error('Error getting session:', error)
+          setLoading(false)
+          return
+        }
+        setSession(data.session ?? null)
+        setUser(data.session?.user ?? null)
+        setLoading(false)
+      })
+      .catch((error) => {
+        console.error('Error in getSession:', error)
+        if (!mounted) return
+        clearTimeout(timeout)
+        setLoading(false)
+      })
 
     // Listen for auth state changes (including OAuth callbacks and email verification)
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
@@ -35,6 +56,7 @@ export default function useAuth() {
 
     return () => {
       mounted = false
+      clearTimeout(timeout)
       subscription.unsubscribe()
     }
   }, [])

@@ -1590,6 +1590,23 @@ export default function GroupDetailPage() {
         .reduce((sum, d) => sum + d.amount, 0)
     : 0
 
+  // Calculate net balance for all members
+  // Positive = user is owed money, Negative = user owes money
+  const memberBalances = members.map(member => {
+    const balance = dues
+      .filter(d => d.user_id === member.user_id)
+      .reduce((sum, d) => sum + d.amount, 0)
+    return {
+      ...member,
+      balance
+    }
+  }).sort((a, b) => {
+    // Sort: current user first, then by balance (owed money first, then those who owe)
+    if (a.user_id === userId) return -1
+    if (b.user_id === userId) return 1
+    return b.balance - a.balance
+  })
+
   return (
     <main className="min-h-screen">
       <header className="border-b border-gray-300 bg-transparent">
@@ -1734,20 +1751,74 @@ export default function GroupDetailPage() {
             <div className="mb-6">
               <h2 className="text-2xl font-semibold mb-6 text-black">Dues</h2>
               
-              <div className="border-2 border-gray-300 rounded-lg p-8 bg-white">
-                <div className="text-center">
-                  <p className="text-sm text-gray-700 mb-2 font-medium">Your Net Balance</p>
-                  <p className={`text-4xl font-bold ${
-                    netBalance > 0 
-                      ? 'text-green-600' 
-                      : netBalance < 0 
-                      ? 'text-red-600' 
-                      : 'text-black'
-                  }`}>
-                    {netBalance >= 0 ? '+' : ''}${(netBalance / 100).toFixed(2)}
-                  </p>
+              {memberBalances.length === 0 ? (
+                <div className="border-2 border-gray-300 rounded-lg p-8 bg-white text-center">
+                  <p className="text-gray-700">No members in this group yet.</p>
                 </div>
-              </div>
+              ) : (
+                <div className="space-y-3">
+                  {memberBalances.map((member) => {
+                    const isCurrentUser = member.user_id === userId
+                    const balance = member.balance
+                    const displayName = formatDisplayName(members, member)
+                    
+                    return (
+                      <div
+                        key={member.user_id}
+                        className={`border-2 rounded-lg p-6 bg-white ${
+                          isCurrentUser
+                            ? 'border-black border-4'
+                            : 'border-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-3 mb-1">
+                              <p className={`font-semibold text-lg ${
+                                isCurrentUser ? 'text-black' : 'text-black'
+                              }`}>
+                                {displayName}
+                              </p>
+                              {isCurrentUser && (
+                                <span className="text-xs bg-black text-white px-2 py-1 rounded font-medium">
+                                  You
+                                </span>
+                              )}
+                              {member.role === 'owner' && (
+                                <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded font-medium">
+                                  Owner
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-sm text-gray-600">@{member.username}</p>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-sm text-gray-700 mb-1 font-medium">Net Balance</p>
+                            <p className={`text-3xl font-bold ${
+                              balance > 0 
+                                ? 'text-green-600' 
+                                : balance < 0 
+                                ? 'text-red-600' 
+                                : 'text-black'
+                            }`}>
+                              {balance >= 0 ? '+' : ''}${(balance / 100).toFixed(2)}
+                            </p>
+                            {balance > 0 && (
+                              <p className="text-xs text-green-600 mt-1">Owed money</p>
+                            )}
+                            {balance < 0 && (
+                              <p className="text-xs text-red-600 mt-1">Owes money</p>
+                            )}
+                            {balance === 0 && (
+                              <p className="text-xs text-gray-600 mt-1">Balanced</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
 

@@ -2,11 +2,13 @@
 
 ## Build Settings
 
-The `netlify.toml` file is already configured with the correct settings. In the Netlify dashboard, you can verify:
+The `netlify.toml` file is already configured with the correct settings. In the Netlify dashboard:
 
-- **Build command**: `npm run build`
-- **Publish directory**: `.next`
+- **Build command**: `npm run build` (set automatically from netlify.toml)
+- **Publish directory**: Leave this EMPTY or unset - the `@netlify/plugin-nextjs` plugin handles it automatically
 - **Node version**: `20` (automatically set by netlify.toml)
+
+⚠️ **IMPORTANT**: Do NOT set a publish directory in the Netlify dashboard. The Next.js plugin manages this automatically. If you see a publish directory setting, clear it or leave it blank.
 
 ## Required Environment Variables
 

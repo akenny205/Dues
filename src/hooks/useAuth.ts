@@ -22,7 +22,7 @@ export default function useAuth() {
 
     // Get initial session
     supabase.auth.getSession()
-      .then(({ data, error }) => {
+      .then(({ data, error }: any) => {
         if (!mounted) return
         clearTimeout(timeout)
         if (error) {
@@ -34,7 +34,7 @@ export default function useAuth() {
         setUser(data.session?.user ?? null)
         setLoading(false)
       })
-      .catch((error) => {
+      .catch((error: any) => {
         console.error('Error in getSession:', error)
         if (!mounted) return
         clearTimeout(timeout)
@@ -42,7 +42,7 @@ export default function useAuth() {
       })
 
     // Listen for auth state changes (including OAuth callbacks and email verification)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event: any, newSession: any) => {
       if (!mounted) return
       setSession(newSession)
       setUser(newSession?.user ?? null)

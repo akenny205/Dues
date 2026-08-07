@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
+import { ArrowRight } from 'lucide-react'
 import useAuth from '@/hooks/useAuth'
 import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
@@ -31,13 +32,16 @@ export default function InviteAcceptPage() {
 
   const loadInvite = async () => {
     try {
-      const { data, error: inviteError } = await supabase
-        .from('Invite')
-        .select('*, Group(*)')
-        .eq('token', token)
-        .single()
+      // Invite is locked down to members-only in RLS, and we aren't a member of
+      // its group yet — so this goes through a lookup function keyed on the
+      // token itself (the invite link is the secret) rather than a plain select.
+      const { data: rows, error: inviteError } = await supabase.rpc('find_invite_by_token', {
+        input_token: token,
+      })
 
       if (inviteError) throw inviteError
+
+      const data = rows?.[0]
 
       if (!data) {
         setError('Invite not found')
@@ -59,7 +63,14 @@ export default function InviteAcceptPage() {
         return
       }
 
-      setInvite(data)
+      setInvite({
+        id: data.id,
+        group_id: data.group_id,
+        email: data.email,
+        expires_at: data.expires_at,
+        accepted_at: data.accepted_at,
+        Group: { name: data.group_name },
+      })
     } catch (error: any) {
       console.error('Error loading invite:', error)
       setError(error.message || 'Failed to load invite')
@@ -85,15 +96,16 @@ export default function InviteAcceptPage() {
         return
       }
 
-      // Check if user is already a member
+      // Check if user is already an active member (a removed member keeps their
+      // row with status 'removed', so this has to check status specifically)
       const { data: existingMember } = await supabase
         .from('GroupMember')
-        .select('*')
+        .select('status')
         .eq('id', invite.group_id)
         .eq('user_id', dbUserId)
         .single()
 
-      if (existingMember) {
+      if (existingMember && existingMember.status !== 'removed') {
         setError('You are already a member of this group')
         setLoading(false)
         router.push(`/groups/${invite.group_id}`)
@@ -134,25 +146,21 @@ export default function InviteAcceptPage() {
 
   if (authLoading || loading) {
     return (
-      <main className="min-h-screen">
-        <div className="max-w-4xl mx-auto px-6 py-8">
-          <div className="text-center py-12">Loading...</div>
-        </div>
+      <main className="min-h-screen flex items-center justify-center">
+        <p className="eyebrow">Loading…</p>
       </main>
     )
   }
 
   if (error) {
     return (
-      <main className="min-h-screen">
-        <div className="max-w-4xl mx-auto px-6 py-8">
-          <div className="text-center py-12">
-            <h1 className="text-2xl font-semibold mb-4 text-black">Invite Error</h1>
-            <p className="text-gray-700 mb-6">{error}</p>
-            <Link href="/" className="text-black underline font-medium">
-              Go to Home
-            </Link>
-          </div>
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="card max-w-md w-full text-center">
+          <p className="eyebrow mb-2" style={{ color: 'var(--rust)' }}>Invite error</p>
+          <p className="mb-6" style={{ color: 'var(--ink-muted)' }}>{error}</p>
+          <Link href="/" className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--ledger)' }}>
+            Go to home <ArrowRight size={14} />
+          </Link>
         </div>
       </main>
     )
@@ -160,12 +168,11 @@ export default function InviteAcceptPage() {
 
   if (success) {
     return (
-      <main className="min-h-screen">
-        <div className="max-w-4xl mx-auto px-6 py-8">
-          <div className="text-center py-12">
-            <h1 className="text-2xl font-semibold mb-4 text-black">Success!</h1>
-            <p className="text-gray-700 mb-6">You've been added to the group. Redirecting...</p>
-          </div>
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="card max-w-md w-full text-center">
+          <p className="eyebrow mb-2" style={{ color: 'var(--emerald)' }}>Success</p>
+          <h1 className="font-display text-2xl font-semibold mb-2">You&apos;re in</h1>
+          <p style={{ color: 'var(--ink-muted)' }}>You&apos;ve been added to the group. Redirecting…</p>
         </div>
       </main>
     )
@@ -178,27 +185,22 @@ export default function InviteAcceptPage() {
   const group = invite.Group
 
   return (
-    <main className="min-h-screen">
-      <div className="max-w-4xl mx-auto px-6 py-8">
-        <div className="max-w-md mx-auto border-2 border-gray-300 rounded-lg p-6">
-          <h1 className="text-2xl font-semibold mb-4 text-black">Group Invitation</h1>
-          <p className="text-gray-700 mb-4">
-            You've been invited to join:
-          </p>
-          <div className="mb-6 p-4 bg-gray-50 rounded border-2 border-gray-300">
-            <h2 className="text-xl font-semibold text-black mb-2">{group?.name || 'Untitled Group'}</h2>
-            <p className="text-sm text-gray-600">Invited by: {invite.email}</p>
+    <main className="min-h-screen flex items-center justify-center px-6 py-16">
+      <div className="card max-w-md w-full">
+        <p className="eyebrow mb-2">Group invitation</p>
+        <h1 className="font-display text-2xl font-semibold mb-4">You&apos;ve been invited to join</h1>
+        <div className="ledger-row mb-6" style={{ paddingTop: 0 }}>
+          <div>
+            <h2 className="font-semibold text-lg">{group?.name || 'Untitled Group'}</h2>
+            <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Invited by {invite.email}</p>
           </div>
-          <button
-            onClick={handleAcceptInvite}
-            className="w-full px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-          >
-            Accept Invitation
-          </button>
-          <Link href="/" className="block text-center mt-4 text-gray-700 hover:text-black">
-            Cancel
-          </Link>
         </div>
+        <button onClick={handleAcceptInvite} className="btn-primary w-full">
+          Accept invitation
+        </button>
+        <Link href="/" className="block text-center mt-4 text-sm hover:underline" style={{ color: 'var(--ink-muted)' }}>
+          Cancel
+        </Link>
       </div>
     </main>
   )

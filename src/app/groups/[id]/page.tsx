@@ -3,7 +3,22 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
+import {
+  ArrowLeft,
+  ArrowRight,
+  ArrowRightLeft,
+  Check,
+  ClipboardList,
+  Hourglass,
+  Trash2,
+  TriangleAlert,
+  Undo2,
+  X,
+  XCircle,
+} from 'lucide-react'
+import ToastStack from '@/components/ToastStack'
 import useAuth from '@/hooks/useAuth'
+import useToast from '@/hooks/useToast'
 import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
 
@@ -20,6 +35,8 @@ interface Session {
   Description: string | null
   group_id: number | null
   created_at: string
+  created_by?: number | null
+  notes?: string | null
   is_live?: boolean | null
   is_payment?: boolean | null
   memberCount?: number
@@ -28,6 +45,7 @@ interface Session {
   pendingApproval?: boolean
   pendingRejection?: boolean
   waitingForApproval?: boolean // Editor is waiting for others to approve
+  pendingIsDeletion?: boolean // The in-flight approval (either direction above) is a deletion request, not an amount edit
 }
 
 interface Due {
@@ -46,6 +64,7 @@ interface GroupMember {
   user_id: number
   role: string | null
   created_at: string
+  status?: string | null
   email?: string
   username?: string
   first_name?: string
@@ -85,6 +104,7 @@ export default function GroupDetailPage() {
   const [loading, setLoading] = useState(true)
   const [userId, setUserId] = useState<number | null>(null)
   const [isOwner, setIsOwner] = useState(false)
+  const [pendingJoinRequests, setPendingJoinRequests] = useState<Array<{ id: number; user_id: number; displayName: string; username: string; created_at: string }>>([])
   const [showPin, setShowPin] = useState(false)
   const [activeTab, setActiveTab] = useState<'dues' | 'members' | 'sessions' | 'payments' | 'info'>('dues')
   const [paymentPayee, setPaymentPayee] = useState<number | null>(null)
@@ -101,14 +121,23 @@ export default function GroupDetailPage() {
   const [sessionDetails, setSessionDetails] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: number }>>([])
   const [selectedLiveSession, setSelectedLiveSession] = useState<number | null>(null)
   const [liveSessionAmount, setLiveSessionAmount] = useState('')
-  const [pendingApprovals, setPendingApprovals] = useState<Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string }>>([])
-  const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string }>>([])
-  const [showNotification, setShowNotification] = useState(false)
-  const [notificationMessage, setNotificationMessage] = useState('')
-  const [notificationType, setNotificationType] = useState<'approval' | 'rejection' | null>(null)
+  const [pendingApprovals, setPendingApprovals] = useState<Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string; is_deletion?: boolean }>>([])
+  const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean }>>([])
+  const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
+  const [pendingRejectionNotices, setPendingRejectionNotices] = useState<Array<{ id: number; session_id: number; session_description: string; rejected_by_name?: string; is_deletion?: boolean }>>([])
   const [originalPayments, setOriginalPayments] = useState<Array<{ user_id: number; amount: number }>>([])
   const [allSessionApprovals, setAllSessionApprovals] = useState<Array<{ user_id: number; old_amount: number; new_amount: number }>>([])
   const [editorUserId, setEditorUserId] = useState<number | null>(null)
+  const [confirmCancelSessionId, setConfirmCancelSessionId] = useState<number | null>(null)
+  const [confirmDeleteSessionId, setConfirmDeleteSessionId] = useState<number | null>(null)
+  const [confirmCancelEditSessionId, setConfirmCancelEditSessionId] = useState<number | null>(null)
+  const [confirmRemoveMemberId, setConfirmRemoveMemberId] = useState<number | null>(null)
+  const [editingNotesSessionId, setEditingNotesSessionId] = useState<number | null>(null)
+  const [notesDraft, setNotesDraft] = useState('')
+  const [savingNotes, setSavingNotes] = useState(false)
+  const [showCreateLiveSessionModal, setShowCreateLiveSessionModal] = useState(false)
+  const [liveSessionDescription, setLiveSessionDescription] = useState('')
+  const { toasts, showToast, dismiss } = useToast()
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -153,7 +182,7 @@ export default function GroupDetailPage() {
       }
     } catch (error) {
       console.error('Error loading group:', error)
-      alert('Group not found')
+      showToast('Group not found')
       router.push('/')
     }
   }, [groupId, router])
@@ -246,6 +275,64 @@ export default function GroupDetailPage() {
     }
   }, [userId, groupId])
 
+  // Only the owner ever gets rows back here — RLS scopes JoinRequest reads to
+  // the group's owner or the requester themselves (see add_join_requests.sql).
+  const loadJoinRequests = useCallback(async () => {
+    if (!groupId) return
+
+    try {
+      const { data: requestsData, error } = await supabase
+        .from('JoinRequest')
+        .select('id, user_id, created_at')
+        .eq('group_id', groupId)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: true })
+
+      if (error) throw error
+
+      const userIds = [...new Set((requestsData || []).map((r: any) => r.user_id))]
+      const userMap: Record<number, { username: string; first_name: string; last_name: string }> = {}
+
+      if (userIds.length > 0) {
+        const { data: usersData } = await supabase
+          .from('User')
+          .select('id, username, first_name, last_name')
+          .in('id', userIds)
+
+        if (usersData) {
+          usersData.forEach((u: any) => {
+            userMap[u.id] = {
+              username: u.username || 'Unknown',
+              first_name: u.first_name || '',
+              last_name: u.last_name || '',
+            }
+          })
+        }
+      }
+
+      const formatted = (requestsData || []).map((r: any) => {
+        const u = userMap[r.user_id]
+        const firstName = u?.first_name || u?.username || 'Unknown'
+        const capitalizedFirstName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase()
+        const displayName = u?.last_name
+          ? `${capitalizedFirstName} ${u.last_name.charAt(0).toUpperCase()}.`
+          : capitalizedFirstName
+
+        return {
+          id: r.id,
+          user_id: r.user_id,
+          displayName,
+          username: u?.username || 'Unknown',
+          created_at: r.created_at,
+        }
+      })
+
+      setPendingJoinRequests(formatted)
+    } catch (error) {
+      console.error('Error loading join requests:', error)
+    }
+  }, [groupId])
+
   const loadMembers = useCallback(async () => {
     if (!groupId) return
     
@@ -285,6 +372,7 @@ export default function GroupDetailPage() {
         user_id: member.user_id,
         role: member.role,
         created_at: member.created_at,
+        status: member.status || 'active', // falls back to active pre-migration, when the column doesn't exist yet
         email: userMap[member.user_id]?.email || 'Unknown',
         username: userMap[member.user_id]?.username || 'Unknown',
         first_name: userMap[member.user_id]?.first_name || '',
@@ -329,7 +417,7 @@ export default function GroupDetailPage() {
 
           const memberCount = paymentsData?.length || 0
           // Sum of absolute values of amounts
-          const totalAmount = (paymentsData || []).reduce((sum, payment: any) => {
+          const totalAmount = (paymentsData || []).reduce((sum: number, payment: any) => {
             return sum + Math.abs(parseFloat(payment.amount?.toString() || '0'))
           }, 0)
 
@@ -421,7 +509,8 @@ export default function GroupDetailPage() {
             ...session,
             pendingApproval: !!userApproval,
             pendingRejection: hasPendingRejection,
-            waitingForApproval: waitingForApproval
+            waitingForApproval: waitingForApproval,
+            pendingIsDeletion: !!userApproval?.is_deletion || !!editorPendingApprovals?.[0]?.is_deletion
           }
         })
       )
@@ -475,7 +564,8 @@ export default function GroupDetailPage() {
           editor_user_id: a.editor_user_id,
           old_amount: parseFloat(a.old_amount?.toString() || '0'),
           new_amount: parseFloat(a.new_amount?.toString() || '0'),
-          session_description: sessionMap[a.session_id] || 'Untitled Session'
+          session_description: sessionMap[a.session_id] || 'Untitled Session',
+          is_deletion: !!a.is_deletion
         }))
 
         setPendingApprovals(formattedApprovals)
@@ -576,37 +666,113 @@ export default function GroupDetailPage() {
             session_description: sessionMap[r.session_id] || 'Untitled Session',
             approver_name: approverName,
             approver_email: approver?.email || 'Unknown',
-            rejected_at: r.created_at || new Date().toISOString()
+            rejected_at: r.created_at || new Date().toISOString(),
+            is_deletion: !!r.is_deletion
           }
         })
 
         setPendingRejections(formattedRejections)
       }
 
-      // Determine notification type and message based on what notifications exist
-      const hasApprovals = formattedApprovals && formattedApprovals.length > 0
-      const hasRejections = formattedRejections && formattedRejections.length > 0
-      
-      if (hasApprovals && hasRejections) {
-        // Multiple types - show generic message
-        setShowNotification(true)
-        setNotificationMessage(`You have ${formattedApprovals.length} pending approval${formattedApprovals.length === 1 ? '' : 's'} and ${formattedRejections.length} rejected edit${formattedRejections.length === 1 ? '' : 's'}`)
-        setNotificationType(null) // Generic type
-      } else if (hasApprovals) {
-        // Only approvals - show specific message
-        setShowNotification(true)
-        setNotificationMessage(`You have ${formattedApprovals.length} pending session edit${formattedApprovals.length === 1 ? '' : 's'} to review`)
-        setNotificationType('approval')
-      } else if (hasRejections) {
-        // Only rejections - show specific message
-        setShowNotification(true)
-        setNotificationMessage(`Your session edit${formattedRejections.length === 1 ? ' was' : 's were'} rejected`)
-        setNotificationType('rejection')
-      } else {
-        // No notifications - hide if previously shown
-        setShowNotification(false)
-        setNotificationMessage('')
-        setNotificationType(null)
+      // Load cancellation notices: sessions where the current user already approved or
+      // rejected an edit, and the editor then cancelled the whole edit before it resolved.
+      const { data: cancellationsData } = await supabase
+        .from('SessionEditApproval')
+        .select(`
+          *,
+          Session!inner(id, Description, group_id)
+        `)
+        .eq('approver_user_id', userId)
+        .eq('status', 'cancelled')
+        .is('dismissed_at', null)
+
+      if (cancellationsData) {
+        const groupCancellations = cancellationsData.filter((c: any) =>
+          c.Session?.group_id === groupId
+        )
+
+        const formattedCancellations = groupCancellations.map((c: any) => ({
+          id: c.id,
+          session_id: c.session_id,
+          session_description: c.Session?.Description || 'Untitled Session',
+          old_amount: parseFloat(c.old_amount?.toString() || '0'),
+          new_amount: parseFloat(c.new_amount?.toString() || '0'),
+          is_deletion: !!c.is_deletion,
+        }))
+
+        setPendingCancellations(formattedCancellations)
+      }
+
+      // Load rejection notices where the current user was a co-approver (not the one
+      // who rejected) — one rejection voids the edit for everyone reviewing it, so
+      // everyone else gets told, separately from the editor's own dedicated notice.
+      const { data: rejectionNoticesData } = await supabase
+        .from('SessionEditApproval')
+        .select(`
+          *,
+          Session!inner(id, Description, group_id)
+        `)
+        .eq('approver_user_id', userId)
+        .eq('status', 'rejected_notice')
+        .is('dismissed_at', null)
+
+      if (rejectionNoticesData) {
+        const groupNotices = rejectionNoticesData.filter((n: any) =>
+          n.Session?.group_id === groupId
+        )
+
+        // Figure out who actually rejected each affected session, for display.
+        const sessionIds = [...new Set(groupNotices.map((n: any) => n.session_id))]
+        const { data: rejectorRows } = await supabase
+          .from('SessionEditApproval')
+          .select('session_id, approver_user_id')
+          .in('session_id', sessionIds.length ? sessionIds : [0])
+          .eq('status', 'rejected')
+
+        const rejectorBySession: Record<number, number> = {}
+        ;(rejectorRows || []).forEach((r: any) => {
+          rejectorBySession[r.session_id] = r.approver_user_id
+        })
+
+        const rejectorUserIds = [...new Set(Object.values(rejectorBySession))]
+        const { data: rejectorUsers } = await supabase
+          .from('User')
+          .select('id, username, first_name, last_name')
+          .in('id', rejectorUserIds.length ? rejectorUserIds : [0])
+
+        const rejectorMap: Record<number, { username: string; first_name?: string; last_name?: string }> = {}
+        if (rejectorUsers) {
+          rejectorUsers.forEach((u: any) => {
+            rejectorMap[u.id] = { username: u.username || 'Unknown', first_name: u.first_name || '', last_name: u.last_name || '' }
+          })
+        }
+
+        const formattedRejectionNotices = groupNotices.map((n: any) => {
+          const rejectorId = rejectorBySession[n.session_id]
+          const rejector = rejectorId ? rejectorMap[rejectorId] : undefined
+          let rejectedByName = 'a member'
+
+          if (rejector) {
+            if (rejector.first_name) {
+              const capitalizedFirstName = rejector.first_name.charAt(0).toUpperCase() + rejector.first_name.slice(1).toLowerCase()
+              rejectedByName = rejector.last_name
+                ? `${capitalizedFirstName} ${rejector.last_name.charAt(0).toUpperCase()}.`
+                : capitalizedFirstName
+            } else {
+              rejectedByName = rejector.username || 'a member'
+            }
+          }
+
+          return {
+            id: n.id,
+            session_id: n.session_id,
+            session_description: n.Session?.Description || 'Untitled Session',
+            rejected_by_name: rejectedByName,
+            is_deletion: !!n.is_deletion,
+          }
+        })
+
+        setPendingRejectionNotices(formattedRejectionNotices)
       }
     } catch (error) {
       console.error('Error loading pending approvals:', error)
@@ -678,7 +844,7 @@ export default function GroupDetailPage() {
         .eq('status', 'pending')
 
       if (existingApprovals && existingApprovals.length > 0) {
-        alert('This session has pending approvals. Please wait for all users to approve or reject the changes before editing again.')
+        showToast('This session has pending approvals. Please wait for all users to approve or reject the changes before editing again.')
         return
       }
 
@@ -724,18 +890,20 @@ export default function GroupDetailPage() {
       setShowAddSession(true)
     } catch (error: any) {
       console.error('Error loading session for edit:', error)
-      alert('Failed to load session: ' + (error.message || 'Unknown error'))
+      showToast('Failed to load session: ' + (error.message || 'Unknown error'))
     }
   }
 
   const handleAddMemberToSession = (memberId?: number) => {
-    // Find members not already in session
-    const availableMembers = members.filter(
+    // Find members not already in session (current members only — a removed
+    // member can't be added to a new/edited session going forward, though they
+    // stay visible on sessions they were already part of)
+    const availableMembers = activeMembers.filter(
       m => !sessionMembers.some(sm => sm.user_id === m.user_id)
     )
     
     if (availableMembers.length === 0) {
-      alert('All members are already added to the session')
+      showToast('All members are already added to the session')
       setShowMemberDropdown(false)
       return
     }
@@ -765,6 +933,98 @@ export default function GroupDetailPage() {
     setSessionMembers(sessionMembers.filter(sm => sm.user_id !== user_id))
   }
 
+  // The one primitive that actually attributes a payment to the database: set this
+  // person's amount on this session, update-if-exists-else-insert. A $0 amount means
+  // "no payment" and deletes the row instead, so no meaningless zero rows accumulate.
+  // Every session — a group split, a live-session contribution, or a 2-person
+  // settle-up payment — is written through this single function.
+  const upsertPayment = async (sessionId: number, userId: number, amount: number) => {
+    const { data: existing, error: fetchError } = await supabase
+      .from('SessionPayment')
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (fetchError) throw fetchError
+
+    if (Math.abs(amount) < 0.01) {
+      if (existing) {
+        const { error } = await supabase.from('SessionPayment').delete().eq('id', existing.id)
+        if (error) throw error
+      }
+      return
+    }
+
+    if (existing) {
+      const { error } = await supabase.from('SessionPayment').update({ amount }).eq('id', existing.id)
+      if (error) throw error
+    } else {
+      const { error } = await supabase.from('SessionPayment').insert([{ session_id: sessionId, user_id: userId, amount }])
+      if (error) throw error
+    }
+  }
+
+  // Makes a session's payments exactly match `entries` — for the cases where the
+  // caller knows the *complete* membership (creating a session, or editing one
+  // directly): removes anyone no longer present, then upserts everyone who is.
+  // Not used when the caller only knows a partial set (a live-session contribution,
+  // or applying just the changed rows from an approved edit) — those call
+  // upsertPayment directly so unrelated members' rows are left untouched.
+  const reconcileSession = async (sessionId: number, entries: Array<{ user_id: number; amount: number }>) => {
+    const { data: existingRows, error: fetchError } = await supabase
+      .from('SessionPayment')
+      .select('id, user_id')
+      .eq('session_id', sessionId)
+
+    if (fetchError) throw fetchError
+
+    const targetUserIds = new Set(entries.map(e => e.user_id))
+    const idsToDelete = (existingRows || [])
+      .filter((row: any) => !targetUserIds.has(row.user_id))
+      .map((row: any) => row.id)
+
+    if (idsToDelete.length > 0) {
+      const { error } = await supabase.from('SessionPayment').delete().in('id', idsToDelete)
+      if (error) throw error
+    }
+
+    for (const entry of entries) {
+      await upsertPayment(sessionId, entry.user_id, entry.amount)
+    }
+  }
+
+  // The actual removal, shared by the no-one-else-to-ask fast path in
+  // handleDeleteSession and the unanimous-approval path in handleApproveEdit.
+  const performSessionDeletion = async (sessionId: number) => {
+    const { error: approvalsError } = await supabase
+      .from('SessionEditApproval')
+      .delete()
+      .eq('session_id', sessionId)
+
+    if (approvalsError) throw approvalsError
+
+    const { error: paymentsError } = await supabase
+      .from('SessionPayment')
+      .delete()
+      .eq('session_id', sessionId)
+
+    if (paymentsError) throw paymentsError
+
+    const { error: sessionError } = await supabase
+      .from('Session')
+      .delete()
+      .eq('id', sessionId)
+
+    if (sessionError) throw sessionError
+
+    if (viewingSessionId === sessionId) setViewingSessionId(null)
+    if (editingSessionId === sessionId) {
+      setEditingSessionId(null)
+      setShowAddSession(false)
+    }
+  }
+
   const handleApproveEdit = async (approvalId: number, sessionId: number) => {
     try {
       // Update approval status to approved
@@ -783,7 +1043,7 @@ export default function GroupDetailPage() {
         .eq('status', 'pending')
 
       if (!allApprovals || allApprovals.length === 0) {
-        // All approvals are done, apply the changes
+        // All approvals are done — apply them
         const { data: approvedChanges } = await supabase
           .from('SessionEditApproval')
           .select('*')
@@ -791,50 +1051,23 @@ export default function GroupDetailPage() {
           .eq('status', 'approved')
 
         if (approvedChanges && approvedChanges.length > 0) {
-          // Get the editor's proposed changes
-          const editorId = approvedChanges[0].editor_user_id
-          
-          // Apply all approved changes
-          for (const change of approvedChanges) {
-            // Check if payment exists
-            const { data: existingPayment } = await supabase
-              .from('SessionPayment')
-              .select('id')
-              .eq('session_id', sessionId)
-              .eq('user_id', change.approver_user_id)
-              .maybeSingle()
+          if (approvedChanges[0].is_deletion) {
+            // Everyone approved deleting the session — remove it outright
+            // rather than applying the $0 amounts, then stop.
+            await performSessionDeletion(sessionId)
+            showToast('Everyone approved — session deleted.')
+            await loadSessions()
+            await loadDues()
+            await loadPendingApprovals()
+            return
+          }
 
-            if (existingPayment) {
-              // Update existing payment
-              await supabase
-                .from('SessionPayment')
-                .update({ amount: change.new_amount })
-                .eq('id', existingPayment.id)
-            } else if (change.new_amount !== 0) {
-              // Insert new payment if amount is not zero
-              await supabase
-                .from('SessionPayment')
-                .insert([{
-                  session_id: sessionId,
-                  user_id: change.approver_user_id,
-                  amount: change.new_amount
-                }])
-            } else {
-              // If new amount is 0, delete the payment if it exists
-              const { data: paymentToDelete } = await supabase
-                .from('SessionPayment')
-                .select('id')
-                .eq('session_id', sessionId)
-                .eq('user_id', change.approver_user_id)
-                .maybeSingle()
-              
-              if (paymentToDelete) {
-                await supabase
-                  .from('SessionPayment')
-                  .delete()
-                  .eq('id', paymentToDelete.id)
-              }
-            }
+          // Apply each approved change. Only the changed rows are known here (not
+          // the session's full membership), so this upserts each one directly
+          // rather than reconciling against the full set — anyone whose amount
+          // didn't change isn't touched.
+          for (const change of approvedChanges) {
+            await upsertPayment(sessionId, change.approver_user_id, change.new_amount)
           }
 
           // Delete all approval records for this session
@@ -843,10 +1076,10 @@ export default function GroupDetailPage() {
             .delete()
             .eq('session_id', sessionId)
 
-          alert('All changes have been approved and applied!')
+          showToast('All changes have been approved and applied!')
         }
       } else {
-        alert('Your approval has been recorded. Waiting for other users to approve.')
+        showToast('Your approval has been recorded. Waiting for other users to approve.')
       }
 
       await loadSessions()
@@ -854,26 +1087,60 @@ export default function GroupDetailPage() {
       await loadPendingApprovals()
     } catch (error: any) {
       console.error('Error approving edit:', error)
-      alert('Failed to approve edit: ' + (error.message || 'Unknown error'))
+      showToast('Failed to approve edit: ' + (error.message || 'Unknown error'))
     }
   }
 
   const handleRejectEdit = async (approvalId: number, sessionId: number, editorUserId: number) => {
     try {
       // Update approval status to rejected
-      const { error: updateError } = await supabase
+      const { data: rejectedRow, error: updateError } = await supabase
         .from('SessionEditApproval')
         .update({ status: 'rejected' })
         .eq('id', approvalId)
+        .select('is_deletion')
+        .single()
 
       if (updateError) throw updateError
 
-      // Delete all other pending approvals for this session (since one rejection cancels the edit)
+      const isDeletion = !!rejectedRow?.is_deletion
+
+      // One rejection voids the edit for everyone — that's intended. But instead of
+      // silently deleting every other approver's record (pending or already-approved),
+      // mark them 'rejected_notice' so each of them gets told the edit they were
+      // reviewing was rejected (see loadPendingApprovals / pendingRejectionNotices).
+      // The editor gets a separate, dedicated notice below instead, so their own
+      // auto-approved record is excluded here and cleaned up afterward.
+      const { data: otherApproverRows, error: otherRowsError } = await supabase
+        .from('SessionEditApproval')
+        .select('id, approver_user_id')
+        .eq('session_id', sessionId)
+        .in('status', ['pending', 'approved'])
+        .neq('id', approvalId)
+
+      if (otherRowsError) throw otherRowsError
+
+      const idsToNotify = (otherApproverRows || [])
+        .filter((row: any) => row.approver_user_id !== editorUserId)
+        .map((row: any) => row.id)
+
+      if (idsToNotify.length > 0) {
+        const { error: notifyOthersError } = await supabase
+          .from('SessionEditApproval')
+          .update({ status: 'rejected_notice' })
+          .in('id', idsToNotify)
+
+        if (notifyOthersError) throw notifyOthersError
+      }
+
+      // Clean up the editor's own leftover record(s) — no longer needed now that
+      // they get their own notice via the insert-if-not-exists check below.
       await supabase
         .from('SessionEditApproval')
         .delete()
         .eq('session_id', sessionId)
-        .eq('status', 'pending')
+        .eq('approver_user_id', editorUserId)
+        .neq('id', approvalId)
 
       // Create a rejection notification for the editor
       // Check if a rejection notification already exists to avoid duplicates
@@ -895,7 +1162,8 @@ export default function GroupDetailPage() {
             approver_user_id: userId,
             status: 'rejected',
             old_amount: 0,
-            new_amount: 0
+            new_amount: 0,
+            is_deletion: isDeletion
           }])
           .select()
           .single()
@@ -926,66 +1194,116 @@ export default function GroupDetailPage() {
         console.log('Rejection notification already exists:', existingRejection)
       }
 
-      alert('Edit rejected. The editor has been notified.')
-      
+      showToast(
+        isDeletion
+          ? 'Deletion rejected — the session was kept as-is. Everyone who was reviewing it has been notified.'
+          : 'Edit rejected. The editor and everyone else reviewing it have been notified.'
+      )
+
       // Reload everything to show the rejection
       await loadSessions()
       await loadDues()
       await loadPendingApprovals()
     } catch (error: any) {
       console.error('Error rejecting edit:', error)
-      alert('Failed to reject edit: ' + (error.message || 'Unknown error'))
+      showToast('Failed to reject edit: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Editor cancels their own pending edit. The session keeps its pre-edit amounts.
+  // Approvers who hadn't acted yet are simply cleared (nothing to notify). Approvers
+  // who had already approved or rejected are marked 'cancelled' instead of deleted, so
+  // they can be notified their review was voided (surfaced in the Dues tab's Pending
+  // Actions area — see loadPendingApprovals / pendingCancellations).
+  const handleCancelEdit = async (sessionId: number) => {
+    if (!userId) return
+
+    try {
+      const { data: rows, error: fetchError } = await supabase
+        .from('SessionEditApproval')
+        .select('*')
+        .eq('session_id', sessionId)
+        .eq('editor_user_id', userId)
+        .is('dismissed_at', null)
+
+      if (fetchError) throw fetchError
+
+      const toDelete: number[] = []
+      const toCancel: number[] = []
+
+      ;(rows || []).forEach((row: any) => {
+        if (row.approver_user_id === userId) {
+          // The editor's own auto-approved record — nothing to notify themselves about.
+          toDelete.push(row.id)
+        } else if (row.status === 'pending') {
+          // They hadn't acted yet — just clear it, nothing was decided.
+          toDelete.push(row.id)
+        } else {
+          // They already approved or rejected — let them know it was voided.
+          toCancel.push(row.id)
+        }
+      })
+
+      if (toDelete.length > 0) {
+        const { error } = await supabase.from('SessionEditApproval').delete().in('id', toDelete)
+        if (error) throw error
+      }
+
+      if (toCancel.length > 0) {
+        const { error } = await supabase
+          .from('SessionEditApproval')
+          .update({ status: 'cancelled' })
+          .in('id', toCancel)
+        if (error) throw error
+      }
+
+      setConfirmCancelEditSessionId(null)
+      if (viewingSessionId === sessionId) setViewingSessionId(null)
+      await loadSessions()
+      await loadPendingApprovals()
+    } catch (error: any) {
+      console.error('Error cancelling edit:', error)
+      showToast('Failed to cancel edit: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Approver acknowledges that their review of an edit was voided by the editor cancelling it.
+  const handleDismissCancellation = async (id: number) => {
+    try {
+      const { error } = await supabase
+        .from('SessionEditApproval')
+        .update({ dismissed_at: new Date().toISOString() })
+        .eq('id', id)
+
+      if (error) throw error
+      setPendingCancellations(prev => prev.filter(c => c.id !== id))
+    } catch (error: any) {
+      console.error('Error dismissing cancellation notice:', error)
+      showToast('Failed to dismiss notice: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Co-approver acknowledges that an edit they were reviewing was rejected by someone else.
+  const handleDismissRejectionNotice = async (id: number) => {
+    try {
+      const { error } = await supabase
+        .from('SessionEditApproval')
+        .update({ dismissed_at: new Date().toISOString() })
+        .eq('id', id)
+
+      if (error) throw error
+      setPendingRejectionNotices(prev => prev.filter(n => n.id !== id))
+    } catch (error: any) {
+      console.error('Error dismissing rejection notice:', error)
+      showToast('Failed to dismiss notice: ' + (error.message || 'Unknown error'))
     }
   }
 
   // Helper function to update session payments
+  // Thin wrapper: the session-edit form always knows the complete membership, so
+  // reconcile against it directly.
   const updateSessionPayments = async (sessionId: number) => {
-    // Get existing payments
-    const { data: existingPayments } = await supabase
-      .from('SessionPayment')
-      .select('id, user_id')
-      .eq('session_id', sessionId)
-
-    // Delete payments that are no longer in the form
-    const currentUserIds = new Set(sessionMembers.map(sm => sm.user_id))
-    const paymentsToDelete = (existingPayments || []).filter(
-      (ep: any) => !currentUserIds.has(ep.user_id)
-    )
-
-    if (paymentsToDelete.length > 0) {
-      const { error: deleteError } = await supabase
-        .from('SessionPayment')
-        .delete()
-        .in('id', paymentsToDelete.map((p: any) => p.id))
-
-      if (deleteError) throw deleteError
-    }
-
-    // Update or insert payments
-    for (const sm of sessionMembers) {
-      const existingPayment = (existingPayments || []).find((ep: any) => ep.user_id === sm.user_id)
-      
-      if (existingPayment) {
-        // Update existing payment
-        const { error: updateError } = await supabase
-          .from('SessionPayment')
-          .update({ amount: parseFloat(sm.amount) })
-          .eq('id', existingPayment.id)
-
-        if (updateError) throw updateError
-      } else {
-        // Insert new payment
-        const { error: insertError } = await supabase
-          .from('SessionPayment')
-          .insert([{
-            session_id: sessionId,
-            user_id: sm.user_id,
-            amount: parseFloat(sm.amount)
-          }])
-
-        if (insertError) throw insertError
-      }
-    }
+    await reconcileSession(sessionId, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
   }
 
   const handleCreateSession = async (e: React.FormEvent) => {
@@ -995,7 +1313,7 @@ export default function GroupDetailPage() {
     // Validate all amounts are filled
     const invalidMembers = sessionMembers.filter(sm => !sm.amount || isNaN(parseFloat(sm.amount)))
     if (invalidMembers.length > 0) {
-      alert('Please enter valid amounts for all members')
+      showToast('Please enter valid amounts for all members')
       return
     }
 
@@ -1006,23 +1324,17 @@ export default function GroupDetailPage() {
 
     // Enforce that sum equals 0
     if (Math.abs(total) > 0.01) { // Allow small floating point differences
-      alert(`The sum of all amounts must equal 0. Current sum: ${total.toFixed(2)}`)
+      showToast(`The sum of all amounts must equal 0. Current sum: ${total.toFixed(2)}`)
       return
     }
 
     try {
       if (editingSessionId) {
-        // Check if session is closed (not live)
-        const { data: sessionData } = await supabase
-          .from('Session')
-          .select('is_live')
-          .eq('id', editingSessionId)
-          .single()
-
-        const isClosedSession = !sessionData?.is_live
-
-        if (isClosedSession) {
-          // For closed sessions, track changes and create approval records
+        // The Edit action is only ever reachable for closed sessions (the UI hides it
+        // for live ones — those are edited via the live-session panel instead), so an
+        // edit here always goes through the approval flow: track changes and create
+        // approval records.
+        {
           const changedUsers: Array<{ user_id: number; old_amount: number; new_amount: number }> = []
           
           // Compare new amounts with original amounts
@@ -1041,7 +1353,10 @@ export default function GroupDetailPage() {
             }
           }
 
-          // Also check for removed users (users in original but not in new)
+          // Also check for removed users (users in original but not in new) — members
+          // added to the session are already caught by the loop above, since a missing
+          // originalPayment is treated as old_amount 0; a second pass here would double
+          // them up into two separate approval records for the same person.
           for (const op of originalPayments) {
             const stillInSession = sessionMembers.some(sm => sm.user_id === op.user_id)
             if (!stillInSession) {
@@ -1049,18 +1364,6 @@ export default function GroupDetailPage() {
                 user_id: op.user_id,
                 old_amount: op.amount,
                 new_amount: 0
-              })
-            }
-          }
-
-          // Also check for added users (users in new but not in original)
-          for (const sm of sessionMembers) {
-            const wasInOriginal = originalPayments.some(op => op.user_id === sm.user_id)
-            if (!wasInOriginal) {
-              changedUsers.push({
-                user_id: sm.user_id,
-                old_amount: 0,
-                new_amount: parseFloat(sm.amount || '0')
               })
             }
           }
@@ -1150,26 +1453,22 @@ export default function GroupDetailPage() {
 
               if (usersToNotify.length > 0) {
                 // Show message that users will be notified
-                alert(`Session edit saved! ${usersToNotify.length} user${usersToNotify.length === 1 ? '' : 's'} will be notified and must approve the changes before they take effect.`)
+                showToast(`Session edit saved! ${usersToNotify.length} user${usersToNotify.length === 1 ? '' : 's'} will be notified and must approve the changes before they take effect.`)
               } else {
                 // Only the editor's value changed, so no approvals needed - update immediately
                 await updateSessionPayments(editingSessionId)
-                alert('Session updated successfully!')
+                showToast('Session updated successfully!')
               }
             } else {
               // No changes detected, update normally
               await updateSessionPayments(editingSessionId)
-              alert('Session updated successfully!')
+              showToast('Session updated successfully!')
             }
           } else {
             // No changes detected, update normally
             await updateSessionPayments(editingSessionId)
-            alert('Session updated successfully!')
+            showToast('Session updated successfully!')
           }
-        } else {
-          // Live session - update immediately
-          await updateSessionPayments(editingSessionId)
-          alert('Session updated successfully!')
         }
 
         // Update session description
@@ -1187,27 +1486,17 @@ export default function GroupDetailPage() {
           .from('Session')
           .insert([{
             group_id: groupId,
-            Description: sessionDescription || null
+            Description: sessionDescription || null,
+            created_by: userId
           }])
           .select('id')
           .single()
 
         if (sessionError) throw sessionError
 
-        // Create session payments for each member
-        const payments = sessionMembers.map(sm => ({
-          session_id: sessionData.id,
-          user_id: sm.user_id,
-          amount: parseFloat(sm.amount)
-        }))
+        await reconcileSession(sessionData.id, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
 
-        const { error: paymentsError } = await supabase
-          .from('SessionPayment')
-          .insert(payments)
-
-        if (paymentsError) throw paymentsError
-
-        alert('Session created successfully!')
+        showToast('Session created successfully!')
       }
 
       // Reset form and reload
@@ -1222,15 +1511,12 @@ export default function GroupDetailPage() {
       await loadPendingApprovals() // Reload pending approvals
     } catch (error: any) {
       console.error('Error saving session:', error)
-      alert('Failed to save session: ' + (error.message || 'Unknown error'))
+      showToast('Failed to save session: ' + (error.message || 'Unknown error'))
     }
   }
 
-  const handleCreateLiveSession = async () => {
-    if (!groupId) return
-
-    const description = prompt('Enter session description (optional):')
-    if (description === null) return // User cancelled
+  const handleCreateLiveSession = async (description: string) => {
+    if (!groupId || !userId) return
 
     try {
       const { data: sessionData, error: sessionError } = await supabase
@@ -1238,18 +1524,21 @@ export default function GroupDetailPage() {
         .insert([{
           group_id: groupId,
           Description: description || 'Live Session',
-          is_live: true
+          is_live: true,
+          created_by: userId
         }])
         .select('id')
         .single()
 
       if (sessionError) throw sessionError
 
+      setShowCreateLiveSessionModal(false)
+      setLiveSessionDescription('')
       await loadSessions()
-      alert('Live session created! Members can now add their payments.')
+      showToast('Live session created! Members can now add their payments.')
     } catch (error: any) {
       console.error('Error creating live session:', error)
-      alert('Failed to create live session: ' + (error.message || 'Unknown error'))
+      showToast('Failed to create live session: ' + (error.message || 'Unknown error'))
     }
   }
 
@@ -1258,39 +1547,15 @@ export default function GroupDetailPage() {
 
     const amountValue = parseFloat(liveSessionAmount)
     if (isNaN(amountValue)) {
-      alert('Please enter a valid amount')
+      showToast('Please enter a valid amount')
       return
     }
 
     try {
-      // Check if user already has a payment in this session
-      const { data: existingPayment } = await supabase
-        .from('SessionPayment')
-        .select('id, amount')
-        .eq('session_id', sessionId)
-        .eq('user_id', userId)
-        .maybeSingle()
-
-      if (existingPayment) {
-        // Update existing payment
-        const { error: updateError } = await supabase
-          .from('SessionPayment')
-          .update({ amount: amountValue })
-          .eq('id', existingPayment.id)
-
-        if (updateError) throw updateError
-      } else {
-        // Create new payment
-        const { error: insertError } = await supabase
-          .from('SessionPayment')
-          .insert([{
-            session_id: sessionId,
-            user_id: userId,
-            amount: amountValue
-          }])
-
-        if (insertError) throw insertError
-      }
+      // Only touch your own row — everyone else's contribution to this live session
+      // is untouched, so this can't reconcile against a "full set" (nobody knows the
+      // full set yet, that's the point of a live session).
+      await upsertPayment(sessionId, userId, amountValue)
 
       // Close the form and reload sessions list to update stats
       setSelectedLiveSession(null)
@@ -1299,7 +1564,7 @@ export default function GroupDetailPage() {
       await loadSessions()
     } catch (error: any) {
       console.error('Error adding to live session:', error)
-      alert('Failed to add payment: ' + (error.message || 'Unknown error'))
+      showToast('Failed to add payment: ' + (error.message || 'Unknown error'))
     }
   }
 
@@ -1357,13 +1622,13 @@ export default function GroupDetailPage() {
       if (paymentsError) throw paymentsError
 
       // Calculate sum
-      const total = (paymentsData || []).reduce((sum, payment: any) => {
+      const total = (paymentsData || []).reduce((sum: number, payment: any) => {
         return sum + parseFloat(payment.amount?.toString() || '0')
       }, 0)
 
       // Check if sum equals 0
       if (Math.abs(total) > 0.01) {
-        alert(`Cannot close session. The sum of all amounts must equal 0. Current sum: ${total.toFixed(2)}`)
+        showToast(`Cannot close session. The sum of all amounts must equal 0. Current sum: ${total.toFixed(2)}`)
         return
       }
 
@@ -1380,10 +1645,106 @@ export default function GroupDetailPage() {
       setLiveSessionAmount('')
       setSessionDetails([])
       await loadSessions()
-      alert('Live session closed successfully!')
+      showToast('Live session closed successfully!')
     } catch (error: any) {
       console.error('Error closing live session:', error)
-      alert('Failed to close session: ' + (error.message || 'Unknown error'))
+      showToast('Failed to close session: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Cancel (abandon) a live session — discards every payment entered so far and
+  // removes the session entirely. Distinct from "Close," which finalizes it.
+  const handleCancelLiveSession = async (sessionId: number) => {
+    try {
+      const { error: paymentsError } = await supabase
+        .from('SessionPayment')
+        .delete()
+        .eq('session_id', sessionId)
+
+      if (paymentsError) throw paymentsError
+
+      const { error: sessionError } = await supabase
+        .from('Session')
+        .delete()
+        .eq('id', sessionId)
+
+      if (sessionError) throw sessionError
+
+      setConfirmCancelSessionId(null)
+      setSelectedLiveSession(null)
+      setLiveSessionAmount('')
+      setSessionDetails([])
+      await loadSessions()
+      await loadDues()
+    } catch (error: any) {
+      console.error('Error cancelling live session:', error)
+      showToast('Failed to cancel session: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Permanently delete a closed session and everything tied to it.
+  // Requests to delete a closed session. Needs unanimous approval from
+  // everyone with a payment in it — same mechanism as editing amounts
+  // (see handleCreateSession's approval-record creation), just proposing
+  // every amount go to $0 with is_deletion marking what that really means.
+  // Skips straight to performSessionDeletion only when the requester is the
+  // sole participant, since there's no one else to ask.
+  const handleDeleteSession = async (sessionId: number) => {
+    if (!userId) return
+
+    try {
+      const { data: paymentsData, error: paymentsError } = await supabase
+        .from('SessionPayment')
+        .select('user_id, amount')
+        .eq('session_id', sessionId)
+
+      if (paymentsError) throw paymentsError
+
+      const others = (paymentsData || []).filter((p: any) => p.user_id !== userId)
+
+      if (others.length === 0) {
+        await performSessionDeletion(sessionId)
+        setConfirmDeleteSessionId(null)
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast('Session deleted.')
+        return
+      }
+
+      const selfPayment = (paymentsData || []).find((p: any) => p.user_id === userId)
+
+      const approvalRecords = [
+        ...others.map((p: any) => ({
+          session_id: sessionId,
+          editor_user_id: userId,
+          approver_user_id: p.user_id,
+          status: 'pending',
+          old_amount: parseFloat(p.amount?.toString() || '0'),
+          new_amount: 0,
+          is_deletion: true,
+        })),
+        {
+          session_id: sessionId,
+          editor_user_id: userId,
+          approver_user_id: userId,
+          status: 'approved',
+          old_amount: selfPayment ? parseFloat(selfPayment.amount?.toString() || '0') : 0,
+          new_amount: 0,
+          is_deletion: true,
+        },
+      ]
+
+      const { error: insertError } = await supabase.from('SessionEditApproval').insert(approvalRecords)
+      if (insertError) throw insertError
+
+      setConfirmDeleteSessionId(null)
+      await loadSessions()
+      await loadPendingApprovals()
+      showToast(`Deletion requested — ${others.length} member${others.length === 1 ? '' : 's'} must approve before the session is removed.`)
+    } catch (error: any) {
+      console.error('Error requesting session deletion:', error)
+      showToast('Failed to request deletion: ' + (error.message || 'Unknown error'))
     }
   }
 
@@ -1393,7 +1754,7 @@ export default function GroupDetailPage() {
 
     const amountValue = parseFloat(paymentAmount)
     if (isNaN(amountValue) || amountValue <= 0) {
-      alert('Please enter a valid amount greater than 0')
+      showToast('Please enter a valid amount greater than 0')
       return
     }
 
@@ -1407,34 +1768,20 @@ export default function GroupDetailPage() {
         .insert([{
           group_id: groupId,
           Description: paymentDescription || `Payment from ${payerName} to ${payeeName}`,
-          is_payment: true
+          is_payment: true,
+          created_by: userId
         }])
         .select('id')
         .single()
 
       if (sessionError) throw sessionError
 
-      // Create two session payments:
-      // 1. Payer (negative amount - they're paying out)
-      // 2. Payee (positive amount - they're receiving)
-      const payments = [
-        {
-          session_id: sessionData.id,
-          user_id: userId,
-          amount: -amountValue // Negative for payer
-        },
-        {
-          session_id: sessionData.id,
-          user_id: paymentPayee,
-          amount: amountValue // Positive for payee
-        }
-      ]
-
-      const { error: paymentsError } = await supabase
-        .from('SessionPayment')
-        .insert(payments)
-
-      if (paymentsError) throw paymentsError
+      // A payment is just a 2-entry session: the payer negative, the payee positive —
+      // written through the same reconcile path as any other session.
+      await reconcileSession(sessionData.id, [
+        { user_id: userId, amount: -amountValue },
+        { user_id: paymentPayee, amount: amountValue },
+      ])
 
       // Reset form and reload
       setPaymentPayee(null)
@@ -1442,10 +1789,10 @@ export default function GroupDetailPage() {
       setPaymentDescription('')
       await loadSessions()
       await loadDues()
-      alert('Payment recorded successfully!')
+      showToast('Payment recorded successfully!')
     } catch (error: any) {
       console.error('Error making payment:', error)
-      alert('Failed to record payment: ' + (error.message || 'Unknown error'))
+      showToast('Failed to record payment: ' + (error.message || 'Unknown error'))
     }
   }
 
@@ -1458,8 +1805,9 @@ export default function GroupDetailPage() {
       loadMembers()
       loadSessions()
       loadPendingApprovals()
+      loadJoinRequests()
     }
-  }, [userId, groupId, loadGroup, loadDues, checkOwnership, loadMembers, loadSessions, loadPendingApprovals])
+  }, [userId, groupId, loadGroup, loadDues, checkOwnership, loadMembers, loadSessions, loadPendingApprovals, loadJoinRequests])
 
   // Load session details when viewing a session
   useEffect(() => {
@@ -1502,10 +1850,10 @@ export default function GroupDetailPage() {
           console.log('Mapped approval records (including editor):', mappedApprovals)
           
           // Check if editor's record is present
-          const editorRecord = mappedApprovals.find(a => a.user_id === editorId)
+          const editorRecord = mappedApprovals.find((a: any) => a.user_id === editorId)
           console.log('Editor record found:', editorRecord)
-          
-          setAllSessionApprovals(mappedApprovals.map(a => ({
+
+          setAllSessionApprovals(mappedApprovals.map((a: any) => ({
             user_id: a.user_id,
             old_amount: a.old_amount,
             new_amount: a.new_amount
@@ -1549,31 +1897,106 @@ export default function GroupDetailPage() {
       // Since there's no paid field, we'll just remove it from the list
       // Or you could add a 'paid' boolean column to SessionPayment
       setDues(dues.filter(due => due.id !== dueId))
-      alert('Due marked as paid (removed from list)')
+      showToast('Due marked as paid (removed from list)')
     } catch (error) {
       console.error('Error paying due:', error)
-      alert('Failed to mark due as paid')
+      showToast('Failed to mark due as paid')
     }
   }
 
   const handleCopyPin = async () => {
     if (!group?.pin) return
-    
+
     try {
       await navigator.clipboard.writeText(group.pin)
-      alert('Group pin copied to clipboard!')
+      showToast('Group pin copied to clipboard!')
     } catch (error) {
       console.error('Failed to copy pin:', error)
-      alert('Failed to copy pin. Please copy it manually.')
+      showToast('Failed to copy pin. Please copy it manually.')
+    }
+  }
+
+  // Both run server-side (approve_join_request / reject_join_request), since
+  // adding someone else to GroupMember isn't something the owner's own RLS
+  // permissions allow directly — see add_join_requests.sql.
+  const handleApproveJoinRequest = async (requestId: number) => {
+    try {
+      const { error } = await supabase.rpc('approve_join_request', { request_id: requestId })
+      if (error) throw error
+
+      setPendingJoinRequests(prev => prev.filter(r => r.id !== requestId))
+      await loadMembers()
+      showToast('Request approved — they now have access to the group.')
+    } catch (error: any) {
+      console.error('Error approving join request:', error)
+      showToast('Failed to approve request: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  const handleRejectJoinRequest = async (requestId: number) => {
+    try {
+      const { error } = await supabase.rpc('reject_join_request', { request_id: requestId })
+      if (error) throw error
+
+      setPendingJoinRequests(prev => prev.filter(r => r.id !== requestId))
+      showToast('Request rejected.')
+    } catch (error: any) {
+      console.error('Error rejecting join request:', error)
+      showToast('Failed to reject request: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Runs server-side (remove_group_member) — it re-checks the $0 balance rule
+  // itself rather than trusting the client, and flips status to 'removed'
+  // instead of deleting the row, so their session/payment history is untouched.
+  const handleRemoveMember = async (targetUserId: number) => {
+    if (!groupId) return
+
+    try {
+      const { error } = await supabase.rpc('remove_group_member', {
+        target_group_id: groupId,
+        target_user_id: targetUserId,
+      })
+
+      if (error) throw error
+
+      setConfirmRemoveMemberId(null)
+      await loadMembers()
+      showToast('Member removed. Their history in this group is untouched — they can request to rejoin any time.')
+    } catch (error: any) {
+      console.error('Error removing member:', error)
+      showToast('Failed to remove member: ' + (error.message || 'Unknown error'))
+    }
+  }
+
+  // Runs server-side (update_session_notes) — it re-checks that you're the
+  // session's creator itself rather than trusting the client, since the
+  // general "any member can update a session" rule doesn't apply to notes.
+  const handleSaveNotes = async (sessionId: number) => {
+    setSavingNotes(true)
+    try {
+      const { error } = await supabase.rpc('update_session_notes', {
+        target_session_id: sessionId,
+        new_notes: notesDraft.trim() || null,
+      })
+
+      if (error) throw error
+
+      setEditingNotesSessionId(null)
+      await loadSessions()
+      showToast('Notes saved.')
+    } catch (error: any) {
+      console.error('Error saving notes:', error)
+      showToast('Failed to save notes: ' + (error.message || 'Unknown error'))
+    } finally {
+      setSavingNotes(false)
     }
   }
 
   if (authLoading || loading) {
     return (
-      <main className="min-h-screen">
-        <div className="max-w-4xl mx-auto px-6 py-8">
-          <div className="text-center py-12">Loading...</div>
-        </div>
+      <main className="min-h-screen flex items-center justify-center">
+        <p className="eyebrow">Loading…</p>
       </main>
     )
   }
@@ -1590,9 +2013,14 @@ export default function GroupDetailPage() {
         .reduce((sum, d) => sum + d.amount, 0)
     : 0
 
+  // Members currently in the group — removed members keep their row (and every
+  // SessionPayment they were ever part of) so old sessions still show their real
+  // name, but they no longer count as "in" the group anywhere active.
+  const activeMembers = members.filter(m => m.status !== 'removed')
+
   // Calculate net balance for all members
   // Positive = user is owed money, Negative = user owes money
-  const memberBalances = members.map(member => {
+  const memberBalances = activeMembers.map(member => {
     const balance = dues
       .filter(d => d.user_id === member.user_id)
       .reduce((sum, d) => sum + d.amount, 0)
@@ -1600,346 +2028,420 @@ export default function GroupDetailPage() {
       ...member,
       balance
     }
-  }).sort((a, b) => {
-    // Sort: current user first, then by balance (owed money first, then those who owe)
-    if (a.user_id === userId) return -1
-    if (b.user_id === userId) return 1
-    return b.balance - a.balance
-  })
+  }).sort((a, b) => b.balance - a.balance) // owed money first, those who owe last
+
+  const tabs: Array<{ key: typeof activeTab; label: string }> = [
+    { key: 'dues', label: 'Dues' },
+    { key: 'members', label: 'Group Members' },
+    { key: 'sessions', label: 'Sessions' },
+    { key: 'payments', label: 'Payments' },
+    { key: 'info', label: group.name ? `${group.name} Info` : 'Group Info' },
+  ]
 
   return (
     <main className="min-h-screen">
-      <header className="border-b border-gray-300 bg-transparent">
+      <header className="border-b" style={{ borderColor: 'var(--line)' }}>
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <Link href="/" className="text-gray-700 hover:text-black font-medium">
-            ← Back
+          <Link href="/" className="text-sm font-medium hover:underline flex items-center gap-1.5" style={{ color: 'var(--ink-muted)' }}>
+            <ArrowLeft size={16} /> Back
           </Link>
-          <h1 className="text-xl font-semibold text-black">{group.name || 'Untitled Group'}</h1>
-          <div></div>
+          <h1 className="font-display text-xl font-semibold tracking-tight">{group.name || 'Untitled Group'}</h1>
+          <div className="w-12"></div>
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto px-6 py-8 flex gap-6">
+      <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col md:flex-row gap-6">
         {/* Sidebar */}
-        <aside className="w-64 flex-shrink-0">
-          <div className="border-2 border-gray-300 rounded-lg p-2">
-            <button
-              onClick={() => setActiveTab('dues')}
-              className={`w-full text-left px-4 py-2 rounded transition ${
-                activeTab === 'dues'
-                  ? 'bg-black text-white'
-                  : 'text-black hover:bg-gray-100'
-              }`}
-            >
-              Dues
-            </button>
-            <button
-              onClick={() => setActiveTab('members')}
-              className={`w-full text-left px-4 py-2 rounded transition mt-1 ${
-                activeTab === 'members'
-                  ? 'bg-black text-white'
-                  : 'text-black hover:bg-gray-100'
-              }`}
-            >
-              Group Members
-            </button>
-            <button
-              onClick={() => setActiveTab('sessions')}
-              className={`w-full text-left px-4 py-2 rounded transition mt-1 ${
-                activeTab === 'sessions'
-                  ? 'bg-black text-white'
-                  : 'text-black hover:bg-gray-100'
-              }`}
-            >
-              Sessions
-            </button>
-            <button
-              onClick={() => setActiveTab('payments')}
-              className={`w-full text-left px-4 py-2 rounded transition mt-1 ${
-                activeTab === 'payments'
-                  ? 'bg-black text-white'
-                  : 'text-black hover:bg-gray-100'
-              }`}
-            >
-              Payments
-            </button>
-            <button
-              onClick={() => setActiveTab('info')}
-              className={`w-full text-left px-4 py-2 rounded transition mt-1 ${
-                activeTab === 'info'
-                  ? 'bg-black text-white'
-                  : 'text-black hover:bg-gray-100'
-              }`}
-            >
-              {group.name ? `${group.name} Info` : 'Group Info'}
-            </button>
-          </div>
+        <aside className="md:w-56 flex-shrink-0">
+          <nav className="flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible">
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setActiveTab(t.key)}
+                className={activeTab === t.key ? 'tab-item-active whitespace-nowrap' : 'tab-item whitespace-nowrap'}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
         </aside>
 
         {/* Main Content */}
         <div className="flex-1">
-          {/* Notification Banner - Only show on Dues tab */}
-          {activeTab === 'dues' && showNotification && (pendingApprovals.length > 0 || pendingRejections.length > 0) && (
-            <div className={`mb-4 p-4 rounded-lg border-2 ${
-              notificationType === 'approval' 
-                ? 'bg-yellow-50 border-yellow-300' 
-                : notificationType === 'rejection'
-                ? 'bg-red-50 border-red-300'
-                : 'bg-orange-50 border-orange-300' // Generic type (multiple notification types)
-            }`}>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <span className={`text-lg ${
-                    notificationType === 'approval' 
-                      ? 'text-yellow-800' 
-                      : notificationType === 'rejection'
-                      ? 'text-red-800'
-                      : 'text-orange-800' // Generic type
-                  }`}>
-                    {notificationType === 'approval' 
-                      ? '⚠️' 
-                      : notificationType === 'rejection'
-                      ? '❌'
-                      : '🔔'} {/* Generic icon for multiple types */}
-                  </span>
-                  <p className={`font-medium ${
-                    notificationType === 'approval' 
-                      ? 'text-yellow-800' 
-                      : notificationType === 'rejection'
-                      ? 'text-red-800'
-                      : 'text-orange-800' // Generic type
-                  }`}>
-                    {notificationMessage}
+          {activeTab === 'dues' && (
+            <div className="mb-6">
+              <p className="eyebrow mb-1">Summary</p>
+              <h2 className="font-display text-2xl font-semibold mb-6">Dues</h2>
+
+              {/* Your balance */}
+              <div className="card mb-8 flex items-center justify-between gap-4">
+                <div>
+                  <p className="eyebrow mb-1">Your balance</p>
+                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
+                    {netBalance > 0 ? "You're owed money" : netBalance < 0 ? 'You owe money' : "You're settled up"}
                   </p>
                 </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={async () => {
-                      setActiveTab('sessions')
-                      setShowNotification(false)
-                      // Reload sessions to ensure rejection indicators are shown
-                      await loadSessions()
-                    }}
-                    className={`px-4 py-2 rounded-lg font-medium transition ${
-                      notificationType === 'approval'
-                        ? 'bg-yellow-600 text-white hover:bg-yellow-700'
-                        : notificationType === 'rejection'
-                        ? 'bg-red-600 text-white hover:bg-red-700'
-                        : 'bg-orange-600 text-white hover:bg-orange-700' // Generic type
-                    }`}
-                  >
-                    Review
-                  </button>
-                  <button
-                    onClick={() => {
-                      setShowNotification(false)
-                      if (notificationType === 'rejection' || !notificationType) {
-                        // Navigate to sessions tab for rejections or generic notifications
-                        setActiveTab('sessions')
-                      }
-                    }}
-                    className="px-4 py-2 rounded-lg border-2 border-gray-300 hover:bg-gray-100 transition text-black"
-                  >
-                    Dismiss
-                  </button>
-                </div>
+                <p
+                  className="amount text-4xl font-semibold"
+                  style={{ color: netBalance > 0 ? 'var(--emerald)' : netBalance < 0 ? 'var(--rust)' : 'var(--ink)' }}
+                >
+                  {netBalance >= 0 ? '+' : ''}${(netBalance / 100).toFixed(2)}
+                </p>
               </div>
+
+              {/* Pending approval (left) & Notifications (right) — split screen under the balance */}
+              {(() => {
+                const inFlight = sessions
+                  .filter((s) => s.pendingApproval || s.waitingForApproval)
+                  .sort((a, b) => (a.pendingApproval === b.pendingApproval ? 0 : a.pendingApproval ? -1 : 1))
+
+                const notificationCount = pendingRejections.length + pendingCancellations.length + pendingRejectionNotices.length
+
+                return (
+                  <div className="grid md:grid-cols-2 gap-6">
+                    {/* Pending approval — any session/payment currently mid-edit: either
+                        you need to review it, or you're the editor waiting on everyone else. */}
+                    <div>
+                      <p className="eyebrow mb-3">Pending approval</p>
+                      {inFlight.length === 0 ? (
+                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Nothing pending.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {inFlight.map((s) => (
+                            <div
+                              key={`inflight-${s.id}`}
+                              className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                            >
+                              <div className="flex items-center gap-3">
+                                <span style={{ color: s.pendingApproval ? 'var(--brass)' : 'var(--ink-muted)' }}>
+                                  {s.pendingApproval ? <TriangleAlert size={18} /> : <Hourglass size={18} />}
+                                </span>
+                                <div>
+                                  <p
+                                    className="text-sm font-medium"
+                                    style={{ color: s.pendingApproval ? 'var(--brass)' : 'var(--ink)' }}
+                                  >
+                                    {s.Description || 'Untitled Session'}
+                                  </p>
+                                  <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+                                    {s.pendingApproval
+                                      ? s.pendingIsDeletion ? 'Someone wants to delete this — needs your review' : 'Needs your review'
+                                      : s.pendingIsDeletion ? 'Waiting on others to approve deleting this' : 'Waiting on others to approve your changes'}
+                                  </p>
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  setActiveTab('sessions')
+                                  setViewingSessionId(s.id)
+                                }}
+                                className={s.pendingApproval ? 'btn-primary text-sm shrink-0' : 'btn-secondary text-sm shrink-0'}
+                              >
+                                {s.pendingApproval ? 'Review' : 'View'}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Notifications — resolved edits that still need acknowledging:
+                        your edit got rejected, your review got cancelled by the editor,
+                        or an edit you were reviewing got rejected by someone else. */}
+                    <div>
+                      <p className="eyebrow mb-3">Notifications</p>
+                      {notificationCount === 0 ? (
+                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No notifications.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {pendingRejections.map((pr) => (
+                            <div
+                              key={`rejection-${pr.id}`}
+                              className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                            >
+                              <div className="flex items-center gap-3">
+                                <XCircle size={18} style={{ color: 'var(--rust)' }} />
+                                <p className="text-sm font-medium">
+                                  {pr.is_deletion
+                                    ? <>Your request to delete &ldquo;{pr.session_description}&rdquo; was rejected by {pr.approver_name || 'a member'}</>
+                                    : <>Your edit to &ldquo;{pr.session_description}&rdquo; was rejected by {pr.approver_name || 'a member'}</>}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  setActiveTab('sessions')
+                                  setViewingSessionId(pr.session_id)
+                                }}
+                                className="btn-danger text-sm shrink-0"
+                              >
+                                Review
+                              </button>
+                            </div>
+                          ))}
+                          {pendingRejectionNotices.map((rn) => (
+                            <div
+                              key={`rejection-notice-${rn.id}`}
+                              className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                            >
+                              <div className="flex items-center gap-3">
+                                <XCircle size={18} style={{ color: 'var(--ink-muted)' }} />
+                                <p className="text-sm font-medium">
+                                  {rn.is_deletion
+                                    ? <>The request to delete &ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'} — it was kept</>
+                                    : <>&ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'} — the edit did not go through</>}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => handleDismissRejectionNotice(rn.id)}
+                                className="btn-secondary text-sm shrink-0"
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                          ))}
+                          {pendingCancellations.map((pc) => (
+                            <div
+                              key={`cancel-${pc.id}`}
+                              className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                            >
+                              <div className="flex items-center gap-3">
+                                <Undo2 size={18} style={{ color: 'var(--ink-muted)' }} />
+                                <p className="text-sm font-medium">
+                                  {pc.is_deletion
+                                    ? <>The request to delete &ldquo;{pc.session_description}&rdquo; was cancelled — your review is no longer needed</>
+                                    : <>Your review on &ldquo;{pc.session_description}&rdquo; was cancelled by the editor</>}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => handleDismissCancellation(pc.id)}
+                                className="btn-secondary text-sm shrink-0"
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
           )}
 
-          {activeTab === 'dues' && (
-            <div className="mb-6">
-              <h2 className="text-2xl font-semibold mb-6 text-black">Dues</h2>
-              
-              {memberBalances.length === 0 ? (
-                <div className="border-2 border-gray-300 rounded-lg p-8 bg-white text-center">
-                  <p className="text-gray-700">No members in this group yet.</p>
+          {activeTab === 'members' && (
+            <div>
+              <p className="eyebrow mb-1">Users</p>
+              <h2 className="font-display text-2xl font-semibold mb-6">Group Members</h2>
+
+              {isOwner && pendingJoinRequests.length > 0 && (
+                <div className="mb-8">
+                  <p className="eyebrow mb-3">Pending requests</p>
+                  <div className="space-y-2">
+                    {pendingJoinRequests.map((req) => (
+                      <div
+                        key={req.id}
+                        className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                        style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}
+                      >
+                        <div>
+                          <p className="text-sm font-medium" style={{ color: 'var(--brass)' }}>{req.displayName}</p>
+                          <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{req.username} · wants to join</p>
+                        </div>
+                        <div className="flex gap-2 shrink-0">
+                          <button onClick={() => handleApproveJoinRequest(req.id)} className="btn-primary text-sm">
+                            Approve
+                          </button>
+                          <button onClick={() => handleRejectJoinRequest(req.id)} className="btn-secondary text-sm">
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
+              )}
+
+              {memberBalances.length === 0 ? (
+                <p style={{ color: 'var(--ink-muted)' }}>No members yet.</p>
               ) : (
-                <div className="space-y-3">
+                <div className="card divide-y" style={{ borderColor: 'var(--line)' }}>
                   {memberBalances.map((member) => {
                     const isCurrentUser = member.user_id === userId
                     const balance = member.balance
-                    const displayName = formatDisplayName(members, member)
-                    
                     return (
                       <div
                         key={member.user_id}
-                        className={`border-2 rounded-lg p-6 bg-white ${
-                          isCurrentUser
-                            ? 'border-black border-4'
-                            : 'border-gray-300'
-                        }`}
+                        className="flex items-center justify-between gap-4 py-5 first:pt-0 last:pb-0"
+                        style={{
+                          borderColor: 'var(--line)',
+                          borderLeft: isCurrentUser ? '3px solid var(--brass)' : '3px solid transparent',
+                          paddingLeft: '1rem',
+                          marginLeft: '-1rem',
+                        }}
                       >
-                        <div className="flex items-center justify-between">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-3 mb-1">
-                              <p className={`font-semibold text-lg ${
-                                isCurrentUser ? 'text-black' : 'text-black'
-                              }`}>
-                                {displayName}
-                              </p>
-                              {isCurrentUser && (
-                                <span className="text-xs bg-black text-white px-2 py-1 rounded font-medium">
-                                  You
-                                </span>
-                              )}
-                              {member.role === 'owner' && (
-                                <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded font-medium">
-                                  Owner
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-sm text-gray-600">@{member.username}</p>
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-1">
+                            <p className="font-semibold">{formatDisplayName(members, member)}</p>
+                            {isCurrentUser && <span className="badge badge-brass">You</span>}
+                            {member.role === 'owner' && <span className="badge badge-outline">Owner</span>}
                           </div>
-                          <div className="text-right">
-                            <p className="text-sm text-gray-700 mb-1 font-medium">Net Balance</p>
-                            <p className={`text-3xl font-bold ${
-                              balance > 0 
-                                ? 'text-green-600' 
-                                : balance < 0 
-                                ? 'text-red-600' 
-                                : 'text-black'
-                            }`}>
-                              {balance >= 0 ? '+' : ''}${(balance / 100).toFixed(2)}
-                            </p>
-                            {balance > 0 && (
-                              <p className="text-xs text-green-600 mt-1">Owed money</p>
-                            )}
-                            {balance < 0 && (
-                              <p className="text-xs text-red-600 mt-1">Owes money</p>
-                            )}
-                            {balance === 0 && (
-                              <p className="text-xs text-gray-600 mt-1">Balanced</p>
-                            )}
-                          </div>
+                          <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>@{member.username}</p>
+                          <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>
+                            Joined {new Date(member.created_at).toLocaleDateString()}
+                          </p>
+                        </div>
+                        <div className="text-right">
+                          <p className="eyebrow mb-1">Net balance</p>
+                          <p
+                            className="amount text-2xl font-semibold"
+                            style={{
+                              color: balance > 0 ? 'var(--emerald)' : balance < 0 ? 'var(--rust)' : 'var(--ink)',
+                            }}
+                          >
+                            {balance >= 0 ? '+' : ''}${(balance / 100).toFixed(2)}
+                          </p>
+                          {balance > 0 && (
+                            <p className="text-xs mt-1" style={{ color: 'var(--emerald)' }}>Owed money</p>
+                          )}
+                          {balance < 0 && (
+                            <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Owes money</p>
+                          )}
+                          {balance === 0 && (
+                            <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>Balanced</p>
+                          )}
+                          {isOwner && !isCurrentUser && member.role !== 'owner' && (
+                            <button
+                              onClick={() => setConfirmRemoveMemberId(member.user_id)}
+                              disabled={Math.abs(balance) >= 1}
+                              className="mt-2 text-xs font-medium hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:no-underline"
+                              style={{ color: 'var(--rust)' }}
+                              title={Math.abs(balance) >= 1 ? 'Balance must be $0.00 before they can be removed' : 'Remove from group'}
+                            >
+                              Remove
+                            </button>
+                          )}
                         </div>
                       </div>
                     )
                   })}
                 </div>
               )}
-            </div>
-          )}
 
-          {activeTab === 'members' && (
-            <div>
-              <h2 className="text-2xl font-semibold mb-4 text-black">Group Members</h2>
-              {members.length === 0 ? (
-                <p className="text-gray-700">No members yet.</p>
-              ) : (
-                <div className="space-y-2">
-                  {members.map((member) => (
-                    <div
-                      key={member.user_id}
-                      className="border-2 border-gray-300 rounded-lg p-4"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <p className="font-semibold text-black">{formatDisplayName(members, member)}</p>
-                          <p className="text-sm text-gray-600">@{member.username}</p>
-                        </div>
-                        {member.role === 'owner' && (
-                          <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded font-medium">
-                            Owner
-                          </span>
-                        )}
-                        {member.role === 'member' && (
-                          <span className="text-xs bg-gray-100 text-gray-800 px-2 py-1 rounded font-medium">
-                            Member
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs text-gray-500 mt-2">
-                        Joined {new Date(member.created_at).toLocaleDateString()}
+              {confirmRemoveMemberId !== null && (() => {
+                const target = members.find(m => m.user_id === confirmRemoveMemberId)
+                return (
+                  <div className="modal-overlay">
+                    <div className="modal-panel">
+                      <h3 className="font-display text-xl font-semibold mb-2">
+                        Remove {target ? formatDisplayName(members, target) : 'this member'}?
+                      </h3>
+                      <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                        They&apos;ll lose access to this group right away. Their name stays on every past session and payment — nothing about their history changes, and they can request to rejoin at any time.
                       </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleRemoveMember(confirmRemoveMemberId)}
+                          className="btn-danger flex-1"
+                        >
+                          Remove member
+                        </button>
+                        <button onClick={() => setConfirmRemoveMemberId(null)} className="btn-secondary">
+                          Cancel
+                        </button>
+                      </div>
                     </div>
-                  ))}
-                </div>
-              )}
+                  </div>
+                )
+              })()}
             </div>
           )}
 
           {activeTab === 'sessions' && (
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-2xl font-semibold text-black">Sessions</h2>
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <p className="eyebrow mb-1">Activity</p>
+                  <h2 className="font-display text-2xl font-semibold">Sessions</h2>
+                </div>
                 <div className="flex gap-2">
-                  <button
-                    onClick={handleCreateLiveSession}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
-                  >
-                    + Create Live Session
+                  <button onClick={() => setShowCreateLiveSessionModal(true)} className="btn-secondary" style={{ borderColor: 'var(--brass)', color: 'var(--brass)' }}>
+                    + Live session
                   </button>
-                  <button
-                    onClick={handleAddSessionClick}
-                    className="px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-                  >
-                    + Add Session
+                  <button onClick={handleAddSessionClick} className="btn-primary">
+                    + Add session
                   </button>
                 </div>
               </div>
 
               {showAddSession && (
-                <div className="mb-6 border-2 border-gray-300 rounded-lg p-4">
-                  <h3 className="text-lg font-semibold mb-4 text-black">
-                    {editingSessionId ? 'Edit Session' : 'Create New Session'}
+                <div className="card mb-6">
+                  <h3 className="font-display text-lg font-semibold mb-4">
+                    {editingSessionId ? 'Edit session' : 'Create new session'}
                   </h3>
                   <form onSubmit={handleCreateSession} className="space-y-4">
                     <div>
-                      <label className="block text-sm font-medium mb-1 text-black">Session Description (optional)</label>
+                      <label className="block text-sm font-medium mb-1">Session description (optional)</label>
                       <input
                         type="text"
                         value={sessionDescription}
                         onChange={(e) => setSessionDescription(e.target.value)}
-                        className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                        className="field"
                         placeholder="e.g., January 2024 Dues"
                       />
                     </div>
 
                     <div>
                       <div className="flex items-center justify-between mb-2">
-                        <label className="block text-sm font-medium text-black">Members & Amounts</label>
+                        <label className="block text-sm font-medium">Members & amounts</label>
                         <div className="relative member-dropdown-container">
                           <button
                             type="button"
                             onClick={() => handleAddMemberToSession()}
-                            className="text-sm px-3 py-1 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-black"
+                            className="btn-secondary text-sm py-1"
                           >
-                            + Add Member
+                            + Add member
                           </button>
                           {showMemberDropdown && (
-                            <div className="absolute right-0 mt-1 bg-white border-2 border-gray-300 rounded-lg shadow-lg z-10 max-h-48 overflow-y-auto min-w-[200px] member-dropdown-container">
-                              {members
+                            <div
+                              className="absolute right-0 mt-1 rounded-lg shadow-lg z-10 max-h-48 overflow-y-auto min-w-[200px] border member-dropdown-container"
+                              style={{ background: 'var(--paper-card)', borderColor: 'var(--line)' }}
+                            >
+                              {activeMembers
                                 .filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id))
                                 .map((member) => (
                                   <button
                                     key={member.user_id}
                                     type="button"
                                     onClick={() => handleAddMemberToSession(member.user_id)}
-                                    className="w-full text-left px-4 py-2 hover:bg-gray-100 transition text-black"
+                                    className="w-full text-left px-4 py-2 transition-colors hover:bg-[var(--paper)]"
                                   >
-                                    <p className="font-medium">{formatDisplayName(members, member)}</p>
-                                    <p className="text-xs text-gray-600">@{member.username}</p>
+                                    <p className="font-medium text-sm">{formatDisplayName(members, member)}</p>
+                                    <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{member.username}</p>
                                   </button>
                                 ))}
-                              {members.filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id)).length === 0 && (
-                                <p className="px-4 py-2 text-sm text-gray-600">All members added</p>
+                              {activeMembers.filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id)).length === 0 && (
+                                <p className="px-4 py-2 text-sm" style={{ color: 'var(--ink-muted)' }}>All members added</p>
                               )}
                             </div>
                           )}
                         </div>
                       </div>
-                      
+
                       {sessionMembers.length === 0 ? (
-                        <p className="text-sm text-gray-600">No members added yet</p>
+                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No members added yet</p>
                       ) : (
                         <>
                           <div className="space-y-2">
                             {sessionMembers.map((sm) => (
                             <div
                               key={sm.user_id}
-                              className="flex items-center gap-2 p-3 border-2 border-gray-300 rounded-lg"
+                              className="flex items-center gap-2 p-3 rounded-lg border"
+                              style={{ borderColor: 'var(--line)' }}
                             >
                               <div className="flex-1">
                                 {(() => {
@@ -1947,8 +2449,8 @@ export default function GroupDetailPage() {
                                   const displayName = member ? formatDisplayName(members, member) : sm.username
                                   return (
                                     <>
-                                      <p className="font-medium text-black">{displayName}</p>
-                                      <p className="text-xs text-gray-600">@{sm.username}</p>
+                                      <p className="font-medium text-sm">{displayName}</p>
+                                      <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{sm.username}</p>
                                     </>
                                   )
                                 })()}
@@ -1965,33 +2467,37 @@ export default function GroupDetailPage() {
                                   )
                                   setSessionMembers(updated)
                                 }}
-                                className="w-24 border-2 border-gray-300 rounded-lg px-2 py-1 text-black focus:border-black focus:outline-none"
+                                className="field amount w-24 px-2 py-1"
                                 placeholder="0.00"
                                 required
                               />
                               <button
                                 type="button"
                                 onClick={() => handleRemoveMemberFromSession(sm.user_id)}
-                                className="px-3 py-1 text-red-600 hover:bg-red-50 rounded transition text-sm"
+                                className="px-3 py-1 rounded transition text-sm font-medium"
+                                style={{ color: 'var(--rust)' }}
                               >
                                 Remove
                               </button>
                             </div>
                           ))}
                           </div>
-                          <div className="mt-4 p-3 border-2 border-gray-300 rounded-lg bg-gray-50">
+                          <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: 'var(--line)', background: 'var(--paper)' }}>
                             <div className="flex items-center justify-between">
-                              <span className="text-sm font-medium text-black">Total Sum:</span>
-                              <span className={`text-lg font-semibold ${
-                                Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) < 0.01
-                                  ? 'text-green-600'
-                                  : 'text-red-600'
-                              }`}>
+                              <span className="text-sm font-medium">Total sum</span>
+                              <span
+                                className="amount text-lg font-semibold"
+                                style={{
+                                  color: Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) < 0.01
+                                    ? 'var(--emerald)'
+                                    : 'var(--rust)',
+                                }}
+                              >
                                 ${sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0).toFixed(2)}
                               </span>
                             </div>
                             {Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) >= 0.01 && (
-                              <p className="text-xs text-red-600 mt-1">Sum must equal $0.00 to create session</p>
+                              <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Sum must equal $0.00 to create session</p>
                             )}
                           </div>
                         </>
@@ -1999,11 +2505,8 @@ export default function GroupDetailPage() {
                     </div>
 
                     <div className="flex gap-2">
-                      <button
-                        type="submit"
-                        className="px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-                      >
-                        {editingSessionId ? 'Update Session' : 'Create Session'}
+                      <button type="submit" className="btn-primary">
+                        {editingSessionId ? 'Update session' : 'Create session'}
                       </button>
                       <button
                         type="button"
@@ -2015,7 +2518,7 @@ export default function GroupDetailPage() {
                           setViewingSessionId(null)
                           setShowMemberDropdown(false)
                         }}
-                        className="px-4 py-2 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-black"
+                        className="btn-secondary"
                       >
                         Cancel
                       </button>
@@ -2040,56 +2543,60 @@ export default function GroupDetailPage() {
                           <div className="flex items-center justify-between mb-4">
                             <button
                               onClick={() => setViewingSessionId(null)}
-                              className="text-gray-700 hover:text-black font-medium flex items-center gap-2"
+                              className="text-sm font-medium hover:underline flex items-center gap-2"
+                              style={{ color: 'var(--ink-muted)' }}
                             >
-                              ← Back to Sessions
+                              <ArrowLeft size={16} /> Back to sessions
                             </button>
                           </div>
-                          
-                          <div className="border-2 border-red-500 bg-red-50 rounded-lg p-6">
+
+                          <div className="rounded-lg p-6 border" style={{ borderColor: 'var(--rust)', background: 'var(--rust-soft)' }}>
                             <div className="mb-4">
-                              <h2 className="text-2xl font-semibold text-black mb-2">
-                                ❌ Session Edit Rejected
+                              <h2 className="font-display text-2xl font-semibold mb-2 flex items-center gap-2">
+                                <XCircle size={22} style={{ color: 'var(--rust)' }} />
+                                {pendingRejection.is_deletion ? 'Deletion request rejected' : 'Session edit rejected'}
                               </h2>
-                              <p className="text-gray-700 mb-4">
-                                Your edit to this session was rejected by a group member.
+                              <p style={{ color: 'var(--ink-muted)' }}>
+                                {pendingRejection.is_deletion
+                                  ? 'Your request to delete this session was rejected by a group member — it was kept as-is.'
+                                  : 'Your edit to this session was rejected by a group member.'}
                               </p>
                             </div>
-                            
-                            <div className="border-2 border-gray-300 rounded-lg p-4 bg-white mb-4">
-                              <h3 className="font-semibold text-black mb-3">
+
+                            <div className="card mb-4">
+                              <h3 className="font-semibold mb-3">
                                 {session.Description || 'Untitled Session'}
                               </h3>
-                              <div className="space-y-3">
-                                <div className="flex items-center justify-between p-3 bg-red-50 rounded">
-                                  <span className="text-sm font-medium text-gray-700">Rejected by:</span>
-                                  <span className="font-semibold text-black">
+                              <div className="space-y-2">
+                                <div className="ledger-row">
+                                  <span className="text-sm font-medium" style={{ color: 'var(--ink-muted)' }}>Rejected by</span>
+                                  <span className="font-semibold text-sm">
                                     {pendingRejection.approver_name || 'Unknown'}
                                   </span>
                                 </div>
-                                <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
-                                  <span className="text-sm text-gray-700">Email:</span>
-                                  <span className="text-sm text-black">
+                                <div className="ledger-row">
+                                  <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Email</span>
+                                  <span className="text-sm">
                                     {pendingRejection.approver_email || 'Unknown'}
                                   </span>
                                 </div>
                                 {pendingRejection.rejected_at && (
-                                  <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
-                                    <span className="text-sm text-gray-700">Rejected on:</span>
-                                    <span className="text-sm text-black">
+                                  <div className="ledger-row">
+                                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Rejected on</span>
+                                    <span className="text-sm">
                                       {new Date(pendingRejection.rejected_at).toLocaleString()}
                                     </span>
                                   </div>
                                 )}
                               </div>
                             </div>
-                            
-                            <div className="bg-white border-2 border-gray-300 rounded-lg p-4 mb-4">
-                              <p className="text-sm text-gray-700 mb-2">
+
+                            <div className="card mb-4">
+                              <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
                                 The changes you made to this session were not approved. You can edit the session again if needed.
                               </p>
                             </div>
-                            
+
                             <button
                               onClick={async () => {
                                 if (pendingRejection) {
@@ -2115,12 +2622,12 @@ export default function GroupDetailPage() {
                                       
                                       if (deleteError) {
                                         console.error('Error deleting rejection:', deleteError)
-                                        alert('Failed to dismiss rejection. Please try again.')
+                                        showToast('Failed to dismiss rejection. Please try again.')
                                         return
                                       }
                                     } else if (dismissError) {
                                       console.error('Error dismissing rejection:', dismissError)
-                                      alert('Failed to dismiss rejection. Please try again.')
+                                      showToast('Failed to dismiss rejection. Please try again.')
                                       return
                                     }
                                     
@@ -2131,44 +2638,17 @@ export default function GroupDetailPage() {
                                     setPendingRejections(prev => prev.filter(pr => pr.id !== pendingRejection.id))
                                     
                                     // Reload sessions and pending approvals to update the UI
+                                    // (this also refreshes pendingRejections/pendingApprovals/pendingCancellations,
+                                    // which is what the Dues tab's Pending Actions area renders from)
                                     await loadSessions()
                                     await loadPendingApprovals()
-                                    
-                                    // Hide notification if there are no more rejections
-                                    const { data: remainingRejections, error: checkError } = await supabase
-                                      .from('SessionEditApproval')
-                                      .select('id')
-                                      .eq('editor_user_id', userId)
-                                      .eq('status', 'rejected')
-                                    
-                                    // If dismissed_at column exists, filter by it
-                                    let finalRemainingRejections = remainingRejections
-                                    if (!checkError && remainingRejections) {
-                                      // Try to filter by dismissed_at if column exists
-                                      const { data: filteredRejections } = await supabase
-                                        .from('SessionEditApproval')
-                                        .select('id')
-                                        .eq('editor_user_id', userId)
-                                        .eq('status', 'rejected')
-                                        .is('dismissed_at', null)
-                                      
-                                      if (!filteredRejections || filteredRejections.length === 0) {
-                                        finalRemainingRejections = []
-                                      }
-                                    }
-                                    
-                                    if (!finalRemainingRejections || finalRemainingRejections.length === 0) {
-                                      setShowNotification(false)
-                                      setNotificationMessage('')
-                                      setNotificationType(null)
-                                    }
                                   } catch (error: any) {
                                     console.error('Error dismissing rejection:', error)
-                                    alert('Failed to dismiss rejection: ' + (error.message || 'Unknown error'))
+                                    showToast('Failed to dismiss rejection: ' + (error.message || 'Unknown error'))
                                   }
                                 }
                               }}
-                              className="w-full px-4 py-3 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition font-medium"
+                              className="btn-secondary w-full"
                             >
                               OK
                             </button>
@@ -2176,7 +2656,7 @@ export default function GroupDetailPage() {
                         </>
                       )
                     }
-                    
+
                     // If this session has a pending approval, show approval UI
                     if (pendingApproval && session.pendingApproval) {
                       return (
@@ -2184,30 +2664,34 @@ export default function GroupDetailPage() {
                           <div className="flex items-center justify-between mb-4">
                             <button
                               onClick={() => setViewingSessionId(null)}
-                              className="text-gray-700 hover:text-black font-medium flex items-center gap-2"
+                              className="text-sm font-medium hover:underline flex items-center gap-2"
+                              style={{ color: 'var(--ink-muted)' }}
                             >
-                              ← Back to Sessions
+                              <ArrowLeft size={16} /> Back to sessions
                             </button>
                           </div>
-                          
-                          <div className="border-2 border-yellow-500 bg-yellow-50 rounded-lg p-6">
+
+                          <div className="rounded-lg p-6 border" style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}>
                             <div className="mb-4">
-                              <h2 className="text-2xl font-semibold text-black mb-2">
-                                ⚠️ Pending Approval Required
+                              <h2 className="font-display text-2xl font-semibold mb-2 flex items-center gap-2">
+                                <TriangleAlert size={22} style={{ color: 'var(--brass)' }} />
+                                {pendingApproval?.is_deletion ? 'Deletion request pending' : 'Pending approval required'}
                               </h2>
-                              <p className="text-gray-700 mb-4">
-                                This session has been edited. Your approval is required before the changes take effect.
+                              <p style={{ color: 'var(--ink-muted)' }}>
+                                {pendingApproval?.is_deletion
+                                  ? 'A group member wants to delete this session. Your approval is required before it’s removed — every amount below is going to $0 as part of that.'
+                                  : 'This session has been edited. Your approval is required before the changes take effect.'}
                               </p>
                             </div>
-                            
-                            <div className="border-2 border-gray-300 rounded-lg p-4 bg-white mb-4">
-                              <h3 className="font-semibold text-black mb-3">
+
+                            <div className="card mb-4">
+                              <h3 className="font-semibold mb-3">
                                 {session.Description || 'Untitled Session'}
                               </h3>
-                              
+
                               {/* Show all members' changes */}
                               <div className="mb-4">
-                                <h4 className="text-sm font-medium text-gray-700 mb-2">All Changes:</h4>
+                                <p className="eyebrow mb-2">All changes</p>
                                 <div className="space-y-2">
                                   {(() => {
                                     // Debug: Log current state
@@ -2266,57 +2750,57 @@ export default function GroupDetailPage() {
                                     console.log('All members to show:', allMembersToShow)
                                     
                                     if (allMembersToShow.length === 0) {
-                                      return <p className="text-sm text-gray-600">Loading session details...</p>
+                                      return <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Loading session details...</p>
                                     }
                                     
                                     return allMembersToShow.map((memberInfo) => {
                                       const isCurrentUser = memberInfo.user_id === userId
-                                      
+
                                       return (
                                         <div
                                           key={memberInfo.user_id}
-                                          className={`flex items-center justify-between p-3 rounded ${
+                                          className="flex items-center justify-between p-3 rounded-md border"
+                                          style={
                                             isCurrentUser
-                                              ? 'bg-yellow-100 border-2 border-yellow-400'
+                                              ? { background: 'var(--brass-soft)', borderColor: 'var(--brass)' }
                                               : memberInfo.hasChange
-                                              ? 'bg-blue-50 border border-blue-200'
-                                              : 'bg-gray-50'
-                                          }`}
+                                              ? { background: 'var(--paper)', borderColor: 'var(--line)' }
+                                              : { background: 'var(--paper)', borderColor: 'transparent' }
+                                          }
                                         >
                                           <div className="flex items-center gap-2">
-                                            <span className="text-sm font-medium text-black">
+                                            <span className="text-sm font-medium">
                                               {memberInfo.displayName}
                                             </span>
-                                            {isCurrentUser && (
-                                              <span className="text-xs bg-yellow-600 text-white px-2 py-0.5 rounded font-medium">
-                                                You
-                                              </span>
-                                            )}
+                                            {isCurrentUser && <span className="badge badge-brass">You</span>}
                                           </div>
-                                          <div className="flex items-center gap-2">
+                                          <div className="flex items-center gap-2 amount">
                                             {memberInfo.approvalRecord ? (
                                               <>
-                                                <span className={`text-sm font-semibold ${
-                                                  memberInfo.approvalRecord.old_amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                                }`}>
+                                                <span
+                                                  className="text-sm font-semibold"
+                                                  style={{ color: memberInfo.approvalRecord.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                                >
                                                   {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
                                                 </span>
-                                                <span className="text-xs text-gray-500">→</span>
-                                                <span className={`text-sm font-semibold ${
-                                                  memberInfo.approvalRecord.new_amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                                }`}>
+                                                <ArrowRight size={14} style={{ color: 'var(--ink-muted)' }} />
+                                                <span
+                                                  className="text-sm font-semibold"
+                                                  style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                                >
                                                   {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
                                                 </span>
                                               </>
                                             ) : (
                                               <>
-                                                <span className={`text-sm font-semibold ${
-                                                  memberInfo.currentAmount >= 0 ? 'text-green-600' : 'text-red-600'
-                                                }`}>
+                                                <span
+                                                  className="text-sm font-semibold"
+                                                  style={{ color: memberInfo.currentAmount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                                >
                                                   {memberInfo.currentAmount >= 0 ? '+' : ''}${memberInfo.currentAmount.toFixed(2)}
                                                 </span>
                                                 {memberInfo.currentAmount !== 0 && (
-                                                  <span className="text-xs text-gray-400">(no change)</span>
+                                                  <span className="text-xs" style={{ color: 'var(--ink-muted)' }}>(no change)</span>
                                                 )}
                                               </>
                                             )}
@@ -2327,35 +2811,30 @@ export default function GroupDetailPage() {
                                   })()}
                                 </div>
                               </div>
-                              
+
                               {/* Highlight the current user's change summary */}
                               {pendingApproval && (
-                                <div className="border-t-2 border-gray-300 pt-3 mt-3">
-                                  <h4 className="text-sm font-medium text-black mb-2">Your Change Summary:</h4>
-                                  <div className="space-y-2">
-                                    <div className="flex items-center justify-between p-2 bg-gray-50 rounded">
-                                      <span className="text-sm text-gray-700">Previous Amount:</span>
-                                      <span className={`font-semibold ${
-                                        pendingApproval.old_amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                      }`}>
+                                <div className="border-t pt-3 mt-3" style={{ borderColor: 'var(--line)' }}>
+                                  <p className="eyebrow mb-2">Your change summary</p>
+                                  <div className="space-y-2 amount">
+                                    <div className="flex items-center justify-between p-2 rounded" style={{ background: 'var(--paper)' }}>
+                                      <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Previous amount</span>
+                                      <span className="font-semibold" style={{ color: pendingApproval.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}>
                                         {pendingApproval.old_amount >= 0 ? '+' : ''}${pendingApproval.old_amount.toFixed(2)}
                                       </span>
                                     </div>
-                                    <div className="flex items-center justify-between p-2 bg-yellow-50 rounded">
-                                      <span className="text-sm text-gray-700">New Amount:</span>
-                                      <span className={`font-semibold ${
-                                        pendingApproval.new_amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                      }`}>
+                                    <div className="flex items-center justify-between p-2 rounded" style={{ background: 'var(--brass-soft)' }}>
+                                      <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>New amount</span>
+                                      <span className="font-semibold" style={{ color: pendingApproval.new_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}>
                                         {pendingApproval.new_amount >= 0 ? '+' : ''}${pendingApproval.new_amount.toFixed(2)}
                                       </span>
                                     </div>
-                                    <div className="flex items-center justify-between p-2 bg-gray-100 rounded">
-                                      <span className="text-sm font-medium text-black">Change:</span>
-                                      <span className={`font-semibold ${
-                                        pendingApproval.new_amount - pendingApproval.old_amount >= 0
-                                          ? 'text-green-600'
-                                          : 'text-red-600'
-                                      }`}>
+                                    <div className="flex items-center justify-between p-2 rounded border" style={{ borderColor: 'var(--line)' }}>
+                                      <span className="text-sm font-medium">Change</span>
+                                      <span
+                                        className="font-semibold"
+                                        style={{ color: pendingApproval.new_amount - pendingApproval.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                      >
                                         {pendingApproval.new_amount - pendingApproval.old_amount >= 0 ? '+' : ''}
                                         ${(pendingApproval.new_amount - pendingApproval.old_amount).toFixed(2)}
                                       </span>
@@ -2364,19 +2843,19 @@ export default function GroupDetailPage() {
                                 </div>
                               )}
                             </div>
-                            
+
                             <div className="flex gap-3">
                               <button
                                 onClick={() => handleApproveEdit(pendingApproval.id, session.id)}
-                                className="flex-1 px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium flex items-center justify-center gap-2"
+                                className="btn-primary flex-1 py-3 flex items-center justify-center gap-2"
                               >
-                                ✓ Approve
+                                <Check size={18} /> {pendingApproval?.is_deletion ? 'Approve deletion' : 'Approve'}
                               </button>
                               <button
                                 onClick={() => handleRejectEdit(pendingApproval.id, session.id, pendingApproval.editor_user_id)}
-                                className="flex-1 px-4 py-3 bg-red-600 text-white rounded-lg hover:bg-red-700 transition font-medium flex items-center justify-center gap-2"
+                                className="btn-danger flex-1 py-3 flex items-center justify-center gap-2"
                               >
-                                ✗ Reject
+                                <X size={18} /> {pendingApproval?.is_deletion ? 'Keep session' : 'Reject'}
                               </button>
                             </div>
                           </div>
@@ -2384,75 +2863,140 @@ export default function GroupDetailPage() {
                       )
                     }
                     
-                    const totalAmount = sessionDetails.reduce((sum, detail) => sum + Math.abs(detail.amount), 0)
-                    
                     return (
                       <>
                         <div className="flex items-center justify-between mb-4">
                           <button
                             onClick={() => setViewingSessionId(null)}
-                            className="text-gray-700 hover:text-black font-medium flex items-center gap-2"
+                            className="text-sm font-medium hover:underline flex items-center gap-2"
+                            style={{ color: 'var(--ink-muted)' }}
                           >
-                            ← Back to Sessions
+                            <ArrowLeft size={16} /> Back to sessions
                           </button>
-                          {!session.pendingApproval && (
+                          {session.waitingForApproval ? (
                             <button
-                              onClick={() => handleEditSession(session.id)}
-                              className="px-3 py-1 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-sm text-black"
+                              onClick={() => setConfirmCancelEditSessionId(session.id)}
+                              className="btn-secondary text-sm py-1"
+                              style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
                             >
-                              Edit
+                              {session.pendingIsDeletion ? 'Cancel deletion request' : 'Cancel edit'}
                             </button>
+                          ) : !session.pendingApproval && (
+                            <div className="flex items-center gap-2">
+                              <button onClick={() => handleEditSession(session.id)} className="btn-secondary text-sm py-1">
+                                Edit
+                              </button>
+                              <button
+                                onClick={() => setConfirmDeleteSessionId(session.id)}
+                                className="p-1.5 rounded-md transition-colors text-[var(--ink-muted)] hover:text-[var(--rust)] hover:bg-[var(--rust-soft)]"
+                                title="Delete session"
+                                aria-label="Delete session"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
                           )}
                         </div>
-                        
-                        <div className="border-2 border-gray-300 rounded-lg p-6">
+
+                        <div className="card">
                           <div className="flex items-center gap-3 mb-2">
-                            <h2 className="text-2xl font-semibold text-black">
+                            <h2 className="font-display text-2xl font-semibold">
                               {session.Description || 'Untitled Session'}
                             </h2>
                             {!session.is_live && (session.Description?.includes('Live Session') || session.Description === 'Live Session') && (
-                              <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded font-medium flex items-center gap-1">
-                                <span>📋</span>
-                                Previously Live Session
+                              <span className="badge badge-outline flex items-center gap-1">
+                                <ClipboardList size={12} />
+                                Previously live
                               </span>
                             )}
                           </div>
-                          <p className="text-sm text-gray-600 mb-6">
+                          <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
                             {new Date(session.created_at).toLocaleDateString()}
                           </p>
-                          
-                          <div className="mb-6 grid grid-cols-2 gap-4">
-                            <div className="border-2 border-gray-300 rounded-lg p-4">
-                              <p className="text-sm text-gray-700 mb-1 font-medium">Members</p>
-                              <p className="text-2xl font-semibold text-black">{sessionDetails.length}</p>
-                            </div>
-                            <div className="border-2 border-gray-300 rounded-lg p-4">
-                              <p className="text-sm text-gray-700 mb-1 font-medium">Total Amount</p>
-                              <p className="text-2xl font-semibold text-black">${totalAmount.toFixed(2)}</p>
-                            </div>
-                          </div>
-                          
+
+                          {(() => {
+                            const canEditNotes = session.created_by == null || session.created_by === userId
+                            const isEditingNotes = editingNotesSessionId === session.id
+
+                            if (isEditingNotes) {
+                              return (
+                                <div className="mb-6">
+                                  <p className="eyebrow mb-2">Notes</p>
+                                  <textarea
+                                    value={notesDraft}
+                                    onChange={(e) => setNotesDraft(e.target.value)}
+                                    className="field"
+                                    rows={3}
+                                    placeholder="Add a note about this session…"
+                                    autoFocus
+                                  />
+                                  <div className="flex gap-2 mt-2">
+                                    <button
+                                      onClick={() => handleSaveNotes(session.id)}
+                                      disabled={savingNotes}
+                                      className="btn-primary text-sm"
+                                    >
+                                      {savingNotes ? 'Saving…' : 'Save'}
+                                    </button>
+                                    <button
+                                      onClick={() => setEditingNotesSessionId(null)}
+                                      disabled={savingNotes}
+                                      className="btn-secondary text-sm"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                              )
+                            }
+
+                            if (!session.notes && !canEditNotes) return null
+
+                            return (
+                              <div className="mb-6">
+                                <div className="flex items-center justify-between mb-2">
+                                  <p className="eyebrow">Notes</p>
+                                  {canEditNotes && (
+                                    <button
+                                      onClick={() => {
+                                        setNotesDraft(session.notes || '')
+                                        setEditingNotesSessionId(session.id)
+                                      }}
+                                      className="text-xs font-medium hover:underline"
+                                      style={{ color: 'var(--ink-muted)' }}
+                                    >
+                                      {session.notes ? 'Edit' : 'Add notes'}
+                                    </button>
+                                  )}
+                                </div>
+                                {session.notes ? (
+                                  <p className="text-sm whitespace-pre-wrap">{session.notes}</p>
+                                ) : (
+                                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No notes yet.</p>
+                                )}
+                              </div>
+                            )
+                          })()}
+
                           <div>
-                            <h3 className="text-lg font-semibold mb-4 text-black">Member Payments</h3>
+                            <p className="eyebrow mb-3">Member payments</p>
                             {sessionDetails.length === 0 ? (
-                              <p className="text-gray-700">No payments in this session.</p>
+                              <p style={{ color: 'var(--ink-muted)' }}>No payments in this session.</p>
                             ) : (
-                              <div className="space-y-2">
+                              <div className="divide-y" style={{ borderColor: 'var(--line)' }}>
                                 {sessionDetails.map((detail) => {
                                   const member = members.find(m => m.user_id === detail.user_id)
                                   const displayName = member ? formatDisplayName(members, member) : detail.username
                                   return (
-                                    <div
-                                      key={detail.user_id}
-                                      className="border-2 border-gray-300 rounded-lg p-4 flex items-center justify-between"
-                                    >
+                                    <div key={detail.user_id} className="flex items-center justify-between py-3">
                                       <div>
-                                        <p className="font-medium text-black">{displayName}</p>
-                                        <p className="text-xs text-gray-600">@{detail.username}</p>
+                                        <p className="font-medium text-sm">{displayName}</p>
+                                        <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{detail.username}</p>
                                       </div>
-                                    <p className={`text-lg font-semibold ${
-                                      detail.amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                    }`}>
+                                    <p
+                                      className="amount text-lg font-semibold"
+                                      style={{ color: detail.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                    >
                                       {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
                                     </p>
                                   </div>
@@ -2469,7 +3013,7 @@ export default function GroupDetailPage() {
               ) : (
                 <>
                   {sessions.length === 0 ? (
-                    <p className="text-gray-700">No sessions yet.</p>
+                    <p style={{ color: 'var(--ink-muted)' }}>No sessions yet.</p>
                   ) : (
                     <div className="space-y-2">
                       {sessions
@@ -2513,116 +3057,142 @@ export default function GroupDetailPage() {
                                 handleViewSession(session.id)
                               }
                             }}
-                            className={`border-2 rounded-lg p-4 transition-transform duration-200 hover:scale-105 cursor-pointer ${
-                              session.pendingApproval
-                                ? 'border-yellow-500 bg-yellow-50'
-                                : hasUndismissedRejection
-                                ? 'border-red-500 bg-red-50'
-                                : session.waitingForApproval
-                                ? 'border-orange-500 bg-orange-50'
-                                : session.is_live
-                                ? 'border-blue-500 bg-blue-50'
-                                : 'border-gray-300'
-                            }`}
+                            className="card cursor-pointer transition-colors hover:border-[var(--brass)]"
+                            style={
+                              session.is_live
+                                ? { borderColor: 'var(--ledger)', background: 'var(--emerald-soft)' }
+                                : undefined
+                            }
                           >
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-start justify-between gap-4">
                               <div className="flex-1">
                                 <div className="flex items-center gap-2">
-                                  <p className="font-semibold text-black">
+                                  <p className="font-semibold">
                                     {session.Description || 'Untitled Session'}
                                   </p>
                                   {session.is_payment && (
-                                    <span className="text-sm" title="Payment Session">✉️</span>
+                                    <ArrowRightLeft size={14} style={{ color: 'var(--ink-muted)' }} aria-label="Payment session" />
                                   )}
                                 </div>
-                                <div className="flex items-center gap-4 mt-1 flex-wrap">
-                                  <p className="text-sm text-gray-600">
+                                <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
                                     {new Date(session.created_at).toLocaleDateString()}
                                   </p>
-                                  <p className="text-sm text-gray-600">
-                                    {session.memberCount || 0} {session.memberCount === 1 ? 'member' : 'members'}
-                                  </p>
-                                  <p className="text-sm font-medium text-black">
-                                    Total: ${(session.totalAmount || 0).toFixed(2)}
-                                  </p>
                                   {session.userPayment !== null && session.userPayment !== undefined && (
-                                    <p className={`text-sm font-semibold ${
-                                      session.userPayment >= 0 ? 'text-green-600' : 'text-red-600'
-                                    }`}>
-                                      {session.userPayment >= 0 ? 'Received' : 'Sent'}: ${Math.abs(session.userPayment).toFixed(2)}
+                                    <p
+                                      className="amount text-sm font-semibold"
+                                      style={{ color: session.userPayment >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                    >
+                                      {session.userPayment >= 0 ? '+' : '-'}${Math.abs(session.userPayment).toFixed(2)}
                                     </p>
                                   )}
-                                  {session.is_live && (
-                                    <span className="text-xs bg-blue-600 text-white px-2 py-1 rounded font-medium">
-                                      LIVE
-                                    </span>
-                                  )}
+                                  {session.is_live && <span className="badge badge-ledger">Live</span>}
                                   {session.is_payment && (
-                                    <span className="text-xs bg-gray-600 text-white px-2 py-1 rounded font-medium flex items-center gap-1">
-                                      <span>✉️</span>
+                                    <span className="badge badge-outline flex items-center gap-1">
+                                      <ArrowRightLeft size={12} />
                                       Payment
                                     </span>
                                   )}
                                   {session.pendingApproval && (
-                                    <span className="text-xs bg-yellow-600 text-white px-2 py-1 rounded font-medium">
-                                      ⚠️ Pending Approval
+                                    <span className="badge badge-brass flex items-center gap-1">
+                                      {session.pendingIsDeletion ? <Trash2 size={12} /> : <TriangleAlert size={12} />}
+                                      {session.pendingIsDeletion ? 'Deletion requested' : 'Pending approval'}
                                     </span>
                                   )}
                                   {hasUndismissedRejection && (
-                                    <span className="text-xs bg-red-600 text-white px-2 py-1 rounded font-medium flex items-center gap-1">
-                                      <span>❌</span>
-                                      <span>Edit Rejected</span>
+                                    <span className="badge badge-rust flex items-center gap-1">
+                                      <XCircle size={12} />
+                                      <span>{pendingRejection?.is_deletion ? 'Deletion rejected' : 'Edit rejected'}</span>
                                     </span>
                                   )}
                                   {session.waitingForApproval && (
-                                    <span className="text-xs bg-orange-600 text-white px-2 py-1 rounded font-medium">
-                                      ⏳ Waiting for Approval
+                                    <span className="badge badge-brass flex items-center gap-1">
+                                      {session.pendingIsDeletion ? <Trash2 size={12} /> : <Hourglass size={12} />}
+                                      {session.pendingIsDeletion ? 'Deletion pending' : 'Waiting for approval'}
                                     </span>
                                   )}
                                 </div>
                               </div>
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-2 shrink-0">
                                 {session.is_live && (
+                                  <>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setConfirmCancelSessionId(session.id)
+                                      }}
+                                      className="btn-secondary text-sm py-1"
+                                      style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
+                                    >
+                                      Cancel
+                                    </button>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleCloseLiveSession(session.id)
+                                      }}
+                                      className="btn-danger text-sm py-1"
+                                    >
+                                      Close session
+                                    </button>
+                                  </>
+                                )}
+                                {!session.is_live && session.waitingForApproval && (
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation()
-                                      handleCloseLiveSession(session.id)
+                                      setConfirmCancelEditSessionId(session.id)
                                     }}
-                                    className="px-3 py-1 bg-red-600 text-white rounded-lg hover:bg-red-700 transition text-sm"
+                                    className="btn-secondary text-sm py-1"
+                                    style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
                                   >
-                                    Close Session
+                                    {session.pendingIsDeletion ? 'Cancel deletion request' : 'Cancel edit'}
                                   </button>
                                 )}
-                                {!session.is_live && !session.pendingApproval && !hasUndismissedRejection && (
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation()
-                                      handleEditSession(session.id)
-                                    }}
-                                    className="ml-4 px-3 py-1 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-sm text-black"
-                                  >
-                                    Edit
-                                  </button>
+                                {!session.is_live && !session.pendingApproval && !hasUndismissedRejection && !session.waitingForApproval && (
+                                  <>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleEditSession(session.id)
+                                      }}
+                                      className="btn-secondary text-sm py-1"
+                                    >
+                                      Edit
+                                    </button>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setConfirmDeleteSessionId(session.id)
+                                      }}
+                                      className="p-1.5 rounded-md transition-colors text-[var(--ink-muted)] hover:text-[var(--rust)] hover:bg-[var(--rust-soft)]"
+                                      title="Delete session"
+                                      aria-label="Delete session"
+                                    >
+                                      <Trash2 size={16} />
+                                    </button>
+                                  </>
                                 )}
                               </div>
                             </div>
                             {selectedLiveSession === session.id && (
-                              <div className="mt-4 pt-4 border-t-2 border-gray-300" onClick={(e) => e.stopPropagation()}>
-                                <h4 className="text-sm font-semibold mb-3 text-black">Live Session Payments</h4>
-                                
+                              <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--line)' }} onClick={(e) => e.stopPropagation()}>
+                                <p className="eyebrow mb-3">Live session payments</p>
+
                                 {/* Show all payments */}
                                 {sessionDetails.length > 0 && (
                                   <div className="mb-4">
-                                    <p className="text-xs font-medium text-gray-700 mb-2">Current Payments:</p>
+                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--ink-muted)' }}>Current payments</p>
                                     <div className="space-y-2">
                                       {sessionDetails.map((detail) => (
                                         <div
                                           key={detail.user_id}
-                                          className={`border-2 rounded-lg p-3 flex items-center justify-between ${
+                                          className="rounded-lg p-3 flex items-center justify-between border"
+                                          style={
                                             detail.user_id === userId
-                                              ? 'border-blue-500 bg-blue-50'
-                                              : 'border-gray-300 bg-gray-50'
-                                          }`}
+                                              ? { borderColor: 'var(--brass)', background: 'var(--brass-soft)' }
+                                              : { borderColor: 'var(--line)', background: 'var(--paper)' }
+                                          }
                                         >
                                           <div>
                                             {(() => {
@@ -2630,20 +3200,21 @@ export default function GroupDetailPage() {
                                               const displayName = member ? formatDisplayName(members, member) : detail.username
                                               return (
                                                 <>
-                                                  <p className="font-medium text-black">
+                                                  <p className="font-medium text-sm">
                                                     {displayName}
                                                     {detail.user_id === userId && (
-                                                      <span className="text-xs text-blue-600 ml-2">(You)</span>
+                                                      <span className="text-xs ml-2" style={{ color: 'var(--brass)' }}>(You)</span>
                                                     )}
                                                   </p>
-                                                  <p className="text-xs text-gray-600">@{detail.username}</p>
+                                                  <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{detail.username}</p>
                                                 </>
                                               )
                                             })()}
                                           </div>
-                                          <p className={`text-sm font-semibold ${
-                                            detail.amount >= 0 ? 'text-green-600' : 'text-red-600'
-                                          }`}>
+                                          <p
+                                            className="amount text-sm font-semibold"
+                                            style={{ color: detail.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                          >
                                             {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
                                           </p>
                                         </div>
@@ -2654,20 +3225,20 @@ export default function GroupDetailPage() {
 
                                 {/* User's payment input */}
                                 <div>
-                                  <p className="text-xs font-medium text-gray-700 mb-2">Your Payment:</p>
+                                  <p className="text-xs font-medium mb-2" style={{ color: 'var(--ink-muted)' }}>Your payment</p>
                                   <div className="flex gap-2">
                                     <input
                                       type="number"
                                       step="0.01"
                                       value={liveSessionAmount}
                                       onChange={(e) => setLiveSessionAmount(e.target.value)}
-                                      className="flex-1 border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                                      className="field amount flex-1"
                                       placeholder="0.00"
                                       autoFocus
                                     />
                                     <button
                                       onClick={() => handleAddToLiveSession(session.id)}
-                                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+                                      className="btn-primary"
                                       disabled={liveSessionAmount === ''}
                                     >
                                       {liveSessionAmount && session.userPayment !== null && session.userPayment !== undefined && parseFloat(liveSessionAmount) !== session.userPayment ? 'Update' : 'Save'}
@@ -2678,28 +3249,31 @@ export default function GroupDetailPage() {
                                         setLiveSessionAmount('')
                                         setSessionDetails([])
                                       }}
-                                      className="px-4 py-2 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-black"
+                                      className="btn-secondary"
                                     >
-                                      Cancel
+                                      Dismiss
                                     </button>
                                   </div>
                                 </div>
 
                                 {/* Show current total */}
                                 {sessionDetails.length > 0 && (
-                                  <div className="mt-3 p-2 border-2 border-gray-300 rounded-lg bg-gray-50">
+                                  <div className="mt-3 p-2 rounded-lg border" style={{ borderColor: 'var(--line)', background: 'var(--paper)' }}>
                                     <div className="flex items-center justify-between">
-                                      <span className="text-xs font-medium text-black">Current Total:</span>
-                                      <span className={`text-sm font-semibold ${
-                                        Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) < 0.01
-                                          ? 'text-green-600'
-                                          : 'text-red-600'
-                                      }`}>
+                                      <span className="text-xs font-medium">Current total</span>
+                                      <span
+                                        className="amount text-sm font-semibold"
+                                        style={{
+                                          color: Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) < 0.01
+                                            ? 'var(--emerald)'
+                                            : 'var(--rust)',
+                                        }}
+                                      >
                                         ${sessionDetails.reduce((sum, d) => sum + d.amount, 0).toFixed(2)}
                                       </span>
                                     </div>
                                     {Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) >= 0.01 && (
-                                      <p className="text-xs text-red-600 mt-1">Sum must equal $0.00 to close session</p>
+                                      <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Sum must equal $0.00 to close session</p>
                                     )}
                                   </div>
                                 )}
@@ -2712,26 +3286,145 @@ export default function GroupDetailPage() {
                   )}
                 </>
               )}
+
+              {confirmCancelSessionId !== null && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">Cancel this live session?</h3>
+                    <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                      Current input will be lost — every amount entered so far will be discarded and the session removed. This can&apos;t be undone.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleCancelLiveSession(confirmCancelSessionId)}
+                        className="btn-danger flex-1"
+                      >
+                        Cancel session
+                      </button>
+                      <button onClick={() => setConfirmCancelSessionId(null)} className="btn-secondary">
+                        Keep session
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {confirmDeleteSessionId !== null && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">Delete this session?</h3>
+                    <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                      If anyone else is part of this session, this sends them a deletion request — nothing is removed until everyone approves. If you&apos;re the only one in it, it&apos;s deleted right away. Either way, this can&apos;t be undone once it goes through.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleDeleteSession(confirmDeleteSessionId)}
+                        className="btn-danger flex-1"
+                      >
+                        Request deletion
+                      </button>
+                      <button onClick={() => setConfirmDeleteSessionId(null)} className="btn-secondary">
+                        Keep session
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {confirmCancelEditSessionId !== null && (() => {
+                const isDeletionRequest = sessions.find(s => s.id === confirmCancelEditSessionId)?.pendingIsDeletion
+                return (
+                  <div className="modal-overlay">
+                    <div className="modal-panel">
+                      <h3 className="font-display text-xl font-semibold mb-2">
+                        {isDeletionRequest ? 'Cancel this deletion request?' : 'Cancel this edit?'}
+                      </h3>
+                      <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                        {isDeletionRequest
+                          ? 'The session will stay exactly as it is. Anyone who already approved or rejected the deletion will be notified that the request was cancelled.'
+                          : 'The session will keep its current amounts. Anyone who already approved or rejected your changes will be notified that the edit was cancelled.'}
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleCancelEdit(confirmCancelEditSessionId)}
+                          className="btn-danger flex-1"
+                        >
+                          {isDeletionRequest ? 'Cancel deletion request' : 'Cancel edit'}
+                        </button>
+                        <button onClick={() => setConfirmCancelEditSessionId(null)} className="btn-secondary">
+                          Keep waiting
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {showCreateLiveSessionModal && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-4">Start a live session</h3>
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        handleCreateLiveSession(liveSessionDescription.trim())
+                      }}
+                      className="space-y-4"
+                    >
+                      <div>
+                        <label htmlFor="liveSessionDescription" className="block text-sm font-medium mb-1">
+                          Description (optional)
+                        </label>
+                        <input
+                          id="liveSessionDescription"
+                          type="text"
+                          value={liveSessionDescription}
+                          onChange={(e) => setLiveSessionDescription(e.target.value)}
+                          className="field"
+                          placeholder="e.g., Bar tab"
+                          autoFocus
+                        />
+                      </div>
+                      <div className="flex gap-2">
+                        <button type="submit" className="btn-primary flex-1">
+                          Start session
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowCreateLiveSessionModal(false)
+                            setLiveSessionDescription('')
+                          }}
+                          className="btn-secondary"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
           {activeTab === 'payments' && (
             <div>
-              <h2 className="text-2xl font-semibold mb-4 text-black">Make a Payment</h2>
-              
-              <form onSubmit={handleMakePayment} className="border-2 border-gray-300 rounded-lg p-6 space-y-4">
+              <p className="eyebrow mb-1">Settle up</p>
+              <h2 className="font-display text-2xl font-semibold mb-6">Make a Payment</h2>
+
+              <form onSubmit={handleMakePayment} className="card space-y-4">
                 <div>
-                  <label className="block text-sm font-medium mb-1 text-black">
-                    Pay To
+                  <label className="block text-sm font-medium mb-1">
+                    Pay to
                   </label>
                   <select
                     value={paymentPayee || ''}
                     onChange={(e) => setPaymentPayee(e.target.value ? parseInt(e.target.value) : null)}
-                    className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                    className="field"
                     required
                   >
                     <option value="">Select a member</option>
-                    {members
+                    {activeMembers
                       .filter(m => m.user_id !== userId)
                       .map((member) => (
                         <option key={member.user_id} value={member.user_id}>
@@ -2739,13 +3432,13 @@ export default function GroupDetailPage() {
                         </option>
                       ))}
                   </select>
-                  {members.filter(m => m.user_id !== userId).length === 0 && (
-                    <p className="text-sm text-gray-600 mt-1">No other members in this group</p>
+                  {activeMembers.filter(m => m.user_id !== userId).length === 0 && (
+                    <p className="text-sm mt-1" style={{ color: 'var(--ink-muted)' }}>No other members in this group</p>
                   )}
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium mb-1 text-black">
+                  <label className="block text-sm font-medium mb-1">
                     Amount ($)
                   </label>
                   <input
@@ -2754,21 +3447,21 @@ export default function GroupDetailPage() {
                     min="0.01"
                     value={paymentAmount}
                     onChange={(e) => setPaymentAmount(e.target.value)}
-                    className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                    className="field amount"
                     placeholder="0.00"
                     required
                   />
                 </div>
 
                 <div>
-                  <label className="block text-sm font-medium mb-1 text-black">
+                  <label className="block text-sm font-medium mb-1">
                     Description (optional)
                   </label>
                   <input
                     type="text"
                     value={paymentDescription}
                     onChange={(e) => setPaymentDescription(e.target.value)}
-                    className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                    className="field"
                     placeholder="e.g., Payment for dinner"
                   />
                 </div>
@@ -2776,10 +3469,10 @@ export default function GroupDetailPage() {
                 <div className="flex gap-2">
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-                    disabled={!paymentPayee || !paymentAmount || members.filter(m => m.user_id !== userId).length === 0}
+                    className="btn-primary"
+                    disabled={!paymentPayee || !paymentAmount || activeMembers.filter(m => m.user_id !== userId).length === 0}
                   >
-                    Record Payment
+                    Record payment
                   </button>
                   <button
                     type="button"
@@ -2788,16 +3481,16 @@ export default function GroupDetailPage() {
                       setPaymentAmount('')
                       setPaymentDescription('')
                     }}
-                    className="px-4 py-2 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-black"
+                    className="btn-secondary"
                   >
                     Clear
                   </button>
                 </div>
               </form>
 
-              <div className="mt-6 border-2 border-gray-300 rounded-lg p-4 bg-gray-50">
-                <h3 className="text-sm font-semibold mb-2 text-black">How it works:</h3>
-                <ul className="text-sm text-gray-700 space-y-1 list-disc list-inside">
+              <div className="mt-6 rounded-lg p-4 border" style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}>
+                <p className="eyebrow mb-2">How it works</p>
+                <ul className="text-sm space-y-1 list-disc list-inside" style={{ color: 'var(--ink-muted)' }}>
                   <li>Select a member to pay</li>
                   <li>Enter the payment amount</li>
                   <li>A session will be created with two payments: one for you (negative) and one for the recipient (positive)</li>
@@ -2809,63 +3502,65 @@ export default function GroupDetailPage() {
 
           {activeTab === 'info' && (
             <div>
-              <h2 className="text-2xl font-semibold mb-4 text-black">{group.name || 'Group Info'}</h2>
-              
+              <p className="eyebrow mb-1">Ledger details</p>
+              <h2 className="font-display text-2xl font-semibold mb-6">{group.name || 'Group Info'}</h2>
+
               {/* Owner Information */}
               {isOwner && (
-                <div className="mb-6 border-2 border-gray-300 rounded-lg p-4">
-                  <h3 className="text-lg font-semibold mb-3 text-black">Owner Information</h3>
-                  <p className="text-sm text-gray-700">You are the owner of this group.</p>
+                <div className="mb-4 rounded-lg p-4 border" style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}>
+                  <p className="text-sm font-medium" style={{ color: 'var(--brass)' }}>You are the owner of this group.</p>
                 </div>
               )}
 
               {/* Group Details */}
-              <div className="mb-6 border-2 border-gray-300 rounded-lg p-4">
-                <h3 className="text-lg font-semibold mb-3 text-black">Group Details</h3>
-                <div className="space-y-2">
-                  <p className="text-sm text-gray-700">
-                    <span className="font-medium text-black">Created:</span>{' '}
-                    {new Date(group.created_at).toLocaleDateString()}
-                  </p>
-                  <p className="text-sm text-gray-700">
-                    <span className="font-medium text-black">Members:</span> {members.length}
-                  </p>
-                  <p className="text-sm text-gray-700">
-                    <span className="font-medium text-black">Sessions:</span> {sessions.length}
-                  </p>
+              <div className="card mb-6">
+                <p className="eyebrow mb-3">Group details</p>
+                <div>
+                  <div className="ledger-row">
+                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Created</span>
+                    <span className="text-sm font-medium">{new Date(group.created_at).toLocaleDateString()}</span>
+                  </div>
+                  <div className="ledger-row">
+                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Members</span>
+                    <span className="text-sm font-medium">{members.length}</span>
+                  </div>
+                  <div className="ledger-row">
+                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Sessions</span>
+                    <span className="text-sm font-medium">{sessions.length}</span>
+                  </div>
                 </div>
               </div>
 
-              {/* Group Pin - Visible to all members */}
+              {/* Group Pin — the ticket stub signature */}
               {group.pin && (
-                <div className="border-2 border-gray-300 rounded-lg p-4">
-                  <h3 className="text-lg font-semibold mb-3 text-black">Group Pin</h3>
-                  <p className="text-sm text-gray-700 mb-3">Share this pin with others so they can join your group:</p>
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 p-4 bg-gray-50 rounded-lg border-2 border-gray-300">
-                      <p className="text-center text-3xl font-mono font-bold text-black tracking-widest">
+                <div>
+                  <p className="eyebrow mb-3">Group pin</p>
+                  <p className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>
+                    Share this pin with others so they can join your group.
+                  </p>
+                  <div className="flex items-center gap-4 flex-wrap">
+                    <div className="ticket-stub px-8 py-5">
+                      <p className="amount text-center text-3xl font-semibold tracking-[0.35em]" style={{ color: 'var(--brass)' }}>
                         {showPin ? group.pin : '••••••'}
                       </p>
                     </div>
-                    <button
-                      onClick={() => setShowPin(!showPin)}
-                      className="px-4 py-2 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-sm text-black"
-                    >
-                      {showPin ? 'Hide' : 'Show'}
-                    </button>
-                    <button
-                      onClick={handleCopyPin}
-                      className="px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition text-sm"
-                    >
-                      Copy
-                    </button>
+                    <div className="flex gap-2">
+                      <button onClick={() => setShowPin(!showPin)} className="btn-secondary text-sm">
+                        {showPin ? 'Hide' : 'Show'}
+                      </button>
+                      <button onClick={handleCopyPin} className="btn-primary text-sm">
+                        Copy
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
+
             </div>
           )}
         </div>
       </div>
+      <ToastStack toasts={toasts} onDismiss={dismiss} />
     </main>
   )
 }

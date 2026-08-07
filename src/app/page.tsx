@@ -3,8 +3,11 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import { ArrowRight } from 'lucide-react'
 import AuthPanel from '@/components/AuthPanel'
+import ToastStack from '@/components/ToastStack'
 import useAuth from '@/hooks/useAuth'
+import useToast from '@/hooks/useToast'
 import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
 
@@ -26,6 +29,9 @@ export default function HomePage() {
   const [showJoinModal, setShowJoinModal] = useState(false)
   const [joinPin, setJoinPin] = useState('')
   const [joinError, setJoinError] = useState('')
+  const [showCreateGroupModal, setShowCreateGroupModal] = useState(false)
+  const [newGroupName, setNewGroupName] = useState('')
+  const { toasts, showToast, dismiss } = useToast()
 
   const loadGroups = useCallback(async () => {
     if (!user) {
@@ -158,8 +164,7 @@ export default function HomePage() {
     checkSession()
   }, [user, authLoading, router, loadGroups])
 
-  const handleCreateGroup = async () => {
-    const name = prompt('Enter group name:')
+  const handleCreateGroup = async (name: string) => {
     if (!name || !user) return
 
     try {
@@ -168,7 +173,7 @@ export default function HomePage() {
       const dbUserId = await getOrCreateUser(user)
       if (!dbUserId) {
         console.error('Failed to get user ID. User:', user)
-        alert('Failed to get user information. Please check the console for details.')
+        showToast('Failed to get user information. Please check the console for details.')
         return
       }
       console.log('Got user ID:', dbUserId)
@@ -182,15 +187,13 @@ export default function HomePage() {
       let attempts = 0
       let pinExists = true
 
-      // Ensure pin is unique
+      // Ensure pin is unique. Groups are locked down to members-only in RLS, so
+      // checking another group's pin — one we're not a member of — has to go
+      // through this lookup function rather than a plain select.
       while (pinExists && attempts < 10) {
-        const { data: existingGroup } = await supabase
-          .from('Group')
-          .select('id')
-          .eq('pin', pin)
-          .maybeSingle()
+        const { data: existingGroups } = await supabase.rpc('find_group_by_pin', { input_pin: pin })
 
-        if (!existingGroup) {
+        if (!existingGroups || existingGroups.length === 0) {
           pinExists = false
         } else {
           pin = generatePin()
@@ -223,10 +226,19 @@ export default function HomePage() {
         // Reload groups to get the updated list
         await loadGroups()
       }
+      setShowCreateGroupModal(false)
+      setNewGroupName('')
     } catch (error) {
       console.error('Error creating group:', error)
-      alert('Failed to create group')
+      showToast('Failed to create group')
     }
+  }
+
+  const handleCreateGroupSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const trimmed = newGroupName.trim()
+    if (!trimmed) return
+    handleCreateGroup(trimmed)
   }
 
   const handleJoinGroup = async (e: React.FormEvent) => {
@@ -243,147 +255,175 @@ export default function HomePage() {
         return
       }
 
-      // Find group by pin
-      const { data: groupData, error: groupError } = await supabase
-        .from('Group')
-        .select('id, name')
-        .eq('pin', joinPin.trim())
-        .single()
+      // Find group by pin — via a lookup function rather than a plain select,
+      // since Group is locked down to members-only and we aren't one yet.
+      const { data: groupRows, error: groupError } = await supabase.rpc('find_group_by_pin', {
+        input_pin: joinPin.trim(),
+      })
+      const groupData = groupRows?.[0]
 
       if (groupError || !groupData) {
         setJoinError('Invalid group pin. Please check and try again.')
         return
       }
 
-      // Check if user is already a member
+      // Check if user is already an active member (a removed member's row still
+      // exists with status 'removed', so this has to check status specifically —
+      // otherwise they'd be told they're "already a member" and blocked from
+      // ever requesting to rejoin)
       const { data: existingMember } = await supabase
         .from('GroupMember')
-        .select('*')
+        .select('status')
         .eq('id', groupData.id)
         .eq('user_id', dbUserId)
         .maybeSingle()
 
-      if (existingMember) {
+      if (existingMember && existingMember.status !== 'removed') {
         setJoinError('You are already a member of this group')
         return
       }
 
-      // Add user to group
-      const { error: memberError } = await supabase
-        .from('GroupMember')
-        .insert([{
-          id: groupData.id,
-          user_id: dbUserId,
-          role: 'member'
-        }])
+      // Check for an existing pending request instead of creating a duplicate
+      const { data: existingRequest } = await supabase
+        .from('JoinRequest')
+        .select('id')
+        .eq('group_id', groupData.id)
+        .eq('user_id', dbUserId)
+        .eq('status', 'pending')
+        .maybeSingle()
 
-      if (memberError) {
-        console.error('Error joining group:', memberError)
-        setJoinError('Failed to join group. Please try again.')
+      if (existingRequest) {
+        setJoinError('You already have a request pending for this group — waiting on the owner to approve it.')
         return
       }
 
-      // Success - close modal and reload groups
+      // Request to join — the group owner has to approve before you're actually
+      // a member (see the Members tab's Pending Requests section for the other side).
+      const { error: requestError } = await supabase
+        .from('JoinRequest')
+        .insert([{
+          group_id: groupData.id,
+          user_id: dbUserId,
+        }])
+
+      if (requestError) {
+        console.error('Error requesting to join group:', requestError)
+        setJoinError('Failed to send join request. Please try again.')
+        return
+      }
+
+      // Success - close modal
       setShowJoinModal(false)
       setJoinPin('')
       setJoinError('')
-      await loadGroups()
+      showToast(`Request sent! ${groupData.name || 'The group'}'s owner needs to approve you before you can access it.`)
     } catch (error: any) {
-      console.error('Error joining group:', error)
-      setJoinError(error.message || 'Failed to join group')
+      console.error('Error requesting to join group:', error)
+      setJoinError(error.message || 'Failed to send join request')
     }
   }
 
   if (authLoading || (loading && user)) {
     return (
-      <main className="min-h-screen">
-        <div className="max-w-4xl mx-auto px-6 py-8">
-          <div className="text-center py-12">Loading...</div>
-        </div>
+      <main className="min-h-screen flex items-center justify-center">
+        <p className="eyebrow">Loading…</p>
       </main>
     )
   }
 
   // Show landing page if user is not authenticated
   if (!user) {
+    const preview = [
+      { name: 'Alex', amount: 42 },
+      { name: 'Jordan', amount: -18.5 },
+      { name: 'Sam', amount: -23.5 },
+    ]
+
     return (
       <main className="min-h-screen">
-        <header className="border-b border-gray-300 bg-transparent">
+        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
           <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-            <h1 className="text-xl font-semibold text-black">Dues</h1>
-            <Link
-              href="/login"
-              className="px-4 py-2 rounded-lg bg-black text-white hover:bg-gray-800 transition text-sm font-medium"
-            >
+            <h1 className="font-display text-xl font-semibold tracking-tight">Dues</h1>
+            <Link href="/login" className="btn-primary text-sm">
               Log in
             </Link>
           </div>
         </header>
 
-        <div className="max-w-6xl mx-auto px-6 py-16">
+        <div className="max-w-6xl mx-auto px-6 pt-16 pb-24">
           {/* Hero Section */}
-          <div className="text-center mb-16">
-            <h2 className="text-5xl font-bold text-black mb-4">
-              Split Expenses, Track Dues
-            </h2>
-            <p className="text-xl text-gray-700 mb-8 max-w-2xl mx-auto">
-              Manage group expenses and track who owes what. Create groups, add sessions, and keep everyone in sync.
-            </p>
-            <div className="flex justify-center">
-              <Link
-                href="/login?signup=true"
-                className="px-8 py-3 bg-black text-white rounded-lg hover:bg-gray-800 transition text-lg font-medium"
-              >
-                Get Started
+          <div className="grid lg:grid-cols-[1.1fr_0.9fr] gap-14 items-center mb-24">
+            <div>
+              <p className="eyebrow mb-4">Group expenses, kept honest</p>
+              <h2 className="font-display text-5xl sm:text-6xl font-semibold tracking-tight leading-[1.05] mb-6">
+                Split evenly.<br />Settle simply.
+              </h2>
+              <p className="text-lg max-w-xl mb-8" style={{ color: 'var(--ink-muted)' }}>
+                Track group dues without the spreadsheet. Create a group, log who paid,
+                and watch every balance settle to zero.
+              </p>
+              <Link href="/login?signup=true" className="btn-primary text-base px-6 py-3 inline-flex items-center gap-2">
+                Get started <ArrowRight size={18} />
               </Link>
+            </div>
+
+            {/* Statement preview — the signature element */}
+            <div className="card">
+              <div className="flex items-center justify-between mb-4">
+                <p className="eyebrow">Weekend trip</p>
+                <span className="badge badge-outline">Statement</span>
+              </div>
+              <div>
+                {preview.map((p) => (
+                  <div key={p.name} className="ledger-row">
+                    <span className="text-sm font-medium">{p.name}</span>
+                    <span
+                      className="amount text-sm font-semibold"
+                      style={{ color: p.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                    >
+                      {p.amount >= 0 ? '+' : ''}${p.amount.toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-between pt-4 mt-1 border-t" style={{ borderColor: 'var(--line)' }}>
+                <span className="eyebrow">Balance</span>
+                <span className="amount text-sm font-semibold">$0.00</span>
+              </div>
             </div>
           </div>
 
           {/* Features Section */}
-          <div className="grid md:grid-cols-3 gap-8 mb-16">
-            <div className="border-2 border-gray-300 rounded-lg p-6 hover:shadow-lg transition">
-              <div className="text-4xl mb-4">👥</div>
-              <h3 className="text-xl font-semibold text-black mb-2">Create Groups</h3>
-              <p className="text-gray-700">
-                Organize expenses by group. Each group gets a unique pin for easy sharing.
-              </p>
-            </div>
-            <div className="border-2 border-gray-300 rounded-lg p-6 hover:shadow-lg transition">
-              <div className="text-4xl mb-4">💰</div>
-              <h3 className="text-xl font-semibold text-black mb-2">Track Sessions</h3>
-              <p className="text-gray-700">
-                Add expense sessions and see who paid what. All amounts automatically balance to zero.
-              </p>
-            </div>
-            <div className="border-2 border-gray-300 rounded-lg p-6 hover:shadow-lg transition">
-              <div className="text-4xl mb-4">📊</div>
-              <h3 className="text-xl font-semibold text-black mb-2">View Dues</h3>
-              <p className="text-gray-700">
-                See your outstanding balance at a glance. Know exactly what you owe or are owed.
-              </p>
-            </div>
+          <div className="grid md:grid-cols-3 gap-px mb-24 rounded-lg overflow-hidden border" style={{ borderColor: 'var(--line)', background: 'var(--line)' }}>
+            {[
+              { title: 'Create groups', body: 'Organize expenses by group. Each one gets a unique pin for easy sharing.' },
+              { title: 'Track sessions', body: 'Log expense sessions and see who paid what. Amounts always balance to zero.' },
+              { title: 'View dues', body: 'See your outstanding balance at a glance — exactly what you owe or are owed.' },
+            ].map((f) => (
+              <div key={f.title} className="p-8" style={{ background: 'var(--paper-card)' }}>
+                <h3 className="font-display text-lg font-semibold mb-2">{f.title}</h3>
+                <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>{f.body}</p>
+              </div>
+            ))}
           </div>
 
           {/* How It Works */}
-          <div className="border-2 border-gray-300 rounded-lg p-8 bg-gray-50">
-            <h3 className="text-2xl font-semibold text-black mb-6 text-center">How It Works</h3>
-            <div className="grid md:grid-cols-4 gap-6">
-              <div className="text-center">
-                <div className="w-12 h-12 bg-black text-white rounded-full flex items-center justify-center font-bold text-lg mx-auto mb-3">1</div>
-                <p className="text-sm text-gray-700">Create or join a group</p>
-              </div>
-              <div className="text-center">
-                <div className="w-12 h-12 bg-black text-white rounded-full flex items-center justify-center font-bold text-lg mx-auto mb-3">2</div>
-                <p className="text-sm text-gray-700">Add expense sessions</p>
-              </div>
-              <div className="text-center">
-                <div className="w-12 h-12 bg-black text-white rounded-full flex items-center justify-center font-bold text-lg mx-auto mb-3">3</div>
-                <p className="text-sm text-gray-700">Track who owes what</p>
-              </div>
-              <div className="text-center">
-                <div className="w-12 h-12 bg-black text-white rounded-full flex items-center justify-center font-bold text-lg mx-auto mb-3">4</div>
-                <p className="text-sm text-gray-700">Settle up easily</p>
-              </div>
+          <div>
+            <p className="eyebrow mb-6 text-center">How it works</p>
+            <div className="grid md:grid-cols-4 gap-8">
+              {[
+                'Create or join a group',
+                'Add expense sessions',
+                'Track who owes what',
+                'Settle up easily',
+              ].map((step, i) => (
+                <div key={step} className="text-center">
+                  <p className="font-display text-3xl font-semibold mb-2" style={{ color: 'var(--brass)' }}>
+                    {String(i + 1).padStart(2, '0')}
+                  </p>
+                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>{step}</p>
+                </div>
+              ))}
             </div>
           </div>
         </div>
@@ -393,40 +433,77 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen">
-      <header className="border-b border-gray-300 bg-transparent">
+      <header className="border-b" style={{ borderColor: 'var(--line)' }}>
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
-          <h1 className="text-xl font-semibold text-black">Dues</h1>
+          <Link href="/" className="font-display text-xl font-semibold tracking-tight">Dues</Link>
           <AuthPanel />
         </div>
       </header>
 
-      <div className="max-w-4xl mx-auto px-6 py-8">
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-2xl font-semibold text-black">My Groups</h2>
+      <div className="max-w-4xl mx-auto px-6 py-10">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <p className="eyebrow mb-1">Your groups</p>
+            <h2 className="font-display text-2xl font-semibold">My Groups</h2>
+          </div>
           <div className="flex gap-2">
-            <button
-              onClick={() => setShowJoinModal(true)}
-              className="px-4 py-2 border-2 border-gray-300 text-black rounded-lg hover:bg-gray-100 transition"
-            >
-              Join Group
+            <button onClick={() => setShowJoinModal(true)} className="btn-secondary">
+              Request to join
             </button>
-            <button
-              onClick={handleCreateGroup}
-              className="px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-            >
-              + New Group
+            <button onClick={() => setShowCreateGroupModal(true)} className="btn-primary">
+              + New group
             </button>
           </div>
         </div>
 
+        {showCreateGroupModal && (
+          <div className="modal-overlay">
+            <div className="modal-panel">
+              <h3 className="font-display text-xl font-semibold mb-4">Name your group</h3>
+              <form onSubmit={handleCreateGroupSubmit} className="space-y-4">
+                <div>
+                  <label htmlFor="newGroupName" className="block text-sm font-medium mb-1">
+                    Group name
+                  </label>
+                  <input
+                    id="newGroupName"
+                    type="text"
+                    value={newGroupName}
+                    onChange={(e) => setNewGroupName(e.target.value)}
+                    className="field"
+                    placeholder="e.g., Roommates"
+                    required
+                    autoFocus
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <button type="submit" className="btn-primary flex-1">
+                    Create group
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCreateGroupModal(false)
+                      setNewGroupName('')
+                    }}
+                    className="btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
         {showJoinModal && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 border-2 border-gray-300 shadow-lg">
-              <h3 className="text-xl font-semibold mb-4 text-black">Join Group</h3>
+          <div className="modal-overlay">
+            <div className="modal-panel">
+              <h3 className="font-display text-xl font-semibold mb-4">Request to join a group</h3>
               <form onSubmit={handleJoinGroup} className="space-y-4">
                 <div>
-                  <label htmlFor="joinPin" className="block text-sm font-medium mb-1 text-black">
-                    Enter Group Pin
+                  <label htmlFor="joinPin" className="block text-sm font-medium mb-1">
+                    Group pin
                   </label>
                   <input
                     id="joinPin"
@@ -436,25 +513,22 @@ export default function HomePage() {
                       setJoinPin(e.target.value.replace(/\D/g, '').slice(0, 6))
                       setJoinError('')
                     }}
-                    className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none text-center text-2xl tracking-widest"
+                    className="field amount text-center text-2xl tracking-[0.3em]"
                     placeholder="000000"
                     maxLength={6}
                     required
                     autoFocus
                   />
-                  <p className="text-xs text-gray-600 mt-1">Enter the 6-digit pin provided by the group owner</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>Enter the 6-digit pin provided by the group owner. They&apos;ll need to approve your request before you have access.</p>
                 </div>
                 {joinError && (
-                  <div className="p-3 bg-yellow-50 border border-yellow-200 text-yellow-800 rounded text-sm">
+                  <div className="p-3 rounded-md text-sm border" style={{ background: 'var(--rust-soft)', color: 'var(--rust)', borderColor: 'var(--rust)' }}>
                     {joinError}
                   </div>
                 )}
                 <div className="flex gap-2">
-                  <button
-                    type="submit"
-                    className="flex-1 px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition"
-                  >
-                    Join
+                  <button type="submit" className="btn-primary flex-1">
+                    Send request
                   </button>
                   <button
                     type="button"
@@ -463,7 +537,7 @@ export default function HomePage() {
                       setJoinPin('')
                       setJoinError('')
                     }}
-                    className="px-4 py-2 border-2 border-gray-300 rounded-lg hover:bg-gray-100 transition text-black"
+                    className="btn-secondary"
                   >
                     Cancel
                   </button>
@@ -474,45 +548,41 @@ export default function HomePage() {
         )}
 
         {groups.length === 0 ? (
-          <div className="text-center py-12">
-            <p className="mb-4 text-gray-700">No groups yet.</p>
-            <button
-              onClick={handleCreateGroup}
-              className="text-black underline font-medium"
-            >
-              Create your first group
+          <div className="card text-center py-16">
+            <p className="mb-4" style={{ color: 'var(--ink-muted)' }}>No groups yet.</p>
+            <button onClick={() => setShowCreateGroupModal(true)} className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--ledger)' }}>
+              Create your first group <ArrowRight size={14} />
             </button>
           </div>
         ) : (
-          <div className="grid gap-4">
+          <div className="grid gap-3">
             {groups.map((group) => (
               <Link
                 key={group.id}
                 href={`/groups/${group.id}`}
-                className={`block border-2 rounded-lg p-4 transition-transform duration-200 hover:scale-105 ${
-                  group.role === 'owner'
-                    ? 'border-yellow-500 hover:border-yellow-600'
-                    : 'border-gray-300 hover:border-gray-400'
-                }`}
+                className="card flex items-center justify-between transition-colors hover:border-[var(--brass)]"
               >
-                <div className="flex items-center justify-between">
-                  <div className="flex-1">
-                    <h3 className="font-semibold text-lg mb-1 text-black">{group.name || 'Untitled Group'}</h3>
-                    <p className="text-sm text-gray-600">
+                <div className="flex items-center gap-3">
+                  <div
+                    className="w-9 h-9 rounded-full flex items-center justify-center font-display font-semibold text-sm shrink-0"
+                    style={{ background: 'var(--ledger)', color: 'var(--on-ledger)' }}
+                  >
+                    {(group.name || 'U').charAt(0).toUpperCase()}
+                  </div>
+                  <div>
+                    <h3 className="font-semibold">{group.name || 'Untitled Group'}</h3>
+                    <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
                       {group.memberCount || 0} {group.memberCount === 1 ? 'member' : 'members'}
                     </p>
                   </div>
-                  {group.role === 'owner' && (
-                    <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-1 rounded font-medium">
-                      Owner
-                    </span>
-                  )}
                 </div>
+                {group.role === 'owner' && <span className="badge badge-brass">Owner</span>}
               </Link>
             ))}
           </div>
         )}
       </div>
+      <ToastStack toasts={toasts} onDismiss={dismiss} />
     </main>
   )
 }

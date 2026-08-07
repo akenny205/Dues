@@ -2,6 +2,7 @@
 
 import { useEffect, useState, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import useAuth from '@/hooks/useAuth'
 
@@ -608,23 +609,28 @@ function LoginForm() {
     }
   }
 
+  const messageStyle = message.includes('Check your email')
+    ? { background: 'var(--emerald-soft)', color: 'var(--emerald)', borderColor: 'var(--emerald)' }
+    : message.includes('already taken') || message.includes('already registered')
+    ? { background: 'var(--rust-soft)', color: 'var(--rust)', borderColor: 'var(--rust)' }
+    : { background: 'var(--brass-soft)', color: 'var(--brass)', borderColor: 'var(--brass)' }
+
   return (
-    <main className="min-h-screen flex items-center justify-center">
-      <div className="w-full max-w-md px-6">
-        <div className="border-2 border-gray-300 rounded-lg p-8 shadow-sm">
-          <h1 className="text-2xl font-semibold mb-2 text-black">Dues</h1>
-          <p className="text-sm text-gray-700 mb-6">
-            {isSignUp ? 'Create an account' : 'Sign in to manage your groups and pay dues'}
-          </p>
+    <main className="min-h-screen flex items-center justify-center px-6 py-16">
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+          <Link href="/" className="font-display text-3xl font-semibold tracking-tight">Dues</Link>
+          <div className="mx-auto mt-3 h-px w-10" style={{ background: 'var(--brass)' }} />
+        </div>
+
+        <div className="card">
+          <p className="eyebrow mb-1">{isSignUp ? 'Create account' : 'Welcome back'}</p>
+          <h1 className="font-display text-2xl font-semibold mb-6">
+            {isSignUp ? 'Open a new ledger' : 'Sign in to your groups'}
+          </h1>
 
           {message && (
-            <div className={`mb-4 p-3 rounded text-sm font-medium ${
-              message.includes('Check your email') 
-                ? 'bg-green-50 border border-green-200 text-green-800' 
-                : message.includes('already taken') || message.includes('already registered')
-                ? 'bg-red-50 border border-red-200 text-red-800'
-                : 'bg-yellow-50 border border-yellow-200 text-yellow-800'
-            }`}>
+            <div className="mb-5 p-3 rounded-md text-sm font-medium border" style={messageStyle}>
               {message}
             </div>
           )}
@@ -634,7 +640,7 @@ function LoginForm() {
               <>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label htmlFor="firstName" className="block text-sm font-medium mb-1 text-black">First Name</label>
+                    <label htmlFor="firstName" className="block text-sm font-medium mb-1">First name</label>
                     <input
                       id="firstName"
                       name="firstName"
@@ -644,14 +650,14 @@ function LoginForm() {
                         setFirstName(e.target.value)
                         setMessage('')
                       }}
-                      className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                      className="field"
                       placeholder="John"
                       required
                       autoComplete="given-name"
                     />
                   </div>
                   <div>
-                    <label htmlFor="lastName" className="block text-sm font-medium mb-1 text-black">Last Name</label>
+                    <label htmlFor="lastName" className="block text-sm font-medium mb-1">Last name</label>
                     <input
                       id="lastName"
                       name="lastName"
@@ -661,7 +667,7 @@ function LoginForm() {
                         setLastName(e.target.value)
                         setMessage('')
                       }}
-                      className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                      className="field"
                       placeholder="Doe"
                       required
                       autoComplete="family-name"
@@ -669,7 +675,7 @@ function LoginForm() {
                   </div>
                 </div>
                 <div>
-                  <label htmlFor="username" className="block text-sm font-medium mb-1 text-black">Username</label>
+                  <label htmlFor="username" className="block text-sm font-medium mb-1">Username</label>
                   <input
                     id="username"
                     name="username"
@@ -679,7 +685,7 @@ function LoginForm() {
                       setUsername(e.target.value)
                       setMessage('') // Clear error message when user types
                     }}
-                    className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                    className="field"
                     placeholder="johndoe"
                     required
                     minLength={3}
@@ -687,20 +693,20 @@ function LoginForm() {
                     title="Username must be at least 3 characters and can only contain letters, numbers, and underscores"
                     autoComplete="username"
                   />
-                  <p className="text-xs text-gray-600 mt-1">3+ characters, letters, numbers, and underscores only</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>3+ characters, letters, numbers, and underscores only</p>
                 </div>
               </>
             )}
 
             <div>
-              <label htmlFor="email" className="block text-sm font-medium mb-1 text-black">Email</label>
+              <label htmlFor="email" className="block text-sm font-medium mb-1">Email</label>
               <input
                 id="email"
                 name="email"
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                className="field"
                 placeholder="you@example.com"
                 required
                 autoComplete="email"
@@ -708,14 +714,14 @@ function LoginForm() {
             </div>
 
             <div>
-              <label htmlFor="password" className="block text-sm font-medium mb-1 text-black">Password</label>
+              <label htmlFor="password" className="block text-sm font-medium mb-1">Password</label>
               <input
                 id="password"
                 name="password"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full border-2 border-gray-300 rounded-lg px-3 py-2 text-black focus:border-black focus:outline-none"
+                className="field"
                 placeholder="••••••••"
                 required
                 minLength={6}
@@ -726,16 +732,13 @@ function LoginForm() {
             <button
               type="submit"
               disabled={isLoading || checkingUsername}
-              onClick={() => {
-                console.log('=== BUTTON CLICKED ===')
-              }}
-              className="w-full px-4 py-2 bg-black text-white rounded-lg hover:bg-gray-800 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-primary w-full"
             >
-              {isLoading || checkingUsername ? 'Loading...' : isSignUp ? 'Sign Up' : 'Sign In'}
+              {isLoading || checkingUsername ? 'Loading…' : isSignUp ? 'Sign up' : 'Sign in'}
             </button>
           </form>
 
-          <div className="mt-4 text-center">
+          <div className="mt-5 text-center">
             <button
               onClick={() => {
                 setIsSignUp(!isSignUp)
@@ -744,7 +747,8 @@ function LoginForm() {
                 setFirstName('')
                 setLastName('')
               }}
-              className="text-sm text-gray-700 hover:text-black font-medium"
+              className="text-sm font-medium hover:underline"
+              style={{ color: 'var(--ink-muted)' }}
             >
               {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
             </button>
@@ -758,11 +762,11 @@ function LoginForm() {
 export default function LoginPage() {
   return (
     <Suspense fallback={
-      <main className="min-h-screen flex items-center justify-center">
-        <div className="w-full max-w-md px-6">
-          <div className="border-2 border-gray-300 rounded-lg p-8 shadow-sm">
-            <h1 className="text-2xl font-semibold mb-2 text-black">Dues</h1>
-            <p className="text-sm text-gray-700 mb-6">Loading...</p>
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="w-full max-w-md">
+          <div className="card text-center">
+            <h1 className="font-display text-2xl font-semibold mb-2">Dues</h1>
+            <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Loading…</p>
           </div>
         </div>
       </main>

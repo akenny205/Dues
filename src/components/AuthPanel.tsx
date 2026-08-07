@@ -8,14 +8,11 @@ export default function AuthPanel() {
   const { user, loading, signOut } = useAuth()
   const router = useRouter()
 
-  if (loading) return <div className="text-sm text-gray-700">Loading…</div>
+  if (loading) return <div className="text-sm" style={{ color: 'var(--ink-muted)' }}>Loading…</div>
 
   if (!user) {
     return (
-      <Link
-        href="/login"
-        className="px-4 py-2 rounded-lg bg-black text-white hover:bg-gray-800 transition text-sm font-medium"
-      >
+      <Link href="/login" className="btn-primary text-sm">
         Log in
       </Link>
     )
@@ -29,11 +26,8 @@ export default function AuthPanel() {
 
   return (
     <div className="flex items-center gap-3">
-      <span className="text-sm text-black font-medium">{user.email}</span>
-      <button
-        onClick={handleSignOut}
-        className="px-3 py-2 rounded-lg border-2 border-gray-300 hover:bg-gray-100 transition text-sm text-black font-medium"
-      >
+      <span className="font-mono text-sm hidden sm:inline" style={{ color: 'var(--ink-muted)' }}>{user.email}</span>
+      <button onClick={handleSignOut} className="btn-secondary text-sm">
         Log out
       </button>
     </div>

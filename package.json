@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:demo": "NEXT_PUBLIC_DEMO_MODE=true next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -14,6 +15,7 @@
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "^2.78.0",
     "@types/next": "^9.0.0",
+    "lucide-react": "^1.28.0",
     "next": "^16.0.1",
     "react": "19.2.0",
     "react-dom": "19.2.0"

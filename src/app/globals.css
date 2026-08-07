@@ -1,39 +1,295 @@
 @import "tailwindcss";
 
-:root {
-   --background: #f5f5f5;
-   --foreground: #171717;
-}
+/* ---------------------------------------------------------------- *
+ * Design tokens — "The Ledger"
+ * A passbook / statement aesthetic: warm paper, deep ledger green,
+ * brass accents, hairline rules instead of boxes, tabular mono
+ * numerals for money. Mirrors into an "ink ledger" dark mode.
+ * ---------------------------------------------------------------- */
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+:root {
+  --paper: #f1efe4;
+  --paper-card: #fbfaf3;
+  --ink: #1b2620;
+  --ink-muted: #5b6459;
+  --line: #d9d4c1;
+
+  --ledger: #1f4d3a;
+  --ledger-dark: #163829;
+  --on-ledger: #f1efe4;
+
+  --brass: #9c7a34;
+  --brass-soft: #f1e4c2;
+
+  --emerald: #1e7a4c;
+  --emerald-soft: #deeee0;
+
+  --rust: #a6432a;
+  --rust-soft: #f3ded6;
+
+  --shadow: 0 1px 2px rgba(27, 38, 32, 0.05), 0 1px 1px rgba(27, 38, 32, 0.04);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --paper: #10160f;
+    --paper-card: #171f18;
+    --ink: #ece7d6;
+    --ink-muted: #97a196;
+    --line: #2b362e;
+
+    --ledger: #2f6b4e;
+    --ledger-dark: #255740;
+    --on-ledger: #f1efe4;
+
+    --brass: #d4ac5f;
+    --brass-soft: #2c2415;
+
+    --emerald: #4fbe84;
+    --emerald-soft: #16281d;
+
+    --rust: #e88664;
+    --rust-soft: #2e1913;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   }
 }
 
-html, body {
-   background: #f5f5f5 !important;
-   color: #000000;
-   font-family: Arial, Helvetica, sans-serif;
-   min-height: 100vh;
-}
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-card: var(--paper-card);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-line: var(--line);
 
-main {
-  background: transparent !important;
-}
+  --color-ledger: var(--ledger);
+  --color-ledger-dark: var(--ledger-dark);
+  --color-on-ledger: var(--on-ledger);
 
-header {
-  background: transparent !important;
+  --color-brass: var(--brass);
+  --color-brass-soft: var(--brass-soft);
+
+  --color-emerald: var(--emerald);
+  --color-emerald-soft: var(--emerald-soft);
+
+  --color-rust: var(--rust);
+  --color-rust-soft: var(--rust-soft);
+
+  --font-display: var(--font-fraunces);
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
 }
 
 * {
   box-sizing: border-box;
+}
+
+html,
+body {
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+body {
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background: var(--brass-soft);
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--brass);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---------------------------------------------------------------- *
+ * Component classes
+ * ---------------------------------------------------------------- */
+
+@layer components {
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-[0.14em];
+    color: var(--ink-muted);
+  }
+
+  .amount {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* Buttons */
+  .btn,
+  .btn-primary,
+  .btn-secondary,
+  .btn-ghost,
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    background: var(--ledger);
+    color: var(--on-ledger);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--ledger-dark);
+  }
+  .btn-secondary {
+    @apply border;
+    border-color: var(--line);
+    color: var(--ink);
+    background: transparent;
+  }
+  .btn-secondary:hover:not(:disabled) {
+    background: var(--paper-card);
+    border-color: var(--brass);
+  }
+  .btn-ghost {
+    color: var(--ink-muted);
+    background: transparent;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    color: var(--ink);
+  }
+  .btn-danger {
+    background: var(--rust);
+    color: #fdf7f4;
+  }
+  .btn-danger:hover:not(:disabled) {
+    filter: brightness(0.92);
+  }
+
+  /* Surfaces */
+  .card {
+    @apply rounded-lg border p-6;
+    background: var(--paper-card);
+    border-color: var(--line);
+    box-shadow: var(--shadow);
+  }
+
+  .field {
+    @apply w-full rounded-md border px-3 py-2 text-sm transition-colors;
+    background: var(--paper-card);
+    border-color: var(--line);
+    color: var(--ink);
+  }
+  .field:focus {
+    border-color: var(--brass);
+    outline: none;
+  }
+  .field::placeholder {
+    color: var(--ink-muted);
+    opacity: 0.7;
+  }
+
+  /* Ledger row: hairline-divided list item, used instead of boxed cards */
+  .ledger-row {
+    @apply flex items-center justify-between gap-4 py-4 px-1 border-b transition-colors;
+    border-color: var(--line);
+  }
+  .ledger-row:last-child {
+    border-bottom: none;
+  }
+
+  /* Badges */
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide;
+  }
+  .badge-brass {
+    background: var(--brass-soft);
+    color: var(--brass);
+  }
+  .badge-emerald {
+    background: var(--emerald-soft);
+    color: var(--emerald);
+  }
+  .badge-rust {
+    background: var(--rust-soft);
+    color: var(--rust);
+  }
+  .badge-ledger {
+    background: var(--ledger);
+    color: var(--on-ledger);
+  }
+  .badge-outline {
+    @apply border;
+    border-color: var(--line);
+    color: var(--ink-muted);
+  }
+
+  /* Sidebar / passbook tabs */
+  .tab-item {
+    @apply w-full text-left px-4 py-2.5 rounded-md text-sm font-medium transition-colors;
+    color: var(--ink-muted);
+  }
+  .tab-item:hover {
+    color: var(--ink);
+    background: var(--paper-card);
+  }
+  .tab-item-active {
+    @apply w-full text-left px-4 py-2.5 rounded-md text-sm font-semibold transition-colors;
+    background: var(--ledger);
+    color: var(--on-ledger);
+  }
+
+  /* Ticket stub — the group PIN, styled like a torn passbook stub */
+  .ticket-stub {
+    position: relative;
+    border: 1px dashed var(--brass);
+    border-radius: 10px;
+    background: var(--brass-soft);
+  }
+  .ticket-stub::before,
+  .ticket-stub::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--paper);
+    transform: translateY(-50%);
+  }
+  .ticket-stub::before {
+    left: -9px;
+  }
+  .ticket-stub::after {
+    right: -9px;
+  }
+
+  .modal-overlay {
+    @apply fixed inset-0 flex items-center justify-center z-50 p-4;
+    background: rgba(16, 22, 15, 0.55);
+  }
+  .modal-panel {
+    @apply w-full max-w-md rounded-lg border p-6;
+    background: var(--paper-card);
+    border-color: var(--line);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+  }
+
+  .toast-in {
+    animation: toast-in 180ms ease-out;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

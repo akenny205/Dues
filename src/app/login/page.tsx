@@ -626,7 +626,7 @@ function LoginForm() {
         <div className="card">
           <p className="eyebrow mb-1">{isSignUp ? 'Create account' : 'Welcome back'}</p>
           <h1 className="font-display text-2xl font-semibold mb-6">
-            {isSignUp ? 'Open a new ledger' : 'Sign in to your groups'}
+            {isSignUp ? 'Get started' : 'Sign in to your groups'}
           </h1>
 
           {message && (

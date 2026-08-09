@@ -16,6 +16,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
+import Skeleton from '@/components/Skeleton'
 import ToastStack from '@/components/ToastStack'
 import useAuth from '@/hooks/useAuth'
 import useToast from '@/hooks/useToast'
@@ -106,7 +107,8 @@ export default function GroupDetailPage() {
   const [isOwner, setIsOwner] = useState(false)
   const [pendingJoinRequests, setPendingJoinRequests] = useState<Array<{ id: number; user_id: number; displayName: string; username: string; created_at: string }>>([])
   const [showPin, setShowPin] = useState(false)
-  const [activeTab, setActiveTab] = useState<'dues' | 'members' | 'sessions' | 'payments' | 'info'>('dues')
+  const [activeTab, setActiveTab] = useState<'dues' | 'members' | 'sessions' | 'info'>('dues')
+  const [showMakePaymentModal, setShowMakePaymentModal] = useState(false)
   const [paymentPayee, setPaymentPayee] = useState<number | null>(null)
   const [paymentAmount, setPaymentAmount] = useState('')
   const [paymentDescription, setPaymentDescription] = useState('')
@@ -1076,10 +1078,10 @@ export default function GroupDetailPage() {
             .delete()
             .eq('session_id', sessionId)
 
-          showToast('All changes have been approved and applied!')
+          showToast('Changes approved and applied.')
         }
       } else {
-        showToast('Your approval has been recorded. Waiting for other users to approve.')
+        showToast('Approved — waiting on others.')
       }
 
       await loadSessions()
@@ -1453,7 +1455,7 @@ export default function GroupDetailPage() {
 
               if (usersToNotify.length > 0) {
                 // Show message that users will be notified
-                showToast(`Session edit saved! ${usersToNotify.length} user${usersToNotify.length === 1 ? '' : 's'} will be notified and must approve the changes before they take effect.`)
+                showToast(`Edit saved — waiting on ${usersToNotify.length} approval${usersToNotify.length === 1 ? '' : 's'}.`)
               } else {
                 // Only the editor's value changed, so no approvals needed - update immediately
                 await updateSessionPayments(editingSessionId)
@@ -1535,7 +1537,7 @@ export default function GroupDetailPage() {
       setShowCreateLiveSessionModal(false)
       setLiveSessionDescription('')
       await loadSessions()
-      showToast('Live session created! Members can now add their payments.')
+      showToast('Live session created.')
     } catch (error: any) {
       console.error('Error creating live session:', error)
       showToast('Failed to create live session: ' + (error.message || 'Unknown error'))
@@ -1783,10 +1785,11 @@ export default function GroupDetailPage() {
         { user_id: paymentPayee, amount: amountValue },
       ])
 
-      // Reset form and reload
+      // Reset form, close the modal, and reload
       setPaymentPayee(null)
       setPaymentAmount('')
       setPaymentDescription('')
+      setShowMakePaymentModal(false)
       await loadSessions()
       await loadDues()
       showToast('Payment recorded successfully!')
@@ -1962,7 +1965,7 @@ export default function GroupDetailPage() {
 
       setConfirmRemoveMemberId(null)
       await loadMembers()
-      showToast('Member removed. Their history in this group is untouched — they can request to rejoin any time.')
+      showToast('Member removed.')
     } catch (error: any) {
       console.error('Error removing member:', error)
       showToast('Failed to remove member: ' + (error.message || 'Unknown error'))
@@ -1995,8 +1998,48 @@ export default function GroupDetailPage() {
 
   if (authLoading || loading) {
     return (
-      <main className="min-h-screen flex items-center justify-center">
-        <p className="eyebrow">Loading…</p>
+      <main className="min-h-screen">
+        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+          <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <Skeleton className="h-4 w-14" />
+            <Skeleton className="h-5 w-40" />
+            <div className="w-12" />
+          </div>
+        </header>
+
+        <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col md:flex-row gap-6">
+          <aside className="md:w-56 flex-shrink-0">
+            <nav className="flex flex-row md:flex-col gap-1.5 overflow-x-auto md:overflow-visible">
+              {[0, 1, 2, 3, 4].map((i) => (
+                <Skeleton key={i} className="h-9 rounded-md shrink-0" style={{ width: 130 }} />
+              ))}
+            </nav>
+          </aside>
+
+          <div className="flex-1">
+            <Skeleton className="h-3 w-16 mb-2" />
+            <Skeleton className="h-7 w-24 mb-6" />
+
+            <div className="card mb-8 flex items-center justify-between gap-4">
+              <div className="space-y-2">
+                <Skeleton className="h-3 w-24" />
+                <Skeleton className="h-3 w-32" />
+              </div>
+              <Skeleton className="h-9 w-28" />
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-6">
+              {[0, 1].map((col) => (
+                <div key={col} className="card space-y-3">
+                  <Skeleton className="h-3 w-28 mb-1" />
+                  <Skeleton className="h-4 w-full" />
+                  <Skeleton className="h-4 w-5/6" />
+                  <Skeleton className="h-4 w-2/3" />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </main>
     )
   }
@@ -2034,7 +2077,6 @@ export default function GroupDetailPage() {
     { key: 'dues', label: 'Dues' },
     { key: 'members', label: 'Group Members' },
     { key: 'sessions', label: 'Sessions' },
-    { key: 'payments', label: 'Payments' },
     { key: 'info', label: group.name ? `${group.name} Info` : 'Group Info' },
   ]
 
@@ -2341,7 +2383,7 @@ export default function GroupDetailPage() {
                         Remove {target ? formatDisplayName(members, target) : 'this member'}?
                       </h3>
                       <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
-                        They&apos;ll lose access to this group right away. Their name stays on every past session and payment — nothing about their history changes, and they can request to rejoin at any time.
+                        They&apos;ll lose access right away, but their past sessions and payments stay untouched. They can request to rejoin later.
                       </p>
                       <div className="flex gap-2">
                         <button
@@ -2369,6 +2411,9 @@ export default function GroupDetailPage() {
                   <h2 className="font-display text-2xl font-semibold">Sessions</h2>
                 </div>
                 <div className="flex gap-2">
+                  <button onClick={() => setShowMakePaymentModal(true)} className="btn-secondary">
+                    + Make a payment
+                  </button>
                   <button onClick={() => setShowCreateLiveSessionModal(true)} className="btn-secondary" style={{ borderColor: 'var(--brass)', color: 'var(--brass)' }}>
                     + Live session
                   </button>
@@ -2593,7 +2638,7 @@ export default function GroupDetailPage() {
 
                             <div className="card mb-4">
                               <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
-                                The changes you made to this session were not approved. You can edit the session again if needed.
+                                Your changes weren&apos;t approved. You can edit the session again if needed.
                               </p>
                             </div>
 
@@ -3292,7 +3337,7 @@ export default function GroupDetailPage() {
                   <div className="modal-panel">
                     <h3 className="font-display text-xl font-semibold mb-2">Cancel this live session?</h3>
                     <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
-                      Current input will be lost — every amount entered so far will be discarded and the session removed. This can&apos;t be undone.
+                      Every amount entered so far will be discarded. This can&apos;t be undone.
                     </p>
                     <div className="flex gap-2">
                       <button
@@ -3314,7 +3359,7 @@ export default function GroupDetailPage() {
                   <div className="modal-panel">
                     <h3 className="font-display text-xl font-semibold mb-2">Delete this session?</h3>
                     <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
-                      If anyone else is part of this session, this sends them a deletion request — nothing is removed until everyone approves. If you&apos;re the only one in it, it&apos;s deleted right away. Either way, this can&apos;t be undone once it goes through.
+                      If others are part of this session, they&apos;ll need to approve first. If you&apos;re the only one, it&apos;s deleted right away. This can&apos;t be undone.
                     </p>
                     <div className="flex gap-2">
                       <button
@@ -3407,95 +3452,88 @@ export default function GroupDetailPage() {
             </div>
           )}
 
-          {activeTab === 'payments' && (
-            <div>
-              <p className="eyebrow mb-1">Settle up</p>
-              <h2 className="font-display text-2xl font-semibold mb-6">Make a Payment</h2>
+          {showMakePaymentModal && (
+            <div className="modal-overlay">
+              <div className="modal-panel">
+                <h3 className="font-display text-xl font-semibold mb-4">Make a payment</h3>
 
-              <form onSubmit={handleMakePayment} className="card space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-1">
-                    Pay to
-                  </label>
-                  <select
-                    value={paymentPayee || ''}
-                    onChange={(e) => setPaymentPayee(e.target.value ? parseInt(e.target.value) : null)}
-                    className="field"
-                    required
-                  >
-                    <option value="">Select a member</option>
-                    {activeMembers
-                      .filter(m => m.user_id !== userId)
-                      .map((member) => (
-                        <option key={member.user_id} value={member.user_id}>
-                          {formatDisplayName(members, member)} (@{member.username})
-                        </option>
-                      ))}
-                  </select>
-                  {activeMembers.filter(m => m.user_id !== userId).length === 0 && (
-                    <p className="text-sm mt-1" style={{ color: 'var(--ink-muted)' }}>No other members in this group</p>
-                  )}
-                </div>
+                <form onSubmit={handleMakePayment} className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
+                      Pay to
+                    </label>
+                    <select
+                      value={paymentPayee || ''}
+                      onChange={(e) => setPaymentPayee(e.target.value ? parseInt(e.target.value) : null)}
+                      className="field"
+                      required
+                      autoFocus
+                    >
+                      <option value="">Select a member</option>
+                      {activeMembers
+                        .filter(m => m.user_id !== userId)
+                        .map((member) => (
+                          <option key={member.user_id} value={member.user_id}>
+                            {formatDisplayName(members, member)} (@{member.username})
+                          </option>
+                        ))}
+                    </select>
+                    {activeMembers.filter(m => m.user_id !== userId).length === 0 && (
+                      <p className="text-sm mt-1" style={{ color: 'var(--ink-muted)' }}>No other members in this group</p>
+                    )}
+                  </div>
 
-                <div>
-                  <label className="block text-sm font-medium mb-1">
-                    Amount ($)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    value={paymentAmount}
-                    onChange={(e) => setPaymentAmount(e.target.value)}
-                    className="field amount"
-                    placeholder="0.00"
-                    required
-                  />
-                </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
+                      Amount ($)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      value={paymentAmount}
+                      onChange={(e) => setPaymentAmount(e.target.value)}
+                      className="field amount"
+                      placeholder="0.00"
+                      required
+                    />
+                  </div>
 
-                <div>
-                  <label className="block text-sm font-medium mb-1">
-                    Description (optional)
-                  </label>
-                  <input
-                    type="text"
-                    value={paymentDescription}
-                    onChange={(e) => setPaymentDescription(e.target.value)}
-                    className="field"
-                    placeholder="e.g., Payment for dinner"
-                  />
-                </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
+                      Description (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={paymentDescription}
+                      onChange={(e) => setPaymentDescription(e.target.value)}
+                      className="field"
+                      placeholder="e.g., Payment for dinner"
+                    />
+                  </div>
 
-                <div className="flex gap-2">
-                  <button
-                    type="submit"
-                    className="btn-primary"
-                    disabled={!paymentPayee || !paymentAmount || activeMembers.filter(m => m.user_id !== userId).length === 0}
-                  >
-                    Record payment
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPaymentPayee(null)
-                      setPaymentAmount('')
-                      setPaymentDescription('')
-                    }}
-                    className="btn-secondary"
-                  >
-                    Clear
-                  </button>
-                </div>
-              </form>
-
-              <div className="mt-6 rounded-lg p-4 border" style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}>
-                <p className="eyebrow mb-2">How it works</p>
-                <ul className="text-sm space-y-1 list-disc list-inside" style={{ color: 'var(--ink-muted)' }}>
-                  <li>Select a member to pay</li>
-                  <li>Enter the payment amount</li>
-                  <li>A session will be created with two payments: one for you (negative) and one for the recipient (positive)</li>
-                  <li>The payment will appear in the Sessions tab</li>
-                </ul>
+                  <div className="flex gap-2">
+                    <button
+                      type="submit"
+                      className="btn-primary flex-1"
+                      disabled={!paymentPayee || !paymentAmount || activeMembers.filter(m => m.user_id !== userId).length === 0}
+                    >
+                      Record payment
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMakePaymentModal(false)
+                        setPaymentPayee(null)
+                        setPaymentAmount('')
+                        setPaymentDescription('')
+                      }}
+                      className="btn-secondary"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
               </div>
             </div>
           )}

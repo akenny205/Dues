@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { ArrowRight } from 'lucide-react'
 import AuthPanel from '@/components/AuthPanel'
+import Skeleton from '@/components/Skeleton'
 import ToastStack from '@/components/ToastStack'
 import useAuth from '@/hooks/useAuth'
 import useToast from '@/hooks/useToast'
@@ -316,7 +317,7 @@ export default function HomePage() {
       setShowJoinModal(false)
       setJoinPin('')
       setJoinError('')
-      showToast(`Request sent! ${groupData.name || 'The group'}'s owner needs to approve you before you can access it.`)
+      showToast(`Request sent to ${groupData.name || 'the group'}.`)
     } catch (error: any) {
       console.error('Error requesting to join group:', error)
       setJoinError(error.message || 'Failed to send join request')
@@ -325,8 +326,38 @@ export default function HomePage() {
 
   if (authLoading || (loading && user)) {
     return (
-      <main className="min-h-screen flex items-center justify-center">
-        <p className="eyebrow">Loading…</p>
+      <main className="min-h-screen">
+        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+          <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
+            <Skeleton className="h-6 w-16" />
+            <Skeleton className="h-8 w-20 rounded-md" />
+          </div>
+        </header>
+
+        <div className="max-w-4xl mx-auto px-6 py-10">
+          <div className="flex items-center justify-between mb-8">
+            <div>
+              <Skeleton className="h-3 w-20 mb-2" />
+              <Skeleton className="h-7 w-32" />
+            </div>
+            <div className="flex gap-2">
+              <Skeleton className="h-9 w-32 rounded-md" />
+              <Skeleton className="h-9 w-28 rounded-md" />
+            </div>
+          </div>
+
+          <div className="grid gap-3">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="card flex items-center gap-3">
+                <Skeleton className="w-9 h-9 rounded-full shrink-0" />
+                <div className="flex-1 space-y-2">
+                  <Skeleton className="h-4 w-40" />
+                  <Skeleton className="h-3 w-24" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       </main>
     )
   }
@@ -396,9 +427,9 @@ export default function HomePage() {
           {/* Features Section */}
           <div className="grid md:grid-cols-3 gap-px mb-24 rounded-lg overflow-hidden border" style={{ borderColor: 'var(--line)', background: 'var(--line)' }}>
             {[
-              { title: 'Create groups', body: 'Organize expenses by group. Each one gets a unique pin for easy sharing.' },
-              { title: 'Track sessions', body: 'Log expense sessions and see who paid what. Amounts always balance to zero.' },
-              { title: 'View dues', body: 'See your outstanding balance at a glance — exactly what you owe or are owed.' },
+              { title: 'Create groups', body: 'Each group gets a unique pin members use to join.' },
+              { title: 'Track sessions', body: 'Log who paid what. Splits always balance to zero.' },
+              { title: 'View dues', body: 'See your current group balance.' },
             ].map((f) => (
               <div key={f.title} className="p-8" style={{ background: 'var(--paper-card)' }}>
                 <h3 className="font-display text-lg font-semibold mb-2">{f.title}</h3>
@@ -519,7 +550,7 @@ export default function HomePage() {
                     required
                     autoFocus
                   />
-                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>Enter the 6-digit pin provided by the group owner. They&apos;ll need to approve your request before you have access.</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>The owner will need to approve your request.</p>
                 </div>
                 {joinError && (
                   <div className="p-3 rounded-md text-sm border" style={{ background: 'var(--rust-soft)', color: 'var(--rust)', borderColor: 'var(--rust)' }}>

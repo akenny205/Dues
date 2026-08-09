@@ -281,6 +281,15 @@ body {
   .toast-in {
     animation: toast-in 180ms ease-out;
   }
+
+  /* Loading placeholder — shape-only block that shimmers while real content
+     loads. Compose several into a layout that mirrors the page underneath. */
+  .skeleton {
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--line) 25%, var(--paper-card) 37%, var(--line) 63%);
+    background-size: 400% 100%;
+    animation: skeleton-shimmer 1.4s ease-in-out infinite;
+  }
 }
 
 @keyframes toast-in {
@@ -292,4 +301,9 @@ body {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+@keyframes skeleton-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
 }

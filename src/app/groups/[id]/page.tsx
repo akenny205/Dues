@@ -2341,8 +2341,8 @@ export default function GroupDetailPage() {
                           {memberInfo.approvalRecord ? (
                             <>
                               <span
-                                className="text-sm font-semibold"
-                                style={{ color: memberInfo.approvalRecord.old_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                className="text-sm font-medium"
+                                style={{ color: 'var(--text-muted)', textDecoration: 'line-through' }}
                               >
                                 {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
                               </span>
@@ -2374,33 +2374,6 @@ export default function GroupDetailPage() {
                 })()}
               </div>
             </div>
-
-            {/* Highlight the current user's change summary — same inline old → new
-                diff style as the "All changes" list above, not a separate
-                previous/new/delta breakdown. */}
-            {pendingApproval && (
-              <div className="border-t pt-2 mt-1" style={{ borderColor: 'var(--border)' }}>
-                <p className="eyebrow mb-1">Your change</p>
-                <div className="ledger-row">
-                  <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Amount</span>
-                  <div className="flex items-center gap-2 amount">
-                    <span
-                      className="text-sm font-semibold"
-                      style={{ color: pendingApproval.old_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                    >
-                      {pendingApproval.old_amount >= 0 ? '+' : ''}${pendingApproval.old_amount.toFixed(2)}
-                    </span>
-                    <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
-                    <span
-                      className="text-sm font-semibold"
-                      style={{ color: pendingApproval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                    >
-                      {pendingApproval.new_amount >= 0 ? '+' : ''}${pendingApproval.new_amount.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="flex gap-3">

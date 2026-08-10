@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, Users, Receipt, DollarSign } from 'lucide-react'
 import AuthPanel from '@/components/AuthPanel'
 import Skeleton from '@/components/Skeleton'
 import ToastStack from '@/components/ToastStack'
@@ -20,6 +20,17 @@ interface Group {
   pin?: string | null
   role?: string | null
   memberCount?: number
+}
+
+// Connects the three steps in the landing page's workflow section — points
+// right in the horizontal desktop layout, down once it stacks on mobile.
+function FlowArrow() {
+  return (
+    <div className="flex items-center justify-center py-1 md:py-0 md:px-1 shrink-0" style={{ color: 'var(--accent)' }}>
+      <ArrowRight size={22} strokeWidth={2.5} className="hidden md:block" />
+      <ArrowRight size={22} strokeWidth={2.5} className="block md:hidden rotate-90" />
+    </div>
+  )
 }
 
 export default function HomePage() {
@@ -424,37 +435,53 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* Features Section */}
-          <div className="grid md:grid-cols-3 gap-px mb-24 rounded-lg overflow-hidden border" style={{ borderColor: 'var(--border)', background: 'var(--border)' }}>
-            {[
-              { title: 'Create groups', body: 'Each group gets a unique pin members use to join.' },
-              { title: 'Track sessions', body: 'Log who paid what. Splits always balance to zero.' },
-              { title: 'View dues', body: 'See your current group balance.' },
-            ].map((f) => (
-              <div key={f.title} className="p-8" style={{ background: 'var(--surface)' }}>
-                <h3 className="font-display text-lg font-semibold mb-2">{f.title}</h3>
-                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{f.body}</p>
-              </div>
-            ))}
-          </div>
-
-          {/* How It Works */}
+          {/* Workflow — the three moments that make up using Dues, reduced to
+              one glyph each rather than mockups: a group of people, a
+              receipt of line items, a dollar settled to zero. */}
           <div>
-            <p className="eyebrow mb-6 text-center">How it works</p>
-            <div className="grid md:grid-cols-4 gap-8">
-              {[
-                'Create or join a group',
-                'Add expense sessions',
-                'Track who owes what',
-                'Settle up easily',
-              ].map((step, i) => (
-                <div key={step} className="text-center">
-                  <p className="font-display text-3xl font-semibold mb-2" style={{ color: 'var(--accent)' }}>
-                    {String(i + 1).padStart(2, '0')}
-                  </p>
-                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{step}</p>
+            <div className="flex flex-col md:flex-row md:items-center gap-8 md:gap-4">
+              <div className="flex-1 text-center">
+                <div
+                  className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
+                  style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
+                >
+                  <Users size={26} />
                 </div>
-              ))}
+                <h3 className="font-display text-lg font-semibold mb-1">Create a group</h3>
+                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                  Roommates, a trip, a shared tab, get everyone in one place.
+                </p>
+              </div>
+
+              <FlowArrow />
+
+              <div className="flex-1 text-center">
+                <div
+                  className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
+                  style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
+                >
+                  <Receipt size={26} />
+                </div>
+                <h3 className="font-display text-lg font-semibold mb-1">Track sessions</h3>
+                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                  Log who paid. Splits always balance to zero.
+                </p>
+              </div>
+
+              <FlowArrow />
+
+              <div className="flex-1 text-center">
+                <div
+                  className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
+                  style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
+                >
+                  <DollarSign size={26} />
+                </div>
+                <h3 className="font-display text-lg font-semibold mb-1">View dues</h3>
+                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                  See exactly where you stand, and settle up with ease.
+                </p>
+              </div>
             </div>
           </div>
         </div>

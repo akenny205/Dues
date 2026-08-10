@@ -209,6 +209,16 @@ body {
     opacity: 0.7;
   }
 
+  /* Icon button inset inside a field — e.g. the password visibility
+     toggle. Sits in the input's own padding rather than beside it. */
+  .field-icon-btn {
+    @apply absolute inset-y-0 right-0 flex items-center px-3 transition-colors;
+    color: var(--text-muted);
+  }
+  .field-icon-btn:hover {
+    color: var(--text);
+  }
+
   /* Ledger row: hairline-divided list item, used instead of boxed cards */
   .ledger-row {
     @apply flex items-center justify-between gap-4 py-4 px-1 border-b transition-colors;
@@ -252,6 +262,30 @@ body {
   .pay-pill:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+
+  /* Payment method picker — single-select row of icon buttons (the "Paid
+     via" field on the Make a payment form). Each badge keeps its own brand
+     color (see PaymentMethodIcon.tsx) rather than going neutral like
+     pay-pill — the accent ring + label color is what signals "selected". */
+  .method-select-row {
+    @apply flex gap-1.5;
+  }
+  .method-select-btn {
+    @apply flex flex-1 flex-col items-center justify-center gap-1 rounded-lg border-2 px-1 py-1.5 text-[9px] font-medium leading-none transition-colors;
+    border-color: transparent;
+    color: var(--text-muted);
+  }
+  .method-select-btn:hover {
+    background: var(--surface);
+  }
+  .method-select-btn.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+  .method-icon-badge {
+    @apply flex items-center justify-center rounded-lg;
   }
 
   /* Sidebar tabs */

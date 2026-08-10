@@ -21,10 +21,12 @@ import ToastStack from '@/components/ToastStack'
 import ProfileModal from '@/components/ProfileModal'
 import Avatar from '@/components/Avatar'
 import InfoTooltip from '@/components/InfoTooltip'
+import PaymentMethodIcon, { PaymentMethodBadge } from '@/components/PaymentMethodIcon'
 import useAuth from '@/hooks/useAuth'
 import useToast from '@/hooks/useToast'
 import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
+import { PAYMENT_METHOD_OPTIONS, paymentMethodLabel } from '@/lib/paymentLinks'
 
 interface Group {
   id: number
@@ -43,6 +45,7 @@ interface Session {
   notes?: string | null
   is_live?: boolean | null
   is_payment?: boolean | null
+  payment_method?: string | null
   memberCount?: number
   totalAmount?: number
   userPayment?: number | null
@@ -132,6 +135,7 @@ export default function GroupDetailPage() {
   const [paymentPayee, setPaymentPayee] = useState<number | null>(null)
   const [paymentAmount, setPaymentAmount] = useState('')
   const [paymentDescription, setPaymentDescription] = useState('')
+  const [paymentMethod, setPaymentMethod] = useState('')
   const [isSubmittingPayment, setIsSubmittingPayment] = useState(false)
   const [members, setMembers] = useState<GroupMember[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
@@ -1803,6 +1807,7 @@ export default function GroupDetailPage() {
           group_id: groupId,
           Description: paymentDescription || `Payment from ${payerName} to ${payeeName}`,
           is_payment: true,
+          payment_method: paymentMethod || null,
           created_by: userId
         }])
         .select('id')
@@ -1846,6 +1851,7 @@ export default function GroupDetailPage() {
       setPaymentPayee(null)
       setPaymentAmount('')
       setPaymentDescription('')
+      setPaymentMethod('')
       setShowMakePaymentModal(false)
       await loadSessions()
       await loadDues()
@@ -2266,6 +2272,12 @@ export default function GroupDetailPage() {
                 ? 'A group member wants to delete this session — every amount below is going to $0.'
                 : 'This session has been edited. Review the changes below.'}
             </p>
+            {session.is_payment && session.payment_method && (
+              <p className="text-sm mt-1 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+                <PaymentMethodIcon method={session.payment_method} size={14} />
+                Paid via <span className="font-medium">{paymentMethodLabel(session.payment_method)}</span>
+              </p>
+            )}
           </div>
 
           <div className="mb-4">
@@ -2416,6 +2428,11 @@ export default function GroupDetailPage() {
 
     return (
       <>
+        {session.is_payment && session.payment_method && (
+          <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+            Paid via <span className="font-medium">{paymentMethodLabel(session.payment_method)}</span>
+          </p>
+        )}
         {isEditingNotes ? (
           <div className="mb-6">
             <p className="eyebrow mb-2">Notes</p>
@@ -3090,6 +3107,12 @@ export default function GroupDetailPage() {
                                       {session.userPayment >= 0 ? '+' : '-'}${Math.abs(session.userPayment).toFixed(2)}
                                     </p>
                                   )}
+                                  {session.is_payment && session.payment_method && (
+                                    <span className="badge badge-outline">
+                                      <PaymentMethodIcon method={session.payment_method} size={11} />
+                                      {paymentMethodLabel(session.payment_method)}
+                                    </span>
+                                  )}
                                   {session.is_live && <span className="badge badge-accent-solid">Live</span>}
                                   {!session.is_live && (session.Description?.includes('Live Session') || session.Description === 'Live Session') && (
                                     <span className="badge badge-outline flex items-center gap-1">
@@ -3470,6 +3493,31 @@ export default function GroupDetailPage() {
 
                   <div>
                     <label className="block text-sm font-medium mb-1">
+                      Paid via (optional)
+                    </label>
+                    <div className="method-select-row" role="radiogroup" aria-label="Payment method">
+                      {PAYMENT_METHOD_OPTIONS.map((option) => {
+                        const isSelected = paymentMethod === option.value
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            title={option.label}
+                            onClick={() => setPaymentMethod(isSelected ? '' : option.value)}
+                            className={`method-select-btn${isSelected ? ' selected' : ''}`}
+                          >
+                            <PaymentMethodBadge method={option.value} size={26} />
+                            <span>{option.label}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
                       Description (optional)
                     </label>
                     <input
@@ -3487,9 +3535,6 @@ export default function GroupDetailPage() {
                     const payeeName = formatDisplayName(members, payee)
                     return (
                       <div>
-                        <p className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>
-                          Dues doesn&apos;t move money — send it directly first, then record it below.
-                        </p>
                         <button
                           type="button"
                           onClick={() => {
@@ -3523,6 +3568,7 @@ export default function GroupDetailPage() {
                         setPaymentPayee(null)
                         setPaymentAmount('')
                         setPaymentDescription('')
+                        setPaymentMethod('')
                       }}
                       disabled={isSubmittingPayment}
                       className="btn-secondary"

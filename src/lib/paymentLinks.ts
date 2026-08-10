@@ -64,3 +64,26 @@ export function getPayLinks(methods: PaymentMethods, amount?: number, note?: str
 export function hasAnyPaymentMethod(methods: PaymentMethods): boolean {
   return !!(methods.venmo_username || methods.cashapp_cashtag || methods.paypal_username || methods.zelle_handle)
 }
+
+// What a payer can tag a *recorded* payment with (Session.payment_method) —
+// separate from the profile handles above. "Cash" and "Other" have no
+// linked account at all, so this list isn't filtered by what either person
+// has set up.
+export interface PaymentMethodOption {
+  value: string
+  label: string
+}
+
+export const PAYMENT_METHOD_OPTIONS: PaymentMethodOption[] = [
+  { value: 'venmo', label: 'Venmo' },
+  { value: 'cashapp', label: 'Cash App' },
+  { value: 'paypal', label: 'PayPal' },
+  { value: 'zelle', label: 'Zelle' },
+  { value: 'cash', label: 'Cash' },
+  { value: 'other', label: 'Other' },
+]
+
+export function paymentMethodLabel(value?: string | null): string | null {
+  if (!value) return null
+  return PAYMENT_METHOD_OPTIONS.find((option) => option.value === value)?.label || value
+}

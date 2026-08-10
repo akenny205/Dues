@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import useAuth from '@/hooks/useAuth'
+import { Eye, EyeOff } from 'lucide-react'
 
 function LoginForm() {
   const router = useRouter()
@@ -20,6 +21,7 @@ function LoginForm() {
   const [isLoading, setIsLoading] = useState(false)
   const [checkingUsername, setCheckingUsername] = useState(false)
   const [signupFailed, setSignupFailed] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
 
   // Check for signup query parameter
   useEffect(() => {
@@ -345,12 +347,11 @@ function LoginForm() {
                   })
                   
                   const deleteResult = await deleteResponse.json()
-                  
+
                   if (!deleteResponse.ok) {
+                    // deleteResult already carries the error body — the response
+                    // stream can only be read once, so don't re-read it as text.
                     console.error('Failed to delete auth user:', deleteResult)
-                    // Try to get more details about the error
-                    const errorText = await deleteResponse.text()
-                    console.error('Delete API error response:', errorText)
                   } else {
                     console.log('Auth user deleted successfully:', deleteResult)
                   }
@@ -715,18 +716,29 @@ function LoginForm() {
 
             <div>
               <label htmlFor="password" className="block text-sm font-medium mb-1">Password</label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="field"
-                placeholder="••••••••"
-                required
-                minLength={6}
-                autoComplete={isSignUp ? "new-password" : "current-password"}
-              />
+              <div className="relative">
+                <input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="field pr-10"
+                  placeholder="••••••••"
+                  required
+                  minLength={6}
+                  autoComplete={isSignUp ? "new-password" : "current-password"}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((v) => !v)}
+                  className="field-icon-btn"
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  aria-pressed={showPassword}
+                >
+                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
+              </div>
             </div>
 
             <button

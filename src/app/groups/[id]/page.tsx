@@ -19,6 +19,7 @@ import {
 import Skeleton from '@/components/Skeleton'
 import ToastStack from '@/components/ToastStack'
 import ProfileModal from '@/components/ProfileModal'
+import AuthPanel from '@/components/AuthPanel'
 import Avatar from '@/components/Avatar'
 import InfoTooltip from '@/components/InfoTooltip'
 import PaymentMethodIcon, { PaymentMethodBadge } from '@/components/PaymentMethodIcon'
@@ -128,7 +129,7 @@ export default function GroupDetailPage() {
   const [loading, setLoading] = useState(true)
   const [userId, setUserId] = useState<number | null>(null)
   const [isOwner, setIsOwner] = useState(false)
-  const [pendingJoinRequests, setPendingJoinRequests] = useState<Array<{ id: number; user_id: number; displayName: string; username: string; created_at: string }>>([])
+  const [pendingJoinRequests, setPendingJoinRequests] = useState<Array<{ id: number; user_id: number; displayName: string; username: string; avatar_url: string | null; created_at: string }>>([])
   const [showPin, setShowPin] = useState(false)
   const [activeTab, setActiveTab] = useState<'dues' | 'members' | 'sessions' | 'info'>('dues')
   const [showMakePaymentModal, setShowMakePaymentModal] = useState(false)
@@ -320,12 +321,12 @@ export default function GroupDetailPage() {
       if (error) throw error
 
       const userIds = [...new Set((requestsData || []).map((r: any) => r.user_id))]
-      const userMap: Record<number, { username: string; first_name: string; last_name: string }> = {}
+      const userMap: Record<number, { username: string; first_name: string; last_name: string; avatar_url: string | null }> = {}
 
       if (userIds.length > 0) {
         const { data: usersData } = await supabase
           .from('User')
-          .select('id, username, first_name, last_name')
+          .select('id, username, first_name, last_name, avatar_url')
           .in('id', userIds)
 
         if (usersData) {
@@ -334,6 +335,7 @@ export default function GroupDetailPage() {
               username: u.username || 'Unknown',
               first_name: u.first_name || '',
               last_name: u.last_name || '',
+              avatar_url: u.avatar_url || null,
             }
           })
         }
@@ -352,6 +354,7 @@ export default function GroupDetailPage() {
           user_id: r.user_id,
           displayName,
           username: u?.username || 'Unknown',
+          avatar_url: u?.avatar_url || null,
           created_at: r.created_at,
         }
       })
@@ -2077,7 +2080,7 @@ export default function GroupDetailPage() {
           <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
             <Skeleton className="h-4 w-14" />
             <Skeleton className="h-5 w-40" />
-            <div className="w-12" />
+            <Skeleton className="w-9 h-9 rounded-full" />
           </div>
         </header>
 
@@ -2470,9 +2473,12 @@ export default function GroupDetailPage() {
                 const displayName = member ? formatDisplayName(members, member) : detail.username
                 return (
                   <div key={detail.user_id} className="flex items-center justify-between py-3">
-                    <div>
-                      <p className="font-medium text-sm">{displayName}</p>
-                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                    <div className="flex items-center gap-3">
+                      <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                      <div>
+                        <p className="font-medium text-sm">{displayName}</p>
+                        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                      </div>
                     </div>
                     <p
                       className="amount text-lg font-semibold"
@@ -2498,7 +2504,7 @@ export default function GroupDetailPage() {
             <ArrowLeft size={16} /> Back
           </Link>
           <h1 className="font-display text-xl font-semibold tracking-tight">{group.name || 'Untitled Group'}</h1>
-          <div className="w-12"></div>
+          <AuthPanel />
         </div>
       </header>
 
@@ -2702,9 +2708,12 @@ export default function GroupDetailPage() {
                         className="flex items-center justify-between gap-4 rounded-lg border p-4"
                         style={{ borderColor: 'var(--border)' }}
                       >
-                        <div>
-                          <p className="text-sm font-medium">{req.displayName}</p>
-                          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{req.username} · wants to join</p>
+                        <div className="flex items-center gap-3">
+                          <Avatar url={req.avatar_url} name={req.displayName} size={36} />
+                          <div>
+                            <p className="text-sm font-medium">{req.displayName}</p>
+                            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{req.username} · wants to join</p>
+                          </div>
                         </div>
                         <div className="flex gap-2 shrink-0">
                           <button onClick={() => handleApproveJoinRequest(req.id)} className="btn-primary text-sm">
@@ -2736,6 +2745,10 @@ export default function GroupDetailPage() {
                           <button
                             type="button"
                             onClick={() => {
+                              if (isCurrentUser) {
+                                router.push('/profile')
+                                return
+                              }
                               setProfileModalContext({})
                               setProfileModalUserId(member.user_id)
                             }}
@@ -2748,6 +2761,10 @@ export default function GroupDetailPage() {
                               <button
                                 type="button"
                                 onClick={() => {
+                                  if (isCurrentUser) {
+                                    router.push('/profile')
+                                    return
+                                  }
                                   setProfileModalContext({})
                                   setProfileModalUserId(member.user_id)
                                 }}
@@ -2890,10 +2907,13 @@ export default function GroupDetailPage() {
                                     key={member.user_id}
                                     type="button"
                                     onClick={() => handleAddMemberToSession(member.user_id)}
-                                    className="w-full text-left px-4 py-2 transition-colors hover:bg-[var(--canvas)]"
+                                    className="w-full flex items-center gap-2 text-left px-4 py-2 transition-colors hover:bg-[var(--canvas)]"
                                   >
-                                    <p className="font-medium text-sm">{formatDisplayName(members, member)}</p>
-                                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{member.username}</p>
+                                    <Avatar url={member.avatar_url} name={formatDisplayName(members, member)} size={28} />
+                                    <div>
+                                      <p className="font-medium text-sm">{formatDisplayName(members, member)}</p>
+                                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{member.username}</p>
+                                    </div>
                                   </button>
                                 ))}
                               {activeMembers.filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id)).length === 0 && (
@@ -2915,14 +2935,17 @@ export default function GroupDetailPage() {
                               className="flex items-center gap-2 p-3 rounded-lg border"
                               style={{ borderColor: 'var(--border)' }}
                             >
-                              <div className="flex-1">
+                              <div className="flex-1 flex items-center gap-2">
                                 {(() => {
                                   const member = members.find(m => m.user_id === sm.user_id)
                                   const displayName = member ? formatDisplayName(members, member) : sm.username
                                   return (
                                     <>
-                                      <p className="font-medium text-sm">{displayName}</p>
-                                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{sm.username}</p>
+                                      <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                                      <div>
+                                        <p className="font-medium text-sm">{displayName}</p>
+                                        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{sm.username}</p>
+                                      </div>
                                     </>
                                   )
                                 })()}
@@ -3195,19 +3218,22 @@ export default function GroupDetailPage() {
                                           className="rounded-lg p-3 flex items-center justify-between border"
                                           style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}
                                         >
-                                          <div>
+                                          <div className="flex items-center gap-3">
                                             {(() => {
                                               const member = members.find(m => m.user_id === detail.user_id)
                                               const displayName = member ? formatDisplayName(members, member) : detail.username
                                               return (
                                                 <>
-                                                  <p className="font-medium text-sm">
-                                                    {displayName}
-                                                    {detail.user_id === userId && (
-                                                      <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>(You)</span>
-                                                    )}
-                                                  </p>
-                                                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                                                  <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                                                  <div>
+                                                    <p className="font-medium text-sm">
+                                                      {displayName}
+                                                      {detail.user_id === userId && (
+                                                        <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>(You)</span>
+                                                      )}
+                                                    </p>
+                                                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                                                  </div>
                                                 </>
                                               )
                                             })()}
@@ -3561,10 +3587,6 @@ export default function GroupDetailPage() {
               amount={profileModalContext.amount}
               note={profileModalContext.note}
               onClose={() => setProfileModalUserId(null)}
-              onSaved={(message) => {
-                showToast(message)
-                loadMembers()
-              }}
             />
           )}
 

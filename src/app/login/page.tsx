@@ -742,6 +742,14 @@ function LoginForm() {
               </div>
             </div>
 
+            {!isSignUp && (
+              <div className="text-right">
+                <Link href="/forgot-password" className="text-sm font-medium hover:underline" style={{ color: 'var(--text-muted)' }}>
+                  Forgot password?
+                </Link>
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={isLoading || checkingUsername}

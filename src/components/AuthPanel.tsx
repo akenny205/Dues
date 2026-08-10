@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import useAuth from '@/hooks/useAuth'
 import { getOrCreateUser } from '@/lib/userHelper'
 import { supabase } from '@/lib/supabase'
 import Avatar from './Avatar'
-import ProfileModal from './ProfileModal'
-import Link from 'next/link'
 
 interface HeaderProfile {
   avatar_url: string | null
@@ -18,22 +17,15 @@ interface HeaderProfile {
 export default function AuthPanel() {
   const { user, loading, signOut } = useAuth()
   const router = useRouter()
-  const [dbUserId, setDbUserId] = useState<number | null>(null)
   const [profile, setProfile] = useState<HeaderProfile | null>(null)
-  const [showProfile, setShowProfile] = useState(false)
-
-  const loadHeaderProfile = async (id: number) => {
-    const { data } = await supabase.from('User').select('avatar_url, first_name, username').eq('id', id).maybeSingle()
-    if (data) setProfile(data)
-  }
 
   useEffect(() => {
     if (!user) return
     let mounted = true
-    getOrCreateUser(user).then((id) => {
+    getOrCreateUser(user).then(async (id) => {
       if (!mounted || !id) return
-      setDbUserId(id)
-      loadHeaderProfile(id)
+      const { data } = await supabase.from('User').select('avatar_url, first_name, username').eq('id', id).maybeSingle()
+      if (mounted && data) setProfile(data)
     })
     return () => {
       mounted = false
@@ -67,23 +59,14 @@ export default function AuthPanel() {
       >
         Log out
       </button>
-      <button
-        onClick={() => dbUserId && setShowProfile(true)}
-        disabled={!dbUserId}
-        className="btn-secondary text-sm inline-flex items-center gap-2"
+      <Link
+        href="/profile"
+        className="inline-flex rounded-full border transition-colors hover:border-[var(--accent)]"
+        style={{ borderColor: 'var(--border)' }}
         title="Your profile"
       >
-        <Avatar url={profile?.avatar_url} name={displayName} size={20} />
-        <span className="hidden sm:inline">Profile</span>
-      </button>
-      {showProfile && dbUserId && (
-        <ProfileModal
-          userId={dbUserId}
-          currentUserId={dbUserId}
-          onClose={() => setShowProfile(false)}
-          onSaved={() => loadHeaderProfile(dbUserId)}
-        />
-      )}
+        <Avatar url={profile?.avatar_url} name={displayName} size={36} />
+      </Link>
     </div>
   )
 }

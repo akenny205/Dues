@@ -305,7 +305,8 @@ function LoginForm() {
                 email: data.user.email || trimmedEmail,
                 username: trimmedUsername,
                 first_name: trimmedFirstName || null,
-                last_name: trimmedLastName || null
+                last_name: trimmedLastName || null,
+                auth_user_id: data.user.id
               }])
               .select()
 

@@ -1,79 +1,71 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------- *
- * Design tokens — "The Ledger"
- * A passbook / statement aesthetic: warm paper, deep ledger green,
- * brass accents, hairline rules instead of boxes, tabular mono
- * numerals for money. Mirrors into an "ink ledger" dark mode.
+ * Design tokens
+ *
+ * A small, deliberately abstract set of tokens: neutrals for
+ * background/surface/text/border, one accent (brand actions, links,
+ * positive amounts), and one negative (destructive actions, errors,
+ * negative amounts). Nothing is named after a decorative metaphor
+ * (no "brass", "rust", "emerald") so a new feature reaches for
+ * --accent or --negative rather than inventing another color —
+ * that's what keeps the palette consistent as the site grows.
  * ---------------------------------------------------------------- */
 
 :root {
-  --paper: #f1efe4;
-  --paper-card: #fbfaf3;
-  --ink: #1b2620;
-  --ink-muted: #5b6459;
-  --line: #d9d4c1;
+  --canvas: #f7f6f2;
+  --surface: #ffffff;
+  --border: #e1ddd3;
+  --text: #211f1c;
+  --text-muted: #6e6a62;
 
-  --ledger: #1f4d3a;
-  --ledger-dark: #163829;
-  --on-ledger: #f1efe4;
+  --accent: #1f4739;
+  --accent-strong: #15332a;
+  --on-accent: #f7f6f2;
+  --accent-soft: #e4eae6;
 
-  --brass: #9c7a34;
-  --brass-soft: #f1e4c2;
+  --negative: #9c4630;
+  --negative-soft: #f1e5e0;
 
-  --emerald: #1e7a4c;
-  --emerald-soft: #deeee0;
-
-  --rust: #a6432a;
-  --rust-soft: #f3ded6;
-
-  --shadow: 0 1px 2px rgba(27, 38, 32, 0.05), 0 1px 1px rgba(27, 38, 32, 0.04);
+  --shadow: 0 1px 2px rgba(33, 31, 28, 0.06), 0 1px 1px rgba(33, 31, 28, 0.04);
+  --overlay: rgba(15, 14, 12, 0.55);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #10160f;
-    --paper-card: #171f18;
-    --ink: #ece7d6;
-    --ink-muted: #97a196;
-    --line: #2b362e;
+    --canvas: #15140f;
+    --surface: #1d1c18;
+    --border: #322f28;
+    --text: #edeae3;
+    --text-muted: #9c978c;
 
-    --ledger: #2f6b4e;
-    --ledger-dark: #255740;
-    --on-ledger: #f1efe4;
+    --accent: #5aa084;
+    --accent-strong: #71b69a;
+    --on-accent: #0e1512;
+    --accent-soft: #1c2a24;
 
-    --brass: #d4ac5f;
-    --brass-soft: #2c2415;
-
-    --emerald: #4fbe84;
-    --emerald-soft: #16281d;
-
-    --rust: #e88664;
-    --rust-soft: #2e1913;
+    --negative: #dd8264;
+    --negative-soft: #2c1d16;
 
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --overlay: rgba(15, 14, 12, 0.65);
   }
 }
 
 @theme inline {
-  --color-paper: var(--paper);
-  --color-paper-card: var(--paper-card);
-  --color-ink: var(--ink);
-  --color-ink-muted: var(--ink-muted);
-  --color-line: var(--line);
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
 
-  --color-ledger: var(--ledger);
-  --color-ledger-dark: var(--ledger-dark);
-  --color-on-ledger: var(--on-ledger);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-on-accent: var(--on-accent);
+  --color-accent-soft: var(--accent-soft);
 
-  --color-brass: var(--brass);
-  --color-brass-soft: var(--brass-soft);
-
-  --color-emerald: var(--emerald);
-  --color-emerald-soft: var(--emerald-soft);
-
-  --color-rust: var(--rust);
-  --color-rust-soft: var(--rust-soft);
+  --color-negative: var(--negative);
+  --color-negative-soft: var(--negative-soft);
 
   --font-display: var(--font-fraunces);
   --font-sans: var(--font-plex-sans);
@@ -86,8 +78,8 @@
 
 html,
 body {
-  background: var(--paper);
-  color: var(--ink);
+  background: var(--canvas);
+  color: var(--text);
   min-height: 100vh;
 }
 
@@ -96,12 +88,12 @@ body {
 }
 
 ::selection {
-  background: var(--brass-soft);
-  color: var(--ink);
+  background: var(--accent-soft);
+  color: var(--text);
 }
 
 :focus-visible {
-  outline: 2px solid var(--brass);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -120,7 +112,7 @@ body {
 @layer components {
   .eyebrow {
     @apply text-[11px] font-semibold uppercase tracking-[0.14em];
-    color: var(--ink-muted);
+    color: var(--text-muted);
   }
 
   .amount {
@@ -134,68 +126,93 @@ body {
   .btn-primary,
   .btn-secondary,
   .btn-ghost,
-  .btn-danger {
+  .btn-danger,
+  .btn-approve,
+  .btn-reject {
     @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn-primary {
-    background: var(--ledger);
-    color: var(--on-ledger);
+    background: var(--accent);
+    color: var(--on-accent);
   }
   .btn-primary:hover:not(:disabled) {
-    background: var(--ledger-dark);
+    background: var(--accent-strong);
   }
   .btn-secondary {
     @apply border;
-    border-color: var(--line);
-    color: var(--ink);
+    border-color: var(--border);
+    color: var(--text);
     background: transparent;
   }
   .btn-secondary:hover:not(:disabled) {
-    background: var(--paper-card);
-    border-color: var(--brass);
+    background: var(--surface);
+    border-color: var(--accent);
   }
   .btn-ghost {
-    color: var(--ink-muted);
+    color: var(--text-muted);
     background: transparent;
   }
   .btn-ghost:hover:not(:disabled) {
-    color: var(--ink);
+    color: var(--text);
   }
   .btn-danger {
-    background: var(--rust);
-    color: #fdf7f4;
+    background: var(--negative);
+    color: var(--on-accent);
   }
   .btn-danger:hover:not(:disabled) {
     filter: brightness(0.92);
   }
 
+  /* Approve / reject — an outline only, no fill, for decisions (like
+     reviewing a session edit) where a solid block of color reads as louder
+     than the choice actually warrants. The tint only shows up on hover, as
+     an affordance rather than a resting state. */
+  .btn-approve {
+    @apply border;
+    background: transparent;
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-approve:hover:not(:disabled) {
+    background: var(--accent-soft);
+  }
+  .btn-reject {
+    @apply border;
+    background: transparent;
+    border-color: var(--negative);
+    color: var(--negative);
+  }
+  .btn-reject:hover:not(:disabled) {
+    background: var(--negative-soft);
+  }
+
   /* Surfaces */
   .card {
     @apply rounded-lg border p-6;
-    background: var(--paper-card);
-    border-color: var(--line);
+    background: var(--surface);
+    border-color: var(--border);
     box-shadow: var(--shadow);
   }
 
   .field {
     @apply w-full rounded-md border px-3 py-2 text-sm transition-colors;
-    background: var(--paper-card);
-    border-color: var(--line);
-    color: var(--ink);
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text);
   }
   .field:focus {
-    border-color: var(--brass);
+    border-color: var(--accent);
     outline: none;
   }
   .field::placeholder {
-    color: var(--ink-muted);
+    color: var(--text-muted);
     opacity: 0.7;
   }
 
   /* Ledger row: hairline-divided list item, used instead of boxed cards */
   .ledger-row {
     @apply flex items-center justify-between gap-4 py-4 px-1 border-b transition-colors;
-    border-color: var(--line);
+    border-color: var(--border);
   }
   .ledger-row:last-child {
     border-bottom: none;
@@ -205,49 +222,59 @@ body {
   .badge {
     @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide;
   }
-  .badge-brass {
-    background: var(--brass-soft);
-    color: var(--brass);
+  .badge-accent {
+    background: var(--accent-soft);
+    color: var(--accent);
   }
-  .badge-emerald {
-    background: var(--emerald-soft);
-    color: var(--emerald);
+  .badge-accent-solid {
+    background: var(--accent);
+    color: var(--on-accent);
   }
-  .badge-rust {
-    background: var(--rust-soft);
-    color: var(--rust);
-  }
-  .badge-ledger {
-    background: var(--ledger);
-    color: var(--on-ledger);
+  .badge-negative {
+    background: var(--negative-soft);
+    color: var(--negative);
   }
   .badge-outline {
     @apply border;
-    border-color: var(--line);
-    color: var(--ink-muted);
+    border-color: var(--border);
+    color: var(--text-muted);
   }
 
-  /* Sidebar / passbook tabs */
+  /* Pay links — quick-pay pills that hand off to an external payment app.
+     Styled like badge-outline rather than in Venmo blue / Cash App green so
+     they read as part of the same system instead of injecting brand colors
+     into an otherwise brand-neutral palette. */
+  .pay-pill {
+    @apply inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-medium transition-colors;
+    border-color: var(--border);
+    color: var(--text);
+  }
+  .pay-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Sidebar tabs */
   .tab-item {
     @apply w-full text-left px-4 py-2.5 rounded-md text-sm font-medium transition-colors;
-    color: var(--ink-muted);
+    color: var(--text-muted);
   }
   .tab-item:hover {
-    color: var(--ink);
-    background: var(--paper-card);
+    color: var(--text);
+    background: var(--surface);
   }
   .tab-item-active {
     @apply w-full text-left px-4 py-2.5 rounded-md text-sm font-semibold transition-colors;
-    background: var(--ledger);
-    color: var(--on-ledger);
+    background: var(--accent);
+    color: var(--on-accent);
   }
 
   /* Ticket stub — the group PIN, styled like a torn passbook stub */
   .ticket-stub {
     position: relative;
-    border: 1px dashed var(--brass);
+    border: 1px dashed var(--accent);
     border-radius: 10px;
-    background: var(--brass-soft);
+    background: var(--accent-soft);
   }
   .ticket-stub::before,
   .ticket-stub::after {
@@ -257,7 +284,7 @@ body {
     width: 16px;
     height: 16px;
     border-radius: 50%;
-    background: var(--paper);
+    background: var(--canvas);
     transform: translateY(-50%);
   }
   .ticket-stub::before {
@@ -269,12 +296,12 @@ body {
 
   .modal-overlay {
     @apply fixed inset-0 flex items-center justify-center z-50 p-4;
-    background: rgba(16, 22, 15, 0.55);
+    background: var(--overlay);
   }
   .modal-panel {
     @apply w-full max-w-md rounded-lg border p-6;
-    background: var(--paper-card);
-    border-color: var(--line);
+    background: var(--surface);
+    border-color: var(--border);
     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
   }
 
@@ -286,7 +313,7 @@ body {
      loads. Compose several into a layout that mirrors the page underneath. */
   .skeleton {
     border-radius: 6px;
-    background: linear-gradient(90deg, var(--line) 25%, var(--paper-card) 37%, var(--line) 63%);
+    background: linear-gradient(90deg, var(--border) 25%, var(--surface) 37%, var(--border) 63%);
     background-size: 400% 100%;
     animation: skeleton-shimmer 1.4s ease-in-out infinite;
   }

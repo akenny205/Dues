@@ -610,17 +610,17 @@ function LoginForm() {
   }
 
   const messageStyle = message.includes('Check your email')
-    ? { background: 'var(--emerald-soft)', color: 'var(--emerald)', borderColor: 'var(--emerald)' }
+    ? { background: 'var(--accent-soft)', color: 'var(--accent)', borderColor: 'var(--accent)' }
     : message.includes('already taken') || message.includes('already registered')
-    ? { background: 'var(--rust-soft)', color: 'var(--rust)', borderColor: 'var(--rust)' }
-    : { background: 'var(--brass-soft)', color: 'var(--brass)', borderColor: 'var(--brass)' }
+    ? { background: 'var(--negative-soft)', color: 'var(--negative)', borderColor: 'var(--negative)' }
+    : { background: 'var(--accent-soft)', color: 'var(--accent)', borderColor: 'var(--accent)' }
 
   return (
     <main className="min-h-screen flex items-center justify-center px-6 py-16">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
           <Link href="/" className="font-display text-3xl font-semibold tracking-tight">Dues</Link>
-          <div className="mx-auto mt-3 h-px w-10" style={{ background: 'var(--brass)' }} />
+          <div className="mx-auto mt-3 h-px w-10" style={{ background: 'var(--accent)' }} />
         </div>
 
         <div className="card">
@@ -693,7 +693,7 @@ function LoginForm() {
                     title="Username must be at least 3 characters and can only contain letters, numbers, and underscores"
                     autoComplete="username"
                   />
-                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>3+ characters, letters, numbers, and underscores only</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>3+ characters, letters, numbers, and underscores only</p>
                 </div>
               </>
             )}
@@ -748,7 +748,7 @@ function LoginForm() {
                 setLastName('')
               }}
               className="text-sm font-medium hover:underline"
-              style={{ color: 'var(--ink-muted)' }}
+              style={{ color: 'var(--text-muted)' }}
             >
               {isSignUp ? 'Already have an account? Sign in' : "Don't have an account? Sign up"}
             </button>
@@ -766,7 +766,7 @@ export default function LoginPage() {
         <div className="w-full max-w-md">
           <div className="card text-center">
             <h1 className="font-display text-2xl font-semibold mb-2">Dues</h1>
-            <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Loading…</p>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading…</p>
           </div>
         </div>
       </main>

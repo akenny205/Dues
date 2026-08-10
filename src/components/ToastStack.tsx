@@ -20,8 +20,8 @@ export default function ToastStack({
           className="toast-in flex items-start gap-3 rounded-lg border px-4 py-3 text-sm shadow-lg"
           style={
             t.type === 'error'
-              ? { background: 'var(--rust-soft)', borderColor: 'var(--rust)', color: 'var(--rust)' }
-              : { background: 'var(--emerald-soft)', borderColor: 'var(--emerald)', color: 'var(--emerald)' }
+              ? { background: 'var(--negative-soft)', borderColor: 'var(--negative)', color: 'var(--negative)' }
+              : { background: 'var(--accent-soft)', borderColor: 'var(--accent)', color: 'var(--accent)' }
           }
           role="status"
         >

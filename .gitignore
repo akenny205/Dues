@@ -32,6 +32,13 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# one-time pg_dump used to bootstrap prod's schema — superseded by
+# supabase/migrations/ now; kept locally as a record, not committed (it's
+# large and includes Supabase's internal auth/storage/realtime schemas, not
+# just this app's tables)
+db/prod-bootstrap.sql
 
 # vercel
 .vercel

@@ -1,9 +1,10 @@
+-- Converted from db/policies/lockdown_rls.sql (kept there for history).
+--
 -- Locks down every policy that was previously USING (true) so that group data
 -- (members, sessions, payments, approvals) is only ever readable/writable by
--- actual members of that group. Run this in your Supabase SQL Editor.
+-- actual members of that group.
 --
--- Two design decisions baked into this file (see the "Session & Payment Logic"
--- spec for the write-up):
+-- Two design decisions baked into this file:
 --   1. Membership is checked via a real User.auth_user_id -> auth.users(id) link,
 --      not by matching email strings.
 --   2. "Join by pin" and "accept an invite" both need to read a Group/Invite row
@@ -13,8 +14,6 @@
 --
 -- Permission model is otherwise unchanged from before: any member of a group can
 -- read/create/edit/delete anything within it — there is no owner-only gating.
--- That was an explicit, separate decision (see spec §09) and nothing here
--- changes it.
 
 -- ============================================================================
 -- 1. Link auth.users to the app's own User table
@@ -23,16 +22,10 @@
 ALTER TABLE public."User"
 ADD COLUMN IF NOT EXISTS auth_user_id uuid REFERENCES auth.users(id);
 
--- One auth user maps to at most one app user. Partial index so legacy rows
--- that haven't been backfilled/healed yet (auth_user_id still null) don't
--- collide with each other.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_auth_user_id
 ON public."User"(auth_user_id)
 WHERE auth_user_id IS NOT NULL;
 
--- One-time backfill for existing rows, matched by email. Anything left over
--- (mismatched/changed email) gets healed automatically the next time that
--- person logs in — see getOrCreateUser in src/lib/userHelper.ts.
 UPDATE public."User" u
 SET auth_user_id = a.id
 FROM auth.users a

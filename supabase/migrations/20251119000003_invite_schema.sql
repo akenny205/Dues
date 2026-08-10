@@ -1,5 +1,6 @@
--- Invite table for group invitations
--- Run this in your Supabase SQL Editor
+-- Converted from db/policies/invite_schema.sql (kept there for history).
+-- Invite table for group invitations, plus (still-open, superseded in
+-- 20260807000001_lockdown_rls.sql) RLS for GroupMember.
 
 CREATE TABLE IF NOT EXISTS public."Invite" (
   id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
@@ -10,34 +11,29 @@ CREATE TABLE IF NOT EXISTS public."Invite" (
   expires_at timestamp with time zone,
   accepted_at timestamp with time zone,
   invited_by bigint,
-  CONSTRAINT Invite_pkey PRIMARY KEY (id),
-  CONSTRAINT Invite_group_id_fkey FOREIGN KEY (group_id) REFERENCES public."Group"(id),
-  CONSTRAINT Invite_invited_by_fkey FOREIGN KEY (invited_by) REFERENCES public."User"(id)
+  CONSTRAINT "Invite_pkey" PRIMARY KEY (id),
+  CONSTRAINT "Invite_group_id_fkey" FOREIGN KEY (group_id) REFERENCES public."Group"(id),
+  CONSTRAINT "Invite_invited_by_fkey" FOREIGN KEY (invited_by) REFERENCES public."User"(id)
 );
 
--- Enable RLS on Invite table
 ALTER TABLE public."Invite" ENABLE ROW LEVEL SECURITY;
 
--- Drop existing policies if they exist
 DROP POLICY IF EXISTS "Users can read invites" ON public."Invite";
 DROP POLICY IF EXISTS "Users can create invites" ON public."Invite";
 DROP POLICY IF EXISTS "Users can update invites" ON public."Invite";
 
--- Policy: Allow authenticated users to read invites (for their email or groups they own)
 CREATE POLICY "Users can read invites"
 ON public."Invite"
 FOR SELECT
 TO authenticated
 USING (true);
 
--- Policy: Allow authenticated users to create invites
 CREATE POLICY "Users can create invites"
 ON public."Invite"
 FOR INSERT
 TO authenticated
 WITH CHECK (true);
 
--- Policy: Allow authenticated users to update invites (to mark as accepted)
 CREATE POLICY "Users can update invites"
 ON public."Invite"
 FOR UPDATE
@@ -68,4 +64,3 @@ ON public."GroupMember"
 FOR UPDATE
 TO authenticated
 USING (true);
-

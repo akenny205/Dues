@@ -156,9 +156,9 @@ export default function InviteAcceptPage() {
     return (
       <main className="min-h-screen flex items-center justify-center px-6">
         <div className="card max-w-md w-full text-center">
-          <p className="eyebrow mb-2" style={{ color: 'var(--rust)' }}>Invite error</p>
-          <p className="mb-6" style={{ color: 'var(--ink-muted)' }}>{error}</p>
-          <Link href="/" className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--ledger)' }}>
+          <p className="eyebrow mb-2" style={{ color: 'var(--negative)' }}>Invite error</p>
+          <p className="mb-6" style={{ color: 'var(--text-muted)' }}>{error}</p>
+          <Link href="/" className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
             Go to home <ArrowRight size={14} />
           </Link>
         </div>
@@ -170,9 +170,9 @@ export default function InviteAcceptPage() {
     return (
       <main className="min-h-screen flex items-center justify-center px-6">
         <div className="card max-w-md w-full text-center">
-          <p className="eyebrow mb-2" style={{ color: 'var(--emerald)' }}>Success</p>
+          <p className="eyebrow mb-2" style={{ color: 'var(--accent)' }}>Success</p>
           <h1 className="font-display text-2xl font-semibold mb-2">You&apos;re in</h1>
-          <p style={{ color: 'var(--ink-muted)' }}>You&apos;ve been added to the group. Redirecting…</p>
+          <p style={{ color: 'var(--text-muted)' }}>You&apos;ve been added to the group. Redirecting…</p>
         </div>
       </main>
     )
@@ -192,13 +192,13 @@ export default function InviteAcceptPage() {
         <div className="ledger-row mb-6" style={{ paddingTop: 0 }}>
           <div>
             <h2 className="font-semibold text-lg">{group?.name || 'Untitled Group'}</h2>
-            <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Invited by {invite.email}</p>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Invited by {invite.email}</p>
           </div>
         </div>
         <button onClick={handleAcceptInvite} className="btn-primary w-full">
           Accept invitation
         </button>
-        <Link href="/" className="block text-center mt-4 text-sm hover:underline" style={{ color: 'var(--ink-muted)' }}>
+        <Link href="/" className="block text-center mt-4 text-sm hover:underline" style={{ color: 'var(--text-muted)' }}>
           Cancel
         </Link>
       </div>

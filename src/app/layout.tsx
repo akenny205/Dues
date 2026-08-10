@@ -33,7 +33,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${fraunces.variable} ${plexSans.variable} ${plexMono.variable} antialiased bg-paper text-ink`}
+        className={`${fraunces.variable} ${plexSans.variable} ${plexMono.variable} antialiased bg-canvas text-text`}
       >
         {children}
       </body>

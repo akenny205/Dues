@@ -1,9 +1,13 @@
+-- Converted from db/policies/add_member_removal.sql (kept there for history).
+-- Requires 20260807000001_lockdown_rls.sql and 20260807000002_add_join_requests.sql
+-- (redefines functions those introduced).
+--
 -- Lets the group owner remove a member without deleting any of their data.
 -- Removal is a soft-delete: GroupMember.status flips to 'removed' rather than
 -- the row being deleted, so User rows and every SessionPayment they were ever
 -- part of stay exactly as they are — other members still see their real name
 -- on old sessions, and if they rejoin later their whole history is still
--- there. Run this in the Supabase SQL Editor.
+-- there.
 
 -- ============================================================================
 -- 1. GroupMember gets a status. Existing rows all become 'active' for free —

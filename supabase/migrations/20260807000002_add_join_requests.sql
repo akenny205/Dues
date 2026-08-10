@@ -1,15 +1,15 @@
+-- Converted from db/policies/add_join_requests.sql (kept there for history).
+-- Requires 20260807000001_lockdown_rls.sql (mirrors its is_group_member,
+-- reuses the auth_user_id column it added).
+--
 -- Group owners must approve people before they actually become members.
 -- Joining by pin (see src/app/page.tsx handleJoinGroup) now creates a
 -- JoinRequest row instead of inserting straight into GroupMember; the owner
--- approves or rejects it from the group's Members tab. Run this in the
--- Supabase SQL Editor.
+-- approves or rejects it from the group's Members tab.
 --
 -- This does NOT change the "no permission gating" decision (any member can
 -- still do anything within a group they're in) — it adds exactly one
 -- owner-only action: deciding who gets in in the first place.
---
--- Defensively repeats the auth_user_id setup from lockdown_rls.sql so this
--- file works regardless of which migration you ran first.
 
 ALTER TABLE public."User"
 ADD COLUMN IF NOT EXISTS auth_user_id uuid REFERENCES auth.users(id);

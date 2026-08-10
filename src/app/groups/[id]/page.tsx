@@ -18,6 +18,9 @@ import {
 } from 'lucide-react'
 import Skeleton from '@/components/Skeleton'
 import ToastStack from '@/components/ToastStack'
+import ProfileModal from '@/components/ProfileModal'
+import Avatar from '@/components/Avatar'
+import InfoTooltip from '@/components/InfoTooltip'
 import useAuth from '@/hooks/useAuth'
 import useToast from '@/hooks/useToast'
 import { supabase } from '@/lib/supabase'
@@ -70,29 +73,46 @@ interface GroupMember {
   username?: string
   first_name?: string
   last_name?: string
+  avatar_url?: string | null
 }
 
-// Helper function to format names: "First L." with last initial only if duplicate first names
+// Helper function to format names: "First L." with last initial only if duplicate
+// first names — and "First Last" (full last name) if the last initial alone
+// still wouldn't tell them apart (e.g. "Andrew Kenn" vs. "Andrew Kenny").
 const formatDisplayName = (members: GroupMember[], currentMember: GroupMember): string => {
   const firstName = currentMember.first_name || currentMember.username || 'Unknown'
   const lastName = currentMember.last_name || ''
-  
+
   // Capitalize first letter of first name
   const capitalizedFirstName = firstName.charAt(0).toUpperCase() + firstName.slice(1).toLowerCase()
-  
-  // Check if there are duplicate first names in the group (case-insensitive comparison)
-  const duplicateFirstNames = members.filter(m => {
+
+  // Everyone else in the group sharing this first name (case-insensitive).
+  // Empty/singleton means the first name is unique — no disambiguation needed.
+  const sameFirstName = members.filter(m => {
     const otherFirstName = (m.first_name || m.username || '').toLowerCase()
     return otherFirstName === firstName.toLowerCase()
-  }).length > 1
-  
-  if (duplicateFirstNames && lastName) {
-    // Capitalize last initial
-    const lastInitial = lastName.charAt(0).toUpperCase()
-    return `${capitalizedFirstName} ${lastInitial}.`
+  })
+
+  if (sameFirstName.length <= 1 || !lastName) {
+    return capitalizedFirstName
   }
-  
-  return capitalizedFirstName
+
+  // A last initial only disambiguates if nobody else sharing this first name
+  // also shares that initial — otherwise fall back to the full last name so
+  // they don't still collide.
+  const lastInitial = lastName.charAt(0).toUpperCase()
+  const initialAlsoCollides = sameFirstName.some(m => {
+    if (m.user_id === currentMember.user_id) return false
+    const otherLastInitial = (m.last_name || '').charAt(0).toUpperCase()
+    return otherLastInitial === lastInitial
+  })
+
+  if (initialAlsoCollides) {
+    const capitalizedLastName = lastName.charAt(0).toUpperCase() + lastName.slice(1).toLowerCase()
+    return `${capitalizedFirstName} ${capitalizedLastName}`
+  }
+
+  return `${capitalizedFirstName} ${lastInitial}.`
 }
 
 export default function GroupDetailPage() {
@@ -112,6 +132,7 @@ export default function GroupDetailPage() {
   const [paymentPayee, setPaymentPayee] = useState<number | null>(null)
   const [paymentAmount, setPaymentAmount] = useState('')
   const [paymentDescription, setPaymentDescription] = useState('')
+  const [isSubmittingPayment, setIsSubmittingPayment] = useState(false)
   const [members, setMembers] = useState<GroupMember[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [showAddSession, setShowAddSession] = useState(false)
@@ -139,6 +160,8 @@ export default function GroupDetailPage() {
   const [savingNotes, setSavingNotes] = useState(false)
   const [showCreateLiveSessionModal, setShowCreateLiveSessionModal] = useState(false)
   const [liveSessionDescription, setLiveSessionDescription] = useState('')
+  const [profileModalUserId, setProfileModalUserId] = useState<number | null>(null)
+  const [profileModalContext, setProfileModalContext] = useState<{ amount?: number; note?: string }>({})
   const { toasts, showToast, dismiss } = useToast()
 
   useEffect(() => {
@@ -347,23 +370,26 @@ export default function GroupDetailPage() {
 
       if (error) throw error
 
-      // Fetch user emails, usernames, and names
+      // Fetch user emails, usernames, names, and avatars. Payment method
+      // handles live behind ProfileModal, which fetches them itself when
+      // someone's profile is actually opened — no need to carry them here.
       const userIds = [...new Set((memberData || []).map((m: any) => m.user_id))]
-      const userMap: Record<number, { email: string; username: string; first_name: string; last_name: string }> = {}
-      
+      const userMap: Record<number, { email: string; username: string; first_name: string; last_name: string; avatar_url: string | null }> = {}
+
       if (userIds.length > 0) {
         const { data: usersData } = await supabase
           .from('User')
-          .select('id, email, username, first_name, last_name')
+          .select('id, email, username, first_name, last_name, avatar_url')
           .in('id', userIds)
-        
+
         if (usersData) {
           usersData.forEach((u: any) => {
-            userMap[u.id] = { 
-              email: u.email || 'Unknown', 
+            userMap[u.id] = {
+              email: u.email || 'Unknown',
               username: u.username || 'Unknown',
               first_name: u.first_name || '',
-              last_name: u.last_name || ''
+              last_name: u.last_name || '',
+              avatar_url: u.avatar_url || null,
             }
           })
         }
@@ -378,7 +404,8 @@ export default function GroupDetailPage() {
         email: userMap[member.user_id]?.email || 'Unknown',
         username: userMap[member.user_id]?.username || 'Unknown',
         first_name: userMap[member.user_id]?.first_name || '',
-        last_name: userMap[member.user_id]?.last_name || ''
+        last_name: userMap[member.user_id]?.last_name || '',
+        avatar_url: userMap[member.user_id]?.avatar_url || null,
       }))
 
       setMembers(transformedMembers)
@@ -1752,6 +1779,10 @@ export default function GroupDetailPage() {
 
   const handleMakePayment = async (e: React.FormEvent) => {
     e.preventDefault()
+    // Guards the network round-trip, not just the click — the submit button
+    // disables on the same flag, but this also catches a double Enter-key
+    // submit that fires before React re-renders the disabled state.
+    if (isSubmittingPayment) return
     if (!userId || !groupId || !paymentPayee || !paymentAmount) return
 
     const amountValue = parseFloat(paymentAmount)
@@ -1760,6 +1791,7 @@ export default function GroupDetailPage() {
       return
     }
 
+    setIsSubmittingPayment(true)
     try {
       // Create a new session for this payment
       const payerName = formatDisplayName(members, members.find(m => m.user_id === userId) || { user_id: userId } as GroupMember)
@@ -1778,12 +1810,37 @@ export default function GroupDetailPage() {
 
       if (sessionError) throw sessionError
 
-      // A payment is just a 2-entry session: the payer negative, the payee positive —
-      // written through the same reconcile path as any other session.
-      await reconcileSession(sessionData.id, [
-        { user_id: userId, amount: -amountValue },
-        { user_id: paymentPayee, amount: amountValue },
-      ])
+      // A payment is a 2-entry session (same sign convention as any expense:
+      // whoever hands over money gets the positive entry, whoever receives it
+      // gets the negative one) — but unlike a regular expense, it isn't
+      // applied immediately. Anyone could otherwise claim a fake payment to
+      // clear their own debt, so it goes through the exact same
+      // SessionEditApproval flow as editing an existing session: the payer's
+      // side is auto-approved, the payee's is pending until they confirm,
+      // and the amounts only land in SessionPayment once every pending row
+      // clears (see handleApproveEdit).
+      const { error: approvalError } = await supabase
+        .from('SessionEditApproval')
+        .insert([
+          {
+            session_id: sessionData.id,
+            editor_user_id: userId,
+            approver_user_id: userId,
+            status: 'approved',
+            old_amount: 0,
+            new_amount: amountValue,
+          },
+          {
+            session_id: sessionData.id,
+            editor_user_id: userId,
+            approver_user_id: paymentPayee,
+            status: 'pending',
+            old_amount: 0,
+            new_amount: -amountValue,
+          },
+        ])
+
+      if (approvalError) throw approvalError
 
       // Reset form, close the modal, and reload
       setPaymentPayee(null)
@@ -1792,10 +1849,13 @@ export default function GroupDetailPage() {
       setShowMakePaymentModal(false)
       await loadSessions()
       await loadDues()
-      showToast('Payment recorded successfully!')
+      await loadPendingApprovals()
+      showToast(`Payment recorded — waiting on ${payeeName} to confirm they received it.`)
     } catch (error: any) {
       console.error('Error making payment:', error)
       showToast('Failed to record payment: ' + (error.message || 'Unknown error'))
+    } finally {
+      setIsSubmittingPayment(false)
     }
   }
 
@@ -1872,6 +1932,14 @@ export default function GroupDetailPage() {
       setAllSessionApprovals([])
       setEditorUserId(null)
     }
+  }, [viewingSessionId])
+
+  // When a session row expands (including jumping here from the Dues tab's
+  // Review/View buttons), scroll it into view since the list can be long.
+  useEffect(() => {
+    if (viewingSessionId === null) return
+    const row = document.getElementById(`session-row-${viewingSessionId}`)
+    row?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [viewingSessionId])
 
   // Close dropdown when clicking outside
@@ -1999,7 +2067,7 @@ export default function GroupDetailPage() {
   if (authLoading || loading) {
     return (
       <main className="min-h-screen">
-        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+        <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
           <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
             <Skeleton className="h-4 w-14" />
             <Skeleton className="h-5 w-40" />
@@ -2007,8 +2075,8 @@ export default function GroupDetailPage() {
           </div>
         </header>
 
-        <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col md:flex-row gap-6">
-          <aside className="md:w-56 flex-shrink-0">
+        <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col gap-6 md:flex-row md:gap-0">
+          <aside className="md:w-56 flex-shrink-0 md:border-r md:pr-6 md:mr-6" style={{ borderColor: 'var(--border)' }}>
             <nav className="flex flex-row md:flex-col gap-1.5 overflow-x-auto md:overflow-visible">
               {[0, 1, 2, 3, 4].map((i) => (
                 <Skeleton key={i} className="h-9 rounded-md shrink-0" style={{ width: 130 }} />
@@ -2080,11 +2148,363 @@ export default function GroupDetailPage() {
     { key: 'info', label: group.name ? `${group.name} Info` : 'Group Info' },
   ]
 
+  // The content shown when a session row is expanded inline (not a separate
+  // view — the row itself toggles this open/closed, accordion-style).
+  const renderSessionExpansion = (
+    session: Session,
+    pendingApproval: typeof pendingApprovals[number] | undefined,
+    pendingRejection: typeof pendingRejections[number] | undefined,
+    hasUndismissedRejection: unknown
+  ) => {
+    // Rejection notice — the editor is reviewing why their change was turned down.
+    if (pendingRejection && hasUndismissedRejection) {
+      return (
+        <div className="card rounded-l-none" style={{ borderLeftWidth: 4, borderLeftColor: 'var(--negative)' }}>
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold mb-1 flex items-center gap-2">
+              <XCircle size={18} style={{ color: 'var(--negative)' }} />
+              {pendingRejection.is_deletion ? 'Deletion request rejected' : 'Session edit rejected'}
+            </h2>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+              {pendingRejection.is_deletion
+                ? 'Your request to delete this session was rejected — it was kept as-is.'
+                : 'Your edit to this session was rejected.'}
+            </p>
+          </div>
+
+          <div className="space-y-2 mb-4">
+            <div className="ledger-row">
+              <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Rejected by</span>
+              <span className="font-medium text-sm">
+                {pendingRejection.approver_name || 'Unknown'}
+              </span>
+            </div>
+            {pendingRejection.rejected_at && (
+              <div className="ledger-row">
+                <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Rejected on</span>
+                <span className="text-sm">
+                  {new Date(pendingRejection.rejected_at).toLocaleString()}
+                </span>
+              </div>
+            )}
+          </div>
+
+          <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+            You can edit the session again if needed.
+          </p>
+
+          <button
+            onClick={async () => {
+              if (pendingRejection) {
+                try {
+                  console.log('Dismissing rejection:', pendingRejection.id)
+
+                  // Mark rejection as dismissed in the database
+                  const { data: updatedData, error: dismissError } = await supabase
+                    .from('SessionEditApproval')
+                    .update({ dismissed_at: new Date().toISOString() })
+                    .eq('id', pendingRejection.id)
+                    .select()
+
+                  console.log('Dismiss update result:', { updatedData, dismissError })
+
+                  // If column doesn't exist, delete the rejection record instead
+                  if (dismissError && (dismissError.message?.includes('dismissed_at') || dismissError.message?.includes('column'))) {
+                    console.log('dismissed_at column doesn\'t exist, deleting rejection record instead')
+                    const { error: deleteError } = await supabase
+                      .from('SessionEditApproval')
+                      .delete()
+                      .eq('id', pendingRejection.id)
+
+                    if (deleteError) {
+                      console.error('Error deleting rejection:', deleteError)
+                      showToast('Failed to dismiss rejection. Please try again.')
+                      return
+                    }
+                  } else if (dismissError) {
+                    console.error('Error dismissing rejection:', dismissError)
+                    showToast('Failed to dismiss rejection. Please try again.')
+                    return
+                  }
+
+                  // Close the expanded row immediately
+                  setViewingSessionId(null)
+
+                  // Remove from pendingRejections state immediately for better UX
+                  setPendingRejections(prev => prev.filter(pr => pr.id !== pendingRejection.id))
+
+                  // Reload sessions and pending approvals to update the UI
+                  // (this also refreshes pendingRejections/pendingApprovals/pendingCancellations,
+                  // which is what the Dues tab's Pending Actions area renders from)
+                  await loadSessions()
+                  await loadPendingApprovals()
+                } catch (error: any) {
+                  console.error('Error dismissing rejection:', error)
+                  showToast('Failed to dismiss rejection: ' + (error.message || 'Unknown error'))
+                }
+              }
+            }}
+            className="btn-secondary w-full"
+          >
+            OK
+          </button>
+        </div>
+      )
+    }
+
+    // Approval needed — someone else's change (or a deletion) is waiting on this member.
+    if (pendingApproval && session.pendingApproval) {
+      return (
+        <div className="card rounded-l-none" style={{ borderLeftWidth: 4, borderLeftColor: 'var(--accent)' }}>
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold mb-1 flex items-center gap-2">
+              <TriangleAlert size={18} style={{ color: 'var(--accent)' }} />
+              {pendingApproval?.is_deletion ? 'Deletion request pending' : 'Pending approval required'}
+            </h2>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+              {pendingApproval?.is_deletion
+                ? 'A group member wants to delete this session — every amount below is going to $0.'
+                : 'This session has been edited. Review the changes below.'}
+            </p>
+          </div>
+
+          <div className="mb-4">
+            {/* Show all members' changes */}
+            <div className="mb-4">
+              <p className="eyebrow mb-2">All changes</p>
+              <div>
+                {(() => {
+                  // Combine all members: those with approval records and those in current session
+                  const allMemberIds = new Set<number>()
+
+                  // Add all members who have approval records (they have changes)
+                  allSessionApprovals.forEach(a => {
+                    allMemberIds.add(a.user_id)
+                  })
+
+                  // Add all members currently in the session
+                  sessionDetails.forEach(d => {
+                    allMemberIds.add(d.user_id)
+                  })
+
+                  // Editor's change is now included in allSessionApprovals (with status 'approved')
+                  // No need to calculate it separately
+
+                  // Create a combined list showing all members
+                  const allMembersToShow = Array.from(allMemberIds).map(memberUserId => {
+                    const approvalRecord = allSessionApprovals.find(a => a.user_id === memberUserId)
+                    const sessionDetail = sessionDetails.find(d => d.user_id === memberUserId)
+                    const member = members.find(m => m.user_id === memberUserId)
+
+                    // If there's an approval record, show the change (old → new)
+                    // Otherwise, show the current amount
+                    const hasChange = !!approvalRecord
+
+                    return {
+                      user_id: memberUserId,
+                      displayName: member ? formatDisplayName(members, member) : (sessionDetail?.username || 'Unknown'),
+                      isCurrentUser: memberUserId === userId,
+                      approvalRecord,
+                      currentAmount: sessionDetail?.amount || approvalRecord?.new_amount || 0,
+                      hasChange
+                    }
+                  })
+
+                  if (allMembersToShow.length === 0) {
+                    return <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading session details...</p>
+                  }
+
+                  return allMembersToShow.map((memberInfo) => {
+                    const isCurrentUser = memberInfo.user_id === userId
+
+                    return (
+                      <div key={memberInfo.user_id} className="ledger-row">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium">
+                            {memberInfo.displayName}
+                          </span>
+                          {isCurrentUser && <span className="badge badge-accent">You</span>}
+                        </div>
+                        <div className="flex items-center gap-2 amount">
+                          {memberInfo.approvalRecord ? (
+                            <>
+                              <span
+                                className="text-sm font-semibold"
+                                style={{ color: memberInfo.approvalRecord.old_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                              >
+                                {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
+                              </span>
+                              <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
+                              <span
+                                className="text-sm font-semibold"
+                                style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                              >
+                                {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span
+                                className="text-sm font-semibold"
+                                style={{ color: memberInfo.currentAmount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                              >
+                                {memberInfo.currentAmount >= 0 ? '+' : ''}${memberInfo.currentAmount.toFixed(2)}
+                              </span>
+                              {memberInfo.currentAmount !== 0 && (
+                                <span className="text-xs" style={{ color: 'var(--text-muted)' }}>(no change)</span>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })
+                })()}
+              </div>
+            </div>
+
+            {/* Highlight the current user's change summary — same inline old → new
+                diff style as the "All changes" list above, not a separate
+                previous/new/delta breakdown. */}
+            {pendingApproval && (
+              <div className="border-t pt-2 mt-1" style={{ borderColor: 'var(--border)' }}>
+                <p className="eyebrow mb-1">Your change</p>
+                <div className="ledger-row">
+                  <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Amount</span>
+                  <div className="flex items-center gap-2 amount">
+                    <span
+                      className="text-sm font-semibold"
+                      style={{ color: pendingApproval.old_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                    >
+                      {pendingApproval.old_amount >= 0 ? '+' : ''}${pendingApproval.old_amount.toFixed(2)}
+                    </span>
+                    <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
+                    <span
+                      className="text-sm font-semibold"
+                      style={{ color: pendingApproval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                    >
+                      {pendingApproval.new_amount >= 0 ? '+' : ''}${pendingApproval.new_amount.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={() => handleApproveEdit(pendingApproval.id, session.id)}
+              className="btn-approve flex-1 py-3"
+            >
+              <Check size={18} /> {pendingApproval?.is_deletion ? 'Approve deletion' : 'Approve'}
+            </button>
+            <button
+              onClick={() => handleRejectEdit(pendingApproval.id, session.id, pendingApproval.editor_user_id)}
+              className="btn-reject flex-1 py-3"
+            >
+              <X size={18} /> {pendingApproval?.is_deletion ? 'Keep session' : 'Reject'}
+            </button>
+          </div>
+        </div>
+      )
+    }
+
+    // Normal case — notes plus the member payment breakdown. Everything else
+    // (edit / delete / cancel-edit) already lives in the row header above.
+    const canEditNotes = session.created_by == null || session.created_by === userId
+    const isEditingNotes = editingNotesSessionId === session.id
+
+    return (
+      <>
+        {isEditingNotes ? (
+          <div className="mb-6">
+            <p className="eyebrow mb-2">Notes</p>
+            <textarea
+              value={notesDraft}
+              onChange={(e) => setNotesDraft(e.target.value)}
+              className="field"
+              rows={3}
+              placeholder="Add a note about this session…"
+              autoFocus
+            />
+            <div className="flex gap-2 mt-2">
+              <button
+                onClick={() => handleSaveNotes(session.id)}
+                disabled={savingNotes}
+                className="btn-primary text-sm"
+              >
+                {savingNotes ? 'Saving…' : 'Save'}
+              </button>
+              <button
+                onClick={() => setEditingNotesSessionId(null)}
+                disabled={savingNotes}
+                className="btn-secondary text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (session.notes || canEditNotes) && (
+          <div className="mb-6">
+            <div className="flex items-center justify-between mb-2">
+              <p className="eyebrow">Notes</p>
+              {canEditNotes && (
+                <button
+                  onClick={() => {
+                    setNotesDraft(session.notes || '')
+                    setEditingNotesSessionId(session.id)
+                  }}
+                  className="text-xs font-medium hover:underline"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {session.notes ? 'Edit' : 'Add notes'}
+                </button>
+              )}
+            </div>
+            {session.notes ? (
+              <p className="text-sm whitespace-pre-wrap">{session.notes}</p>
+            ) : (
+              <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No notes yet.</p>
+            )}
+          </div>
+        )}
+
+        <div>
+          <p className="eyebrow mb-3">Member payments</p>
+          {sessionDetails.length === 0 ? (
+            <p style={{ color: 'var(--text-muted)' }}>No payments in this session.</p>
+          ) : (
+            <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+              {sessionDetails.map((detail) => {
+                const member = members.find(m => m.user_id === detail.user_id)
+                const displayName = member ? formatDisplayName(members, member) : detail.username
+                return (
+                  <div key={detail.user_id} className="flex items-center justify-between py-3">
+                    <div>
+                      <p className="font-medium text-sm">{displayName}</p>
+                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                    </div>
+                    <p
+                      className="amount text-lg font-semibold"
+                      style={{ color: detail.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                    >
+                      {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
+                    </p>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </>
+    )
+  }
+
   return (
     <main className="min-h-screen">
-      <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+      <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <Link href="/" className="text-sm font-medium hover:underline flex items-center gap-1.5" style={{ color: 'var(--ink-muted)' }}>
+          <Link href="/" className="text-sm font-medium hover:underline flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
             <ArrowLeft size={16} /> Back
           </Link>
           <h1 className="font-display text-xl font-semibold tracking-tight">{group.name || 'Untitled Group'}</h1>
@@ -2092,9 +2512,10 @@ export default function GroupDetailPage() {
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col md:flex-row gap-6">
-        {/* Sidebar */}
-        <aside className="md:w-56 flex-shrink-0">
+      <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col gap-6 md:flex-row md:gap-0">
+        {/* Sidebar — split from the content by a hairline, the same way the
+            topbar is split from the page, rather than boxing it in a panel. */}
+        <aside className="md:w-56 flex-shrink-0 md:border-r md:pr-6 md:mr-6" style={{ borderColor: 'var(--border)' }}>
           <nav className="flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible">
             {tabs.map((t) => (
               <button
@@ -2112,20 +2533,25 @@ export default function GroupDetailPage() {
         <div className="flex-1">
           {activeTab === 'dues' && (
             <div className="mb-6">
-              <p className="eyebrow mb-1">Summary</p>
               <h2 className="font-display text-2xl font-semibold mb-6">Dues</h2>
 
               {/* Your balance */}
               <div className="card mb-8 flex items-center justify-between gap-4">
                 <div>
-                  <p className="eyebrow mb-1">Your balance</p>
-                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
+                  <p className="eyebrow mb-1 flex items-center gap-1.5">
+                    Your balance
+                    <InfoTooltip label="What this balance means">
+                      A positive balance means the group owes you money; negative means you owe the
+                      group. Recording a payment moves both numbers toward zero — it never moves money itself.
+                    </InfoTooltip>
+                  </p>
+                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
                     {netBalance > 0 ? "You're owed money" : netBalance < 0 ? 'You owe money' : "You're settled up"}
                   </p>
                 </div>
                 <p
                   className="amount text-4xl font-semibold"
-                  style={{ color: netBalance > 0 ? 'var(--emerald)' : netBalance < 0 ? 'var(--rust)' : 'var(--ink)' }}
+                  style={{ color: netBalance > 0 ? 'var(--accent)' : netBalance < 0 ? 'var(--negative)' : 'var(--text)' }}
                 >
                   {netBalance >= 0 ? '+' : ''}${(netBalance / 100).toFixed(2)}
                 </p>
@@ -2146,27 +2572,24 @@ export default function GroupDetailPage() {
                     <div>
                       <p className="eyebrow mb-3">Pending approval</p>
                       {inFlight.length === 0 ? (
-                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Nothing pending.</p>
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Nothing pending.</p>
                       ) : (
                         <div className="space-y-2">
                           {inFlight.map((s) => (
                             <div
                               key={`inflight-${s.id}`}
                               className="flex items-center justify-between gap-4 rounded-lg border p-4"
-                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                              style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
                             >
                               <div className="flex items-center gap-3">
-                                <span style={{ color: s.pendingApproval ? 'var(--brass)' : 'var(--ink-muted)' }}>
+                                <span style={{ color: s.pendingApproval ? 'var(--accent)' : 'var(--text-muted)' }}>
                                   {s.pendingApproval ? <TriangleAlert size={18} /> : <Hourglass size={18} />}
                                 </span>
                                 <div>
-                                  <p
-                                    className="text-sm font-medium"
-                                    style={{ color: s.pendingApproval ? 'var(--brass)' : 'var(--ink)' }}
-                                  >
+                                  <p className="text-sm font-medium">
                                     {s.Description || 'Untitled Session'}
                                   </p>
-                                  <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>
+                                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
                                     {s.pendingApproval
                                       ? s.pendingIsDeletion ? 'Someone wants to delete this — needs your review' : 'Needs your review'
                                       : s.pendingIsDeletion ? 'Waiting on others to approve deleting this' : 'Waiting on others to approve your changes'}
@@ -2194,17 +2617,17 @@ export default function GroupDetailPage() {
                     <div>
                       <p className="eyebrow mb-3">Notifications</p>
                       {notificationCount === 0 ? (
-                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No notifications.</p>
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No notifications.</p>
                       ) : (
                         <div className="space-y-2">
                           {pendingRejections.map((pr) => (
                             <div
                               key={`rejection-${pr.id}`}
                               className="flex items-center justify-between gap-4 rounded-lg border p-4"
-                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                              style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
                             >
                               <div className="flex items-center gap-3">
-                                <XCircle size={18} style={{ color: 'var(--rust)' }} />
+                                <XCircle size={18} style={{ color: 'var(--negative)' }} />
                                 <p className="text-sm font-medium">
                                   {pr.is_deletion
                                     ? <>Your request to delete &ldquo;{pr.session_description}&rdquo; was rejected by {pr.approver_name || 'a member'}</>
@@ -2226,10 +2649,10 @@ export default function GroupDetailPage() {
                             <div
                               key={`rejection-notice-${rn.id}`}
                               className="flex items-center justify-between gap-4 rounded-lg border p-4"
-                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                              style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
                             >
                               <div className="flex items-center gap-3">
-                                <XCircle size={18} style={{ color: 'var(--ink-muted)' }} />
+                                <XCircle size={18} style={{ color: 'var(--text-muted)' }} />
                                 <p className="text-sm font-medium">
                                   {rn.is_deletion
                                     ? <>The request to delete &ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'} — it was kept</>
@@ -2248,10 +2671,10 @@ export default function GroupDetailPage() {
                             <div
                               key={`cancel-${pc.id}`}
                               className="flex items-center justify-between gap-4 rounded-lg border p-4"
-                              style={{ borderColor: 'var(--line)', background: 'var(--paper-card)' }}
+                              style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
                             >
                               <div className="flex items-center gap-3">
-                                <Undo2 size={18} style={{ color: 'var(--ink-muted)' }} />
+                                <Undo2 size={18} style={{ color: 'var(--text-muted)' }} />
                                 <p className="text-sm font-medium">
                                   {pc.is_deletion
                                     ? <>The request to delete &ldquo;{pc.session_description}&rdquo; was cancelled — your review is no longer needed</>
@@ -2277,7 +2700,6 @@ export default function GroupDetailPage() {
 
           {activeTab === 'members' && (
             <div>
-              <p className="eyebrow mb-1">Users</p>
               <h2 className="font-display text-2xl font-semibold mb-6">Group Members</h2>
 
               {isOwner && pendingJoinRequests.length > 0 && (
@@ -2288,11 +2710,11 @@ export default function GroupDetailPage() {
                       <div
                         key={req.id}
                         className="flex items-center justify-between gap-4 rounded-lg border p-4"
-                        style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}
+                        style={{ borderColor: 'var(--border)' }}
                       >
                         <div>
-                          <p className="text-sm font-medium" style={{ color: 'var(--brass)' }}>{req.displayName}</p>
-                          <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{req.username} · wants to join</p>
+                          <p className="text-sm font-medium">{req.displayName}</p>
+                          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{req.username} · wants to join</p>
                         </div>
                         <div className="flex gap-2 shrink-0">
                           <button onClick={() => handleApproveJoinRequest(req.id)} className="btn-primary text-sm">
@@ -2309,9 +2731,9 @@ export default function GroupDetailPage() {
               )}
 
               {memberBalances.length === 0 ? (
-                <p style={{ color: 'var(--ink-muted)' }}>No members yet.</p>
+                <p style={{ color: 'var(--text-muted)' }}>No members yet.</p>
               ) : (
-                <div className="card divide-y" style={{ borderColor: 'var(--line)' }}>
+                <div className="card divide-y" style={{ borderColor: 'var(--border)' }}>
                   {memberBalances.map((member) => {
                     const isCurrentUser = member.user_id === userId
                     const balance = member.balance
@@ -2319,49 +2741,64 @@ export default function GroupDetailPage() {
                       <div
                         key={member.user_id}
                         className="flex items-center justify-between gap-4 py-5 first:pt-0 last:pb-0"
-                        style={{
-                          borderColor: 'var(--line)',
-                          borderLeft: isCurrentUser ? '3px solid var(--brass)' : '3px solid transparent',
-                          paddingLeft: '1rem',
-                          marginLeft: '-1rem',
-                        }}
                       >
-                        <div className="flex-1">
-                          <div className="flex items-center gap-2 mb-1">
-                            <p className="font-semibold">{formatDisplayName(members, member)}</p>
-                            {isCurrentUser && <span className="badge badge-brass">You</span>}
-                            {member.role === 'owner' && <span className="badge badge-outline">Owner</span>}
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setProfileModalContext({})
+                              setProfileModalUserId(member.user_id)
+                            }}
+                            title={isCurrentUser ? 'Edit your profile' : `View ${formatDisplayName(members, member)}'s profile`}
+                          >
+                            <Avatar url={member.avatar_url} name={formatDisplayName(members, member)} size={44} />
+                          </button>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setProfileModalContext({})
+                                  setProfileModalUserId(member.user_id)
+                                }}
+                                className="font-semibold hover:underline text-left"
+                              >
+                                {formatDisplayName(members, member)}
+                              </button>
+                              {isCurrentUser && <span className="badge badge-accent">You</span>}
+                              {member.role === 'owner' && <span className="badge badge-outline">Owner</span>}
+                            </div>
+                            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>@{member.username}</p>
+                            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                              Joined {new Date(member.created_at).toLocaleDateString()}
+                            </p>
                           </div>
-                          <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>@{member.username}</p>
-                          <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>
-                            Joined {new Date(member.created_at).toLocaleDateString()}
-                          </p>
                         </div>
                         <div className="text-right">
                           <p className="eyebrow mb-1">Net balance</p>
                           <p
                             className="amount text-2xl font-semibold"
                             style={{
-                              color: balance > 0 ? 'var(--emerald)' : balance < 0 ? 'var(--rust)' : 'var(--ink)',
+                              color: balance > 0 ? 'var(--accent)' : balance < 0 ? 'var(--negative)' : 'var(--text)',
                             }}
                           >
                             {balance >= 0 ? '+' : ''}${(balance / 100).toFixed(2)}
                           </p>
                           {balance > 0 && (
-                            <p className="text-xs mt-1" style={{ color: 'var(--emerald)' }}>Owed money</p>
+                            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>Owed money</p>
                           )}
                           {balance < 0 && (
-                            <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Owes money</p>
+                            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>Owes money</p>
                           )}
                           {balance === 0 && (
-                            <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>Balanced</p>
+                            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>Balanced</p>
                           )}
                           {isOwner && !isCurrentUser && member.role !== 'owner' && (
                             <button
                               onClick={() => setConfirmRemoveMemberId(member.user_id)}
                               disabled={Math.abs(balance) >= 1}
                               className="mt-2 text-xs font-medium hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:no-underline"
-                              style={{ color: 'var(--rust)' }}
+                              style={{ color: 'var(--negative)' }}
                               title={Math.abs(balance) >= 1 ? 'Balance must be $0.00 before they can be removed' : 'Remove from group'}
                             >
                               Remove
@@ -2382,7 +2819,7 @@ export default function GroupDetailPage() {
                       <h3 className="font-display text-xl font-semibold mb-2">
                         Remove {target ? formatDisplayName(members, target) : 'this member'}?
                       </h3>
-                      <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                      <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
                         They&apos;ll lose access right away, but their past sessions and payments stay untouched. They can request to rejoin later.
                       </p>
                       <div className="flex gap-2">
@@ -2400,6 +2837,7 @@ export default function GroupDetailPage() {
                   </div>
                 )
               })()}
+
             </div>
           )}
 
@@ -2407,14 +2845,13 @@ export default function GroupDetailPage() {
             <div>
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <p className="eyebrow mb-1">Activity</p>
                   <h2 className="font-display text-2xl font-semibold">Sessions</h2>
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => setShowMakePaymentModal(true)} className="btn-secondary">
                     + Make a payment
                   </button>
-                  <button onClick={() => setShowCreateLiveSessionModal(true)} className="btn-secondary" style={{ borderColor: 'var(--brass)', color: 'var(--brass)' }}>
+                  <button onClick={() => setShowCreateLiveSessionModal(true)} className="btn-secondary" style={{ borderColor: 'var(--accent)', color: 'var(--accent)' }}>
                     + Live session
                   </button>
                   <button onClick={handleAddSessionClick} className="btn-primary">
@@ -2454,7 +2891,7 @@ export default function GroupDetailPage() {
                           {showMemberDropdown && (
                             <div
                               className="absolute right-0 mt-1 rounded-lg shadow-lg z-10 max-h-48 overflow-y-auto min-w-[200px] border member-dropdown-container"
-                              style={{ background: 'var(--paper-card)', borderColor: 'var(--line)' }}
+                              style={{ background: 'var(--surface)', borderColor: 'var(--border)' }}
                             >
                               {activeMembers
                                 .filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id))
@@ -2463,14 +2900,14 @@ export default function GroupDetailPage() {
                                     key={member.user_id}
                                     type="button"
                                     onClick={() => handleAddMemberToSession(member.user_id)}
-                                    className="w-full text-left px-4 py-2 transition-colors hover:bg-[var(--paper)]"
+                                    className="w-full text-left px-4 py-2 transition-colors hover:bg-[var(--canvas)]"
                                   >
                                     <p className="font-medium text-sm">{formatDisplayName(members, member)}</p>
-                                    <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{member.username}</p>
+                                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{member.username}</p>
                                   </button>
                                 ))}
                               {activeMembers.filter(m => !sessionMembers.some(sm => sm.user_id === m.user_id)).length === 0 && (
-                                <p className="px-4 py-2 text-sm" style={{ color: 'var(--ink-muted)' }}>All members added</p>
+                                <p className="px-4 py-2 text-sm" style={{ color: 'var(--text-muted)' }}>All members added</p>
                               )}
                             </div>
                           )}
@@ -2478,7 +2915,7 @@ export default function GroupDetailPage() {
                       </div>
 
                       {sessionMembers.length === 0 ? (
-                        <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No members added yet</p>
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No members added yet</p>
                       ) : (
                         <>
                           <div className="space-y-2">
@@ -2486,7 +2923,7 @@ export default function GroupDetailPage() {
                             <div
                               key={sm.user_id}
                               className="flex items-center gap-2 p-3 rounded-lg border"
-                              style={{ borderColor: 'var(--line)' }}
+                              style={{ borderColor: 'var(--border)' }}
                             >
                               <div className="flex-1">
                                 {(() => {
@@ -2495,7 +2932,7 @@ export default function GroupDetailPage() {
                                   return (
                                     <>
                                       <p className="font-medium text-sm">{displayName}</p>
-                                      <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{sm.username}</p>
+                                      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{sm.username}</p>
                                     </>
                                   )
                                 })()}
@@ -2520,29 +2957,29 @@ export default function GroupDetailPage() {
                                 type="button"
                                 onClick={() => handleRemoveMemberFromSession(sm.user_id)}
                                 className="px-3 py-1 rounded transition text-sm font-medium"
-                                style={{ color: 'var(--rust)' }}
+                                style={{ color: 'var(--negative)' }}
                               >
                                 Remove
                               </button>
                             </div>
                           ))}
                           </div>
-                          <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: 'var(--line)', background: 'var(--paper)' }}>
+                          <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
                             <div className="flex items-center justify-between">
                               <span className="text-sm font-medium">Total sum</span>
                               <span
                                 className="amount text-lg font-semibold"
                                 style={{
                                   color: Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) < 0.01
-                                    ? 'var(--emerald)'
-                                    : 'var(--rust)',
+                                    ? 'var(--accent)'
+                                    : 'var(--negative)',
                                 }}
                               >
                                 ${sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0).toFixed(2)}
                               </span>
                             </div>
                             {Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) >= 0.01 && (
-                              <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Sum must equal $0.00 to create session</p>
+                              <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to create session</p>
                             )}
                           </div>
                         </>
@@ -2572,493 +3009,9 @@ export default function GroupDetailPage() {
                 </div>
               )}
 
-              {viewingSessionId ? (
-                <div>
-                  {(() => {
-                    const session = sessions.find(s => s.id === viewingSessionId)
-                    if (!session) return null
-                    
-                    const pendingApproval = pendingApprovals.find(pa => pa.session_id === session.id)
-                    const pendingRejection = pendingRejections.find(pr => pr.session_id === session.id)
-                    
-                    // If this session has a pending rejection, show rejection details
-                    if (pendingRejection && session.pendingRejection) {
-                      return (
-                        <>
-                          <div className="flex items-center justify-between mb-4">
-                            <button
-                              onClick={() => setViewingSessionId(null)}
-                              className="text-sm font-medium hover:underline flex items-center gap-2"
-                              style={{ color: 'var(--ink-muted)' }}
-                            >
-                              <ArrowLeft size={16} /> Back to sessions
-                            </button>
-                          </div>
-
-                          <div className="rounded-lg p-6 border" style={{ borderColor: 'var(--rust)', background: 'var(--rust-soft)' }}>
-                            <div className="mb-4">
-                              <h2 className="font-display text-2xl font-semibold mb-2 flex items-center gap-2">
-                                <XCircle size={22} style={{ color: 'var(--rust)' }} />
-                                {pendingRejection.is_deletion ? 'Deletion request rejected' : 'Session edit rejected'}
-                              </h2>
-                              <p style={{ color: 'var(--ink-muted)' }}>
-                                {pendingRejection.is_deletion
-                                  ? 'Your request to delete this session was rejected by a group member — it was kept as-is.'
-                                  : 'Your edit to this session was rejected by a group member.'}
-                              </p>
-                            </div>
-
-                            <div className="card mb-4">
-                              <h3 className="font-semibold mb-3">
-                                {session.Description || 'Untitled Session'}
-                              </h3>
-                              <div className="space-y-2">
-                                <div className="ledger-row">
-                                  <span className="text-sm font-medium" style={{ color: 'var(--ink-muted)' }}>Rejected by</span>
-                                  <span className="font-semibold text-sm">
-                                    {pendingRejection.approver_name || 'Unknown'}
-                                  </span>
-                                </div>
-                                <div className="ledger-row">
-                                  <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Email</span>
-                                  <span className="text-sm">
-                                    {pendingRejection.approver_email || 'Unknown'}
-                                  </span>
-                                </div>
-                                {pendingRejection.rejected_at && (
-                                  <div className="ledger-row">
-                                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Rejected on</span>
-                                    <span className="text-sm">
-                                      {new Date(pendingRejection.rejected_at).toLocaleString()}
-                                    </span>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-
-                            <div className="card mb-4">
-                              <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
-                                Your changes weren&apos;t approved. You can edit the session again if needed.
-                              </p>
-                            </div>
-
-                            <button
-                              onClick={async () => {
-                                if (pendingRejection) {
-                                  try {
-                                    console.log('Dismissing rejection:', pendingRejection.id)
-                                    
-                                    // Mark rejection as dismissed in the database
-                                    const { data: updatedData, error: dismissError } = await supabase
-                                      .from('SessionEditApproval')
-                                      .update({ dismissed_at: new Date().toISOString() })
-                                      .eq('id', pendingRejection.id)
-                                      .select()
-                                    
-                                    console.log('Dismiss update result:', { updatedData, dismissError })
-                                    
-                                    // If column doesn't exist, delete the rejection record instead
-                                    if (dismissError && (dismissError.message?.includes('dismissed_at') || dismissError.message?.includes('column'))) {
-                                      console.log('dismissed_at column doesn\'t exist, deleting rejection record instead')
-                                      const { error: deleteError } = await supabase
-                                        .from('SessionEditApproval')
-                                        .delete()
-                                        .eq('id', pendingRejection.id)
-                                      
-                                      if (deleteError) {
-                                        console.error('Error deleting rejection:', deleteError)
-                                        showToast('Failed to dismiss rejection. Please try again.')
-                                        return
-                                      }
-                                    } else if (dismissError) {
-                                      console.error('Error dismissing rejection:', dismissError)
-                                      showToast('Failed to dismiss rejection. Please try again.')
-                                      return
-                                    }
-                                    
-                                    // Close the rejection details view immediately
-                                    setViewingSessionId(null)
-                                    
-                                    // Remove from pendingRejections state immediately for better UX
-                                    setPendingRejections(prev => prev.filter(pr => pr.id !== pendingRejection.id))
-                                    
-                                    // Reload sessions and pending approvals to update the UI
-                                    // (this also refreshes pendingRejections/pendingApprovals/pendingCancellations,
-                                    // which is what the Dues tab's Pending Actions area renders from)
-                                    await loadSessions()
-                                    await loadPendingApprovals()
-                                  } catch (error: any) {
-                                    console.error('Error dismissing rejection:', error)
-                                    showToast('Failed to dismiss rejection: ' + (error.message || 'Unknown error'))
-                                  }
-                                }
-                              }}
-                              className="btn-secondary w-full"
-                            >
-                              OK
-                            </button>
-                          </div>
-                        </>
-                      )
-                    }
-
-                    // If this session has a pending approval, show approval UI
-                    if (pendingApproval && session.pendingApproval) {
-                      return (
-                        <>
-                          <div className="flex items-center justify-between mb-4">
-                            <button
-                              onClick={() => setViewingSessionId(null)}
-                              className="text-sm font-medium hover:underline flex items-center gap-2"
-                              style={{ color: 'var(--ink-muted)' }}
-                            >
-                              <ArrowLeft size={16} /> Back to sessions
-                            </button>
-                          </div>
-
-                          <div className="rounded-lg p-6 border" style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}>
-                            <div className="mb-4">
-                              <h2 className="font-display text-2xl font-semibold mb-2 flex items-center gap-2">
-                                <TriangleAlert size={22} style={{ color: 'var(--brass)' }} />
-                                {pendingApproval?.is_deletion ? 'Deletion request pending' : 'Pending approval required'}
-                              </h2>
-                              <p style={{ color: 'var(--ink-muted)' }}>
-                                {pendingApproval?.is_deletion
-                                  ? 'A group member wants to delete this session. Your approval is required before it’s removed — every amount below is going to $0 as part of that.'
-                                  : 'This session has been edited. Your approval is required before the changes take effect.'}
-                              </p>
-                            </div>
-
-                            <div className="card mb-4">
-                              <h3 className="font-semibold mb-3">
-                                {session.Description || 'Untitled Session'}
-                              </h3>
-
-                              {/* Show all members' changes */}
-                              <div className="mb-4">
-                                <p className="eyebrow mb-2">All changes</p>
-                                <div className="space-y-2">
-                                  {(() => {
-                                    // Debug: Log current state
-                                    console.log('Rendering approval UI - allSessionApprovals:', allSessionApprovals)
-                                    console.log('Rendering approval UI - sessionDetails:', sessionDetails)
-                                    console.log('Rendering approval UI - members:', members)
-                                    // Combine all members: those with approval records and those in current session
-                                    const allMemberIds = new Set<number>()
-                                    
-                                    // Add all members who have approval records (they have changes)
-                                    allSessionApprovals.forEach(a => {
-                                      console.log('Adding member from approval record:', a.user_id)
-                                      allMemberIds.add(a.user_id)
-                                    })
-                                    
-                                    // Add all members currently in the session
-                                    sessionDetails.forEach(d => {
-                                      console.log('Adding member from session details:', d.user_id)
-                                      allMemberIds.add(d.user_id)
-                                    })
-                                    
-                                    console.log('All member IDs to show:', Array.from(allMemberIds))
-                                    console.log('All session approvals:', allSessionApprovals)
-                                    console.log('Editor user ID:', editorUserId)
-                                    
-                                    // Editor's change is now included in allSessionApprovals (with status 'approved')
-                                    // No need to calculate it separately
-                                    
-                                    // Create a combined list showing all members
-                                    const allMembersToShow = Array.from(allMemberIds).map(memberUserId => {
-                                      const approvalRecord = allSessionApprovals.find(a => a.user_id === memberUserId)
-                                      const sessionDetail = sessionDetails.find(d => d.user_id === memberUserId)
-                                      const member = members.find(m => m.user_id === memberUserId)
-                                      
-                                      console.log(`Processing member ${memberUserId}:`, {
-                                        hasApprovalRecord: !!approvalRecord,
-                                        approvalRecord,
-                                        sessionDetail,
-                                        member
-                                      })
-                                      
-                                      // If there's an approval record, show the change (old → new)
-                                      // Otherwise, show the current amount
-                                      const hasChange = !!approvalRecord
-                                      
-                                      return {
-                                        user_id: memberUserId,
-                                        displayName: member ? formatDisplayName(members, member) : (sessionDetail?.username || 'Unknown'),
-                                        isCurrentUser: memberUserId === userId,
-                                        approvalRecord,
-                                        currentAmount: sessionDetail?.amount || approvalRecord?.new_amount || 0,
-                                        hasChange
-                                      }
-                                    })
-                                    
-                                    console.log('All members to show:', allMembersToShow)
-                                    
-                                    if (allMembersToShow.length === 0) {
-                                      return <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>Loading session details...</p>
-                                    }
-                                    
-                                    return allMembersToShow.map((memberInfo) => {
-                                      const isCurrentUser = memberInfo.user_id === userId
-
-                                      return (
-                                        <div
-                                          key={memberInfo.user_id}
-                                          className="flex items-center justify-between p-3 rounded-md border"
-                                          style={
-                                            isCurrentUser
-                                              ? { background: 'var(--brass-soft)', borderColor: 'var(--brass)' }
-                                              : memberInfo.hasChange
-                                              ? { background: 'var(--paper)', borderColor: 'var(--line)' }
-                                              : { background: 'var(--paper)', borderColor: 'transparent' }
-                                          }
-                                        >
-                                          <div className="flex items-center gap-2">
-                                            <span className="text-sm font-medium">
-                                              {memberInfo.displayName}
-                                            </span>
-                                            {isCurrentUser && <span className="badge badge-brass">You</span>}
-                                          </div>
-                                          <div className="flex items-center gap-2 amount">
-                                            {memberInfo.approvalRecord ? (
-                                              <>
-                                                <span
-                                                  className="text-sm font-semibold"
-                                                  style={{ color: memberInfo.approvalRecord.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
-                                                >
-                                                  {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
-                                                </span>
-                                                <ArrowRight size={14} style={{ color: 'var(--ink-muted)' }} />
-                                                <span
-                                                  className="text-sm font-semibold"
-                                                  style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
-                                                >
-                                                  {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
-                                                </span>
-                                              </>
-                                            ) : (
-                                              <>
-                                                <span
-                                                  className="text-sm font-semibold"
-                                                  style={{ color: memberInfo.currentAmount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
-                                                >
-                                                  {memberInfo.currentAmount >= 0 ? '+' : ''}${memberInfo.currentAmount.toFixed(2)}
-                                                </span>
-                                                {memberInfo.currentAmount !== 0 && (
-                                                  <span className="text-xs" style={{ color: 'var(--ink-muted)' }}>(no change)</span>
-                                                )}
-                                              </>
-                                            )}
-                                          </div>
-                                        </div>
-                                      )
-                                    })
-                                  })()}
-                                </div>
-                              </div>
-
-                              {/* Highlight the current user's change summary */}
-                              {pendingApproval && (
-                                <div className="border-t pt-3 mt-3" style={{ borderColor: 'var(--line)' }}>
-                                  <p className="eyebrow mb-2">Your change summary</p>
-                                  <div className="space-y-2 amount">
-                                    <div className="flex items-center justify-between p-2 rounded" style={{ background: 'var(--paper)' }}>
-                                      <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Previous amount</span>
-                                      <span className="font-semibold" style={{ color: pendingApproval.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}>
-                                        {pendingApproval.old_amount >= 0 ? '+' : ''}${pendingApproval.old_amount.toFixed(2)}
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center justify-between p-2 rounded" style={{ background: 'var(--brass-soft)' }}>
-                                      <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>New amount</span>
-                                      <span className="font-semibold" style={{ color: pendingApproval.new_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}>
-                                        {pendingApproval.new_amount >= 0 ? '+' : ''}${pendingApproval.new_amount.toFixed(2)}
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center justify-between p-2 rounded border" style={{ borderColor: 'var(--line)' }}>
-                                      <span className="text-sm font-medium">Change</span>
-                                      <span
-                                        className="font-semibold"
-                                        style={{ color: pendingApproval.new_amount - pendingApproval.old_amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
-                                      >
-                                        {pendingApproval.new_amount - pendingApproval.old_amount >= 0 ? '+' : ''}
-                                        ${(pendingApproval.new_amount - pendingApproval.old_amount).toFixed(2)}
-                                      </span>
-                                    </div>
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-
-                            <div className="flex gap-3">
-                              <button
-                                onClick={() => handleApproveEdit(pendingApproval.id, session.id)}
-                                className="btn-primary flex-1 py-3 flex items-center justify-center gap-2"
-                              >
-                                <Check size={18} /> {pendingApproval?.is_deletion ? 'Approve deletion' : 'Approve'}
-                              </button>
-                              <button
-                                onClick={() => handleRejectEdit(pendingApproval.id, session.id, pendingApproval.editor_user_id)}
-                                className="btn-danger flex-1 py-3 flex items-center justify-center gap-2"
-                              >
-                                <X size={18} /> {pendingApproval?.is_deletion ? 'Keep session' : 'Reject'}
-                              </button>
-                            </div>
-                          </div>
-                        </>
-                      )
-                    }
-                    
-                    return (
-                      <>
-                        <div className="flex items-center justify-between mb-4">
-                          <button
-                            onClick={() => setViewingSessionId(null)}
-                            className="text-sm font-medium hover:underline flex items-center gap-2"
-                            style={{ color: 'var(--ink-muted)' }}
-                          >
-                            <ArrowLeft size={16} /> Back to sessions
-                          </button>
-                          {session.waitingForApproval ? (
-                            <button
-                              onClick={() => setConfirmCancelEditSessionId(session.id)}
-                              className="btn-secondary text-sm py-1"
-                              style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
-                            >
-                              {session.pendingIsDeletion ? 'Cancel deletion request' : 'Cancel edit'}
-                            </button>
-                          ) : !session.pendingApproval && (
-                            <div className="flex items-center gap-2">
-                              <button onClick={() => handleEditSession(session.id)} className="btn-secondary text-sm py-1">
-                                Edit
-                              </button>
-                              <button
-                                onClick={() => setConfirmDeleteSessionId(session.id)}
-                                className="p-1.5 rounded-md transition-colors text-[var(--ink-muted)] hover:text-[var(--rust)] hover:bg-[var(--rust-soft)]"
-                                title="Delete session"
-                                aria-label="Delete session"
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
-                          )}
-                        </div>
-
-                        <div className="card">
-                          <div className="flex items-center gap-3 mb-2">
-                            <h2 className="font-display text-2xl font-semibold">
-                              {session.Description || 'Untitled Session'}
-                            </h2>
-                            {!session.is_live && (session.Description?.includes('Live Session') || session.Description === 'Live Session') && (
-                              <span className="badge badge-outline flex items-center gap-1">
-                                <ClipboardList size={12} />
-                                Previously live
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
-                            {new Date(session.created_at).toLocaleDateString()}
-                          </p>
-
-                          {(() => {
-                            const canEditNotes = session.created_by == null || session.created_by === userId
-                            const isEditingNotes = editingNotesSessionId === session.id
-
-                            if (isEditingNotes) {
-                              return (
-                                <div className="mb-6">
-                                  <p className="eyebrow mb-2">Notes</p>
-                                  <textarea
-                                    value={notesDraft}
-                                    onChange={(e) => setNotesDraft(e.target.value)}
-                                    className="field"
-                                    rows={3}
-                                    placeholder="Add a note about this session…"
-                                    autoFocus
-                                  />
-                                  <div className="flex gap-2 mt-2">
-                                    <button
-                                      onClick={() => handleSaveNotes(session.id)}
-                                      disabled={savingNotes}
-                                      className="btn-primary text-sm"
-                                    >
-                                      {savingNotes ? 'Saving…' : 'Save'}
-                                    </button>
-                                    <button
-                                      onClick={() => setEditingNotesSessionId(null)}
-                                      disabled={savingNotes}
-                                      className="btn-secondary text-sm"
-                                    >
-                                      Cancel
-                                    </button>
-                                  </div>
-                                </div>
-                              )
-                            }
-
-                            if (!session.notes && !canEditNotes) return null
-
-                            return (
-                              <div className="mb-6">
-                                <div className="flex items-center justify-between mb-2">
-                                  <p className="eyebrow">Notes</p>
-                                  {canEditNotes && (
-                                    <button
-                                      onClick={() => {
-                                        setNotesDraft(session.notes || '')
-                                        setEditingNotesSessionId(session.id)
-                                      }}
-                                      className="text-xs font-medium hover:underline"
-                                      style={{ color: 'var(--ink-muted)' }}
-                                    >
-                                      {session.notes ? 'Edit' : 'Add notes'}
-                                    </button>
-                                  )}
-                                </div>
-                                {session.notes ? (
-                                  <p className="text-sm whitespace-pre-wrap">{session.notes}</p>
-                                ) : (
-                                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>No notes yet.</p>
-                                )}
-                              </div>
-                            )
-                          })()}
-
-                          <div>
-                            <p className="eyebrow mb-3">Member payments</p>
-                            {sessionDetails.length === 0 ? (
-                              <p style={{ color: 'var(--ink-muted)' }}>No payments in this session.</p>
-                            ) : (
-                              <div className="divide-y" style={{ borderColor: 'var(--line)' }}>
-                                {sessionDetails.map((detail) => {
-                                  const member = members.find(m => m.user_id === detail.user_id)
-                                  const displayName = member ? formatDisplayName(members, member) : detail.username
-                                  return (
-                                    <div key={detail.user_id} className="flex items-center justify-between py-3">
-                                      <div>
-                                        <p className="font-medium text-sm">{displayName}</p>
-                                        <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{detail.username}</p>
-                                      </div>
-                                    <p
-                                      className="amount text-lg font-semibold"
-                                      style={{ color: detail.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
-                                    >
-                                      {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
-                                    </p>
-                                  </div>
-                                  )
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </>
-                    )
-                  })()}
-                </div>
-              ) : (
                 <>
                   {sessions.length === 0 ? (
-                    <p style={{ color: 'var(--ink-muted)' }}>No sessions yet.</p>
+                    <p style={{ color: 'var(--text-muted)' }}>No sessions yet.</p>
                   ) : (
                     <div className="space-y-2">
                       {sessions
@@ -3088,24 +3041,30 @@ export default function GroupDetailPage() {
                           <div
                             key={session.id}
                             onClick={() => {
+                              // Each row is an accordion: click to expand, click again to collapse.
                               if (session.pendingApproval && pendingApproval) {
-                                // Show approval UI instead of viewing session
-                                setViewingSessionId(session.id)
-                                setActiveTab('sessions')
+                                setViewingSessionId(viewingSessionId === session.id ? null : session.id)
                               } else if (hasUndismissedRejection) {
-                                // Show rejection details for editor
-                                setViewingSessionId(session.id)
-                                setActiveTab('sessions')
+                                setViewingSessionId(viewingSessionId === session.id ? null : session.id)
                               } else if (session.is_live) {
-                                handleOpenLiveSession(session.id)
+                                if (selectedLiveSession === session.id) {
+                                  setSelectedLiveSession(null)
+                                  setLiveSessionAmount('')
+                                  setSessionDetails([])
+                                } else {
+                                  handleOpenLiveSession(session.id)
+                                }
+                              } else if (viewingSessionId === session.id) {
+                                setViewingSessionId(null)
                               } else {
                                 handleViewSession(session.id)
                               }
                             }}
-                            className="card cursor-pointer transition-colors hover:border-[var(--brass)]"
+                            id={`session-row-${session.id}`}
+                            className="card cursor-pointer transition-colors hover:border-[var(--accent)]"
                             style={
                               session.is_live
-                                ? { borderColor: 'var(--ledger)', background: 'var(--emerald-soft)' }
+                                ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)' }
                                 : undefined
                             }
                           >
@@ -3116,42 +3075,42 @@ export default function GroupDetailPage() {
                                     {session.Description || 'Untitled Session'}
                                   </p>
                                   {session.is_payment && (
-                                    <ArrowRightLeft size={14} style={{ color: 'var(--ink-muted)' }} aria-label="Payment session" />
+                                    <ArrowRightLeft size={14} style={{ color: 'var(--text-muted)' }} aria-label="Payment session" />
                                   )}
                                 </div>
                                 <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
+                                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
                                     {new Date(session.created_at).toLocaleDateString()}
                                   </p>
                                   {session.userPayment !== null && session.userPayment !== undefined && (
                                     <p
                                       className="amount text-sm font-semibold"
-                                      style={{ color: session.userPayment >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                      style={{ color: session.userPayment >= 0 ? 'var(--accent)' : 'var(--negative)' }}
                                     >
                                       {session.userPayment >= 0 ? '+' : '-'}${Math.abs(session.userPayment).toFixed(2)}
                                     </p>
                                   )}
-                                  {session.is_live && <span className="badge badge-ledger">Live</span>}
-                                  {session.is_payment && (
+                                  {session.is_live && <span className="badge badge-accent-solid">Live</span>}
+                                  {!session.is_live && (session.Description?.includes('Live Session') || session.Description === 'Live Session') && (
                                     <span className="badge badge-outline flex items-center gap-1">
-                                      <ArrowRightLeft size={12} />
-                                      Payment
+                                      <ClipboardList size={12} />
+                                      Previously live
                                     </span>
                                   )}
                                   {session.pendingApproval && (
-                                    <span className="badge badge-brass flex items-center gap-1">
+                                    <span className="badge badge-accent flex items-center gap-1">
                                       {session.pendingIsDeletion ? <Trash2 size={12} /> : <TriangleAlert size={12} />}
                                       {session.pendingIsDeletion ? 'Deletion requested' : 'Pending approval'}
                                     </span>
                                   )}
                                   {hasUndismissedRejection && (
-                                    <span className="badge badge-rust flex items-center gap-1">
+                                    <span className="badge badge-negative flex items-center gap-1">
                                       <XCircle size={12} />
                                       <span>{pendingRejection?.is_deletion ? 'Deletion rejected' : 'Edit rejected'}</span>
                                     </span>
                                   )}
                                   {session.waitingForApproval && (
-                                    <span className="badge badge-brass flex items-center gap-1">
+                                    <span className="badge badge-accent flex items-center gap-1">
                                       {session.pendingIsDeletion ? <Trash2 size={12} /> : <Hourglass size={12} />}
                                       {session.pendingIsDeletion ? 'Deletion pending' : 'Waiting for approval'}
                                     </span>
@@ -3167,7 +3126,7 @@ export default function GroupDetailPage() {
                                         setConfirmCancelSessionId(session.id)
                                       }}
                                       className="btn-secondary text-sm py-1"
-                                      style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
+                                      style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
                                     >
                                       Cancel
                                     </button>
@@ -3189,7 +3148,7 @@ export default function GroupDetailPage() {
                                       setConfirmCancelEditSessionId(session.id)
                                     }}
                                     className="btn-secondary text-sm py-1"
-                                    style={{ borderColor: 'var(--rust)', color: 'var(--rust)' }}
+                                    style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
                                   >
                                     {session.pendingIsDeletion ? 'Cancel deletion request' : 'Cancel edit'}
                                   </button>
@@ -3210,7 +3169,7 @@ export default function GroupDetailPage() {
                                         e.stopPropagation()
                                         setConfirmDeleteSessionId(session.id)
                                       }}
-                                      className="p-1.5 rounded-md transition-colors text-[var(--ink-muted)] hover:text-[var(--rust)] hover:bg-[var(--rust-soft)]"
+                                      className="p-1.5 rounded-md transition-colors text-[var(--text-muted)] hover:text-[var(--negative)] hover:bg-[var(--negative-soft)]"
                                       title="Delete session"
                                       aria-label="Delete session"
                                     >
@@ -3220,24 +3179,25 @@ export default function GroupDetailPage() {
                                 )}
                               </div>
                             </div>
+                            {viewingSessionId === session.id && (
+                              <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border)' }} onClick={(e) => e.stopPropagation()}>
+                                {renderSessionExpansion(session, pendingApproval, pendingRejection, hasUndismissedRejection)}
+                              </div>
+                            )}
                             {selectedLiveSession === session.id && (
-                              <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--line)' }} onClick={(e) => e.stopPropagation()}>
+                              <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border)' }} onClick={(e) => e.stopPropagation()}>
                                 <p className="eyebrow mb-3">Live session payments</p>
 
                                 {/* Show all payments */}
                                 {sessionDetails.length > 0 && (
                                   <div className="mb-4">
-                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--ink-muted)' }}>Current payments</p>
+                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Current payments</p>
                                     <div className="space-y-2">
                                       {sessionDetails.map((detail) => (
                                         <div
                                           key={detail.user_id}
                                           className="rounded-lg p-3 flex items-center justify-between border"
-                                          style={
-                                            detail.user_id === userId
-                                              ? { borderColor: 'var(--brass)', background: 'var(--brass-soft)' }
-                                              : { borderColor: 'var(--line)', background: 'var(--paper)' }
-                                          }
+                                          style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}
                                         >
                                           <div>
                                             {(() => {
@@ -3248,17 +3208,17 @@ export default function GroupDetailPage() {
                                                   <p className="font-medium text-sm">
                                                     {displayName}
                                                     {detail.user_id === userId && (
-                                                      <span className="text-xs ml-2" style={{ color: 'var(--brass)' }}>(You)</span>
+                                                      <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>(You)</span>
                                                     )}
                                                   </p>
-                                                  <p className="text-xs" style={{ color: 'var(--ink-muted)' }}>@{detail.username}</p>
+                                                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
                                                 </>
                                               )
                                             })()}
                                           </div>
                                           <p
                                             className="amount text-sm font-semibold"
-                                            style={{ color: detail.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                                            style={{ color: detail.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
                                           >
                                             {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
                                           </p>
@@ -3270,7 +3230,7 @@ export default function GroupDetailPage() {
 
                                 {/* User's payment input */}
                                 <div>
-                                  <p className="text-xs font-medium mb-2" style={{ color: 'var(--ink-muted)' }}>Your payment</p>
+                                  <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Your payment</p>
                                   <div className="flex gap-2">
                                     <input
                                       type="number"
@@ -3303,22 +3263,22 @@ export default function GroupDetailPage() {
 
                                 {/* Show current total */}
                                 {sessionDetails.length > 0 && (
-                                  <div className="mt-3 p-2 rounded-lg border" style={{ borderColor: 'var(--line)', background: 'var(--paper)' }}>
+                                  <div className="mt-3 p-2 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
                                     <div className="flex items-center justify-between">
                                       <span className="text-xs font-medium">Current total</span>
                                       <span
                                         className="amount text-sm font-semibold"
                                         style={{
                                           color: Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) < 0.01
-                                            ? 'var(--emerald)'
-                                            : 'var(--rust)',
+                                            ? 'var(--accent)'
+                                            : 'var(--negative)',
                                         }}
                                       >
                                         ${sessionDetails.reduce((sum, d) => sum + d.amount, 0).toFixed(2)}
                                       </span>
                                     </div>
                                     {Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) >= 0.01 && (
-                                      <p className="text-xs mt-1" style={{ color: 'var(--rust)' }}>Sum must equal $0.00 to close session</p>
+                                      <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to close session</p>
                                     )}
                                   </div>
                                 )}
@@ -3330,13 +3290,12 @@ export default function GroupDetailPage() {
                     </div>
                   )}
                 </>
-              )}
 
               {confirmCancelSessionId !== null && (
                 <div className="modal-overlay">
                   <div className="modal-panel">
                     <h3 className="font-display text-xl font-semibold mb-2">Cancel this live session?</h3>
-                    <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
                       Every amount entered so far will be discarded. This can&apos;t be undone.
                     </p>
                     <div className="flex gap-2">
@@ -3358,8 +3317,8 @@ export default function GroupDetailPage() {
                 <div className="modal-overlay">
                   <div className="modal-panel">
                     <h3 className="font-display text-xl font-semibold mb-2">Delete this session?</h3>
-                    <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
-                      If others are part of this session, they&apos;ll need to approve first. If you&apos;re the only one, it&apos;s deleted right away. This can&apos;t be undone.
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                      The other members of this session will need to approve before it&apos;s removed. This can&apos;t be undone.
                     </p>
                     <div className="flex gap-2">
                       <button
@@ -3384,7 +3343,7 @@ export default function GroupDetailPage() {
                       <h3 className="font-display text-xl font-semibold mb-2">
                         {isDeletionRequest ? 'Cancel this deletion request?' : 'Cancel this edit?'}
                       </h3>
-                      <p className="text-sm mb-6" style={{ color: 'var(--ink-muted)' }}>
+                      <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
                         {isDeletionRequest
                           ? 'The session will stay exactly as it is. Anyone who already approved or rejected the deletion will be notified that the request was cancelled.'
                           : 'The session will keep its current amounts. Anyone who already approved or rejected your changes will be notified that the edit was cancelled.'}
@@ -3455,7 +3414,17 @@ export default function GroupDetailPage() {
           {showMakePaymentModal && (
             <div className="modal-overlay">
               <div className="modal-panel">
-                <h3 className="font-display text-xl font-semibold mb-4">Make a payment</h3>
+                <h3 className="font-display text-xl font-semibold mb-4 flex items-center gap-2">
+                  Make a payment
+                  <InfoTooltip label="How this affects balances">
+                    This records money you already sent outside the app (Venmo, cash, etc.) —
+                    Dues doesn&apos;t move money itself. It won&apos;t affect either balance until the
+                    other person confirms they received it — that way no one can clear their own
+                    debt by just claiming a payment that didn&apos;t happen. Once confirmed, your
+                    balance goes up (you owe less, or you&apos;re owed more) and theirs goes down by
+                    the same amount.
+                  </InfoTooltip>
+                </h3>
 
                 <form onSubmit={handleMakePayment} className="space-y-4">
                   <div>
@@ -3479,7 +3448,7 @@ export default function GroupDetailPage() {
                         ))}
                     </select>
                     {activeMembers.filter(m => m.user_id !== userId).length === 0 && (
-                      <p className="text-sm mt-1" style={{ color: 'var(--ink-muted)' }}>No other members in this group</p>
+                      <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>No other members in this group</p>
                     )}
                   </div>
 
@@ -3512,13 +3481,40 @@ export default function GroupDetailPage() {
                     />
                   </div>
 
+                  {paymentPayee && (() => {
+                    const payee = members.find((m) => m.user_id === paymentPayee)
+                    if (!payee) return null
+                    const payeeName = formatDisplayName(members, payee)
+                    return (
+                      <div>
+                        <p className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>
+                          Dues doesn&apos;t move money — send it directly first, then record it below.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProfileModalContext({
+                              amount: parseFloat(paymentAmount) || undefined,
+                              note: paymentDescription.trim() || group?.name || undefined,
+                            })
+                            setProfileModalUserId(paymentPayee)
+                          }}
+                          className="pay-pill inline-flex items-center gap-2"
+                        >
+                          <Avatar url={payee.avatar_url} name={payeeName} size={18} />
+                          See how to pay {payeeName} ↗
+                        </button>
+                      </div>
+                    )
+                  })()}
+
                   <div className="flex gap-2">
                     <button
                       type="submit"
                       className="btn-primary flex-1"
-                      disabled={!paymentPayee || !paymentAmount || activeMembers.filter(m => m.user_id !== userId).length === 0}
+                      disabled={!paymentPayee || !paymentAmount || isSubmittingPayment || activeMembers.filter(m => m.user_id !== userId).length === 0}
                     >
-                      Record payment
+                      {isSubmittingPayment ? 'Recording…' : 'Record payment'}
                     </button>
                     <button
                       type="button"
@@ -3528,6 +3524,7 @@ export default function GroupDetailPage() {
                         setPaymentAmount('')
                         setPaymentDescription('')
                       }}
+                      disabled={isSubmittingPayment}
                       className="btn-secondary"
                     >
                       Cancel
@@ -3538,15 +3535,28 @@ export default function GroupDetailPage() {
             </div>
           )}
 
+          {profileModalUserId !== null && userId && (
+            <ProfileModal
+              userId={profileModalUserId}
+              currentUserId={userId}
+              amount={profileModalContext.amount}
+              note={profileModalContext.note}
+              onClose={() => setProfileModalUserId(null)}
+              onSaved={(message) => {
+                showToast(message)
+                loadMembers()
+              }}
+            />
+          )}
+
           {activeTab === 'info' && (
             <div>
-              <p className="eyebrow mb-1">Ledger details</p>
               <h2 className="font-display text-2xl font-semibold mb-6">{group.name || 'Group Info'}</h2>
 
               {/* Owner Information */}
               {isOwner && (
-                <div className="mb-4 rounded-lg p-4 border" style={{ borderColor: 'var(--brass)', background: 'var(--brass-soft)' }}>
-                  <p className="text-sm font-medium" style={{ color: 'var(--brass)' }}>You are the owner of this group.</p>
+                <div className="mb-4">
+                  <span className="badge badge-accent">Owner</span>
                 </div>
               )}
 
@@ -3555,15 +3565,15 @@ export default function GroupDetailPage() {
                 <p className="eyebrow mb-3">Group details</p>
                 <div>
                   <div className="ledger-row">
-                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Created</span>
+                    <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Created</span>
                     <span className="text-sm font-medium">{new Date(group.created_at).toLocaleDateString()}</span>
                   </div>
                   <div className="ledger-row">
-                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Members</span>
+                    <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Members</span>
                     <span className="text-sm font-medium">{members.length}</span>
                   </div>
                   <div className="ledger-row">
-                    <span className="text-sm" style={{ color: 'var(--ink-muted)' }}>Sessions</span>
+                    <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Sessions</span>
                     <span className="text-sm font-medium">{sessions.length}</span>
                   </div>
                 </div>
@@ -3573,12 +3583,12 @@ export default function GroupDetailPage() {
               {group.pin && (
                 <div>
                   <p className="eyebrow mb-3">Group pin</p>
-                  <p className="text-sm mb-4" style={{ color: 'var(--ink-muted)' }}>
+                  <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
                     Share this pin with others so they can join your group.
                   </p>
                   <div className="flex items-center gap-4 flex-wrap">
                     <div className="ticket-stub px-8 py-5">
-                      <p className="amount text-center text-3xl font-semibold tracking-[0.35em]" style={{ color: 'var(--brass)' }}>
+                      <p className="amount text-center text-3xl font-semibold tracking-[0.35em]" style={{ color: 'var(--accent)' }}>
                         {showPin ? group.pin : '••••••'}
                       </p>
                     </div>

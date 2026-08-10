@@ -1,9 +1,9 @@
+-- Converted from db/policies/add_session_payment_indexes.sql (kept there for history).
 -- Index SessionPayment for the lookups the app actually makes.
--- Unlike SessionEditApproval (see session_edit_approvals.sql), SessionPayment only
--- ever had its primary key indexed — everything else relied on a sequential scan
--- that grows with the table's *entire* size across every group, not just one.
--- Run this in your Supabase SQL Editor (Dashboard > SQL Editor).
-
+-- Unlike SessionEditApproval, SessionPayment only ever had its primary key
+-- indexed — everything else relied on a sequential scan that grows with the
+-- table's *entire* size across every group, not just one.
+--
 -- Covers every actual query pattern against this table:
 --   .eq('session_id', X)              -- per-session payment fetches, loadSessionDetails, etc.
 --   .in('session_id', [...])          -- loadDues, bulk group-wide fetch

@@ -1,6 +1,8 @@
+-- Converted from db/policies/add_deletion_approval.sql (kept there for history).
+--
 -- Deleting a closed session now needs unanimous approval from everyone who
 -- was part of it, same as editing one — not the unilateral, no-approval
--- delete it was before. Run this in the Supabase SQL Editor.
+-- delete it was before.
 --
 -- No new table: the audience for "does this deletion need your sign-off" is
 -- identical to the audience for "does this edit need your sign-off" — every

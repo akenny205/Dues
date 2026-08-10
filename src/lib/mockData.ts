@@ -14,14 +14,18 @@ export const DEMO_USER_ID = 1
 // mockSupabaseClient.ts's signInWithPassword) — not just Alex. Sign in with
 // any of their emails below and any password to switch who you're testing
 // as; useful for reviewing/approving an edit from the other side.
+// Payment method handles are deliberately seeded unevenly — Alex has all
+// four, a couple people have just one, and the rest have none — so demo
+// mode shows every state the Members tab/pay modal can be in (full pay
+// menu, a single link, and "no payment methods on file yet").
 export const mockUsers = [
-  { id: 1, created_at: daysAgo(120), username: 'alexchen', email: 'alex@demo.dues.app', first_name: 'Alex', last_name: 'Chen', auth_user_id: DEMO_AUTH_USER_ID },
-  { id: 2, created_at: daysAgo(118), username: 'jordanr', email: 'jordan@demo.dues.app', first_name: 'Jordan', last_name: 'Rivera', auth_user_id: '00000000-0000-4000-8000-000000000002' },
-  { id: 3, created_at: daysAgo(117), username: 'sampatel', email: 'sam@demo.dues.app', first_name: 'Sam', last_name: 'Patel', auth_user_id: '00000000-0000-4000-8000-000000000003' },
-  { id: 4, created_at: daysAgo(115), username: 'morganlee', email: 'morgan@demo.dues.app', first_name: 'Morgan', last_name: 'Lee', auth_user_id: '00000000-0000-4000-8000-000000000004' },
-  { id: 5, created_at: daysAgo(1), username: 'taylork', email: 'taylor@demo.dues.app', first_name: 'Taylor', last_name: 'Kim', auth_user_id: '00000000-0000-4000-8000-000000000005' },
-  { id: 6, created_at: daysAgo(40), username: 'caseyn', email: 'casey@demo.dues.app', first_name: 'Casey', last_name: 'Nguyen', auth_user_id: '00000000-0000-4000-8000-000000000006' },
-  { id: 7, created_at: daysAgo(38), username: 'rileyb', email: 'riley@demo.dues.app', first_name: 'Riley', last_name: 'Brooks', auth_user_id: '00000000-0000-4000-8000-000000000007' },
+  { id: 1, created_at: daysAgo(120), username: 'alexchen', email: 'alex@demo.dues.app', first_name: 'Alex', last_name: 'Chen', auth_user_id: DEMO_AUTH_USER_ID, venmo_username: 'alex-chen-99', cashapp_cashtag: 'alexchen', paypal_username: 'alexchendemo', zelle_handle: 'alex@demo.dues.app' },
+  { id: 2, created_at: daysAgo(118), username: 'jordanr', email: 'jordan@demo.dues.app', first_name: 'Jordan', last_name: 'Rivera', auth_user_id: '00000000-0000-4000-8000-000000000002', venmo_username: 'jordan-rivera', cashapp_cashtag: null, paypal_username: null, zelle_handle: null },
+  { id: 3, created_at: daysAgo(117), username: 'sampatel', email: 'sam@demo.dues.app', first_name: 'Sam', last_name: 'Patel', auth_user_id: '00000000-0000-4000-8000-000000000003', venmo_username: null, cashapp_cashtag: 'sampatel', paypal_username: null, zelle_handle: null },
+  { id: 4, created_at: daysAgo(115), username: 'morganlee', email: 'morgan@demo.dues.app', first_name: 'Morgan', last_name: 'Lee', auth_user_id: '00000000-0000-4000-8000-000000000004', venmo_username: null, cashapp_cashtag: null, paypal_username: null, zelle_handle: null },
+  { id: 5, created_at: daysAgo(1), username: 'taylork', email: 'taylor@demo.dues.app', first_name: 'Taylor', last_name: 'Kim', auth_user_id: '00000000-0000-4000-8000-000000000005', venmo_username: null, cashapp_cashtag: null, paypal_username: null, zelle_handle: null },
+  { id: 6, created_at: daysAgo(40), username: 'caseyn', email: 'casey@demo.dues.app', first_name: 'Casey', last_name: 'Nguyen', auth_user_id: '00000000-0000-4000-8000-000000000006', venmo_username: 'casey-nguyen', cashapp_cashtag: null, paypal_username: null, zelle_handle: 'casey@demo.dues.app' },
+  { id: 7, created_at: daysAgo(38), username: 'rileyb', email: 'riley@demo.dues.app', first_name: 'Riley', last_name: 'Brooks', auth_user_id: '00000000-0000-4000-8000-000000000007', venmo_username: null, cashapp_cashtag: null, paypal_username: null, zelle_handle: null },
 ]
 
 export const mockGroups = [
@@ -74,9 +78,11 @@ export const mockSessionPayments = [
   { id: 1010, created_at: daysAgo(8), session_id: 103, user_id: 2, amount: -20 },
   { id: 1011, created_at: daysAgo(8), session_id: 103, user_id: 3, amount: -20 },
   { id: 1012, created_at: daysAgo(8), session_id: 103, user_id: 4, amount: -20 },
-  // 104 — settle-up payment, Jordan -> Alex, $40
-  { id: 1013, created_at: daysAgo(5), session_id: 104, user_id: 2, amount: -40 },
-  { id: 1014, created_at: daysAgo(5), session_id: 104, user_id: 1, amount: 40 },
+  // 104 — settle-up payment, Jordan -> Alex, $40 (Jordan is the one handing
+  // over money, so — same convention as any expense's "fronting" payer —
+  // Jordan gets the positive entry and Alex, the recipient, gets the negative one)
+  { id: 1013, created_at: daysAgo(5), session_id: 104, user_id: 2, amount: 40 },
+  { id: 1014, created_at: daysAgo(5), session_id: 104, user_id: 1, amount: -40 },
   // 105 — live "Weekend groceries", still in progress (intentionally not zero-sum)
   { id: 1015, created_at: daysAgo(2), session_id: 105, user_id: 1, amount: -20 },
   { id: 1016, created_at: daysAgo(2), session_id: 105, user_id: 4, amount: 8 },

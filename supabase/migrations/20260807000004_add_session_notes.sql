@@ -1,6 +1,8 @@
+-- Converted from db/policies/add_session_notes.sql (kept there for history).
+-- Requires 20260807000001_lockdown_rls.sql (uses is_session_group_member).
+--
 -- Lets any group member attach a free-text note to a session, but only the
--- person who created it can ever change that note. Run this in the
--- Supabase SQL Editor.
+-- person who created it can ever change that note.
 --
 -- Why a function instead of just widening the Session UPDATE policy: RLS
 -- policies apply per-row, not per-column — the existing "any member can

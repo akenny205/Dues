@@ -327,7 +327,7 @@ export default function HomePage() {
   if (authLoading || (loading && user)) {
     return (
       <main className="min-h-screen">
-        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+        <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
           <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
             <Skeleton className="h-6 w-16" />
             <Skeleton className="h-8 w-20 rounded-md" />
@@ -372,7 +372,7 @@ export default function HomePage() {
 
     return (
       <main className="min-h-screen">
-        <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+        <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
           <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
             <h1 className="font-display text-xl font-semibold tracking-tight">Dues</h1>
             <Link href="/login" className="btn-primary text-sm">
@@ -389,7 +389,7 @@ export default function HomePage() {
               <h2 className="font-display text-5xl sm:text-6xl font-semibold tracking-tight leading-[1.05] mb-6">
                 Split evenly.<br />Settle simply.
               </h2>
-              <p className="text-lg max-w-xl mb-8" style={{ color: 'var(--ink-muted)' }}>
+              <p className="text-lg max-w-xl mb-8" style={{ color: 'var(--text-muted)' }}>
                 Track group dues without the spreadsheet. Create a group, log who paid,
                 and watch every balance settle to zero.
               </p>
@@ -410,14 +410,14 @@ export default function HomePage() {
                     <span className="text-sm font-medium">{p.name}</span>
                     <span
                       className="amount text-sm font-semibold"
-                      style={{ color: p.amount >= 0 ? 'var(--emerald)' : 'var(--rust)' }}
+                      style={{ color: p.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
                     >
                       {p.amount >= 0 ? '+' : ''}${p.amount.toFixed(2)}
                     </span>
                   </div>
                 ))}
               </div>
-              <div className="flex items-center justify-between pt-4 mt-1 border-t" style={{ borderColor: 'var(--line)' }}>
+              <div className="flex items-center justify-between pt-4 mt-1 border-t" style={{ borderColor: 'var(--border)' }}>
                 <span className="eyebrow">Balance</span>
                 <span className="amount text-sm font-semibold">$0.00</span>
               </div>
@@ -425,15 +425,15 @@ export default function HomePage() {
           </div>
 
           {/* Features Section */}
-          <div className="grid md:grid-cols-3 gap-px mb-24 rounded-lg overflow-hidden border" style={{ borderColor: 'var(--line)', background: 'var(--line)' }}>
+          <div className="grid md:grid-cols-3 gap-px mb-24 rounded-lg overflow-hidden border" style={{ borderColor: 'var(--border)', background: 'var(--border)' }}>
             {[
               { title: 'Create groups', body: 'Each group gets a unique pin members use to join.' },
               { title: 'Track sessions', body: 'Log who paid what. Splits always balance to zero.' },
               { title: 'View dues', body: 'See your current group balance.' },
             ].map((f) => (
-              <div key={f.title} className="p-8" style={{ background: 'var(--paper-card)' }}>
+              <div key={f.title} className="p-8" style={{ background: 'var(--surface)' }}>
                 <h3 className="font-display text-lg font-semibold mb-2">{f.title}</h3>
-                <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>{f.body}</p>
+                <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{f.body}</p>
               </div>
             ))}
           </div>
@@ -449,10 +449,10 @@ export default function HomePage() {
                 'Settle up easily',
               ].map((step, i) => (
                 <div key={step} className="text-center">
-                  <p className="font-display text-3xl font-semibold mb-2" style={{ color: 'var(--brass)' }}>
+                  <p className="font-display text-3xl font-semibold mb-2" style={{ color: 'var(--accent)' }}>
                     {String(i + 1).padStart(2, '0')}
                   </p>
-                  <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>{step}</p>
+                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{step}</p>
                 </div>
               ))}
             </div>
@@ -464,7 +464,7 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen">
-      <header className="border-b" style={{ borderColor: 'var(--line)' }}>
+      <header className="border-b" style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}>
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
           <Link href="/" className="font-display text-xl font-semibold tracking-tight">Dues</Link>
           <AuthPanel />
@@ -474,7 +474,6 @@ export default function HomePage() {
       <div className="max-w-4xl mx-auto px-6 py-10">
         <div className="flex items-center justify-between mb-8">
           <div>
-            <p className="eyebrow mb-1">Your groups</p>
             <h2 className="font-display text-2xl font-semibold">My Groups</h2>
           </div>
           <div className="flex gap-2">
@@ -550,10 +549,10 @@ export default function HomePage() {
                     required
                     autoFocus
                   />
-                  <p className="text-xs mt-1" style={{ color: 'var(--ink-muted)' }}>The owner will need to approve your request.</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>The owner will need to approve your request.</p>
                 </div>
                 {joinError && (
-                  <div className="p-3 rounded-md text-sm border" style={{ background: 'var(--rust-soft)', color: 'var(--rust)', borderColor: 'var(--rust)' }}>
+                  <div className="p-3 rounded-md text-sm border" style={{ background: 'var(--negative-soft)', color: 'var(--negative)', borderColor: 'var(--negative)' }}>
                     {joinError}
                   </div>
                 )}
@@ -580,8 +579,8 @@ export default function HomePage() {
 
         {groups.length === 0 ? (
           <div className="card text-center py-16">
-            <p className="mb-4" style={{ color: 'var(--ink-muted)' }}>No groups yet.</p>
-            <button onClick={() => setShowCreateGroupModal(true)} className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--ledger)' }}>
+            <p className="mb-4" style={{ color: 'var(--text-muted)' }}>No groups yet.</p>
+            <button onClick={() => setShowCreateGroupModal(true)} className="text-sm font-semibold hover:underline inline-flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
               Create your first group <ArrowRight size={14} />
             </button>
           </div>
@@ -591,23 +590,23 @@ export default function HomePage() {
               <Link
                 key={group.id}
                 href={`/groups/${group.id}`}
-                className="card flex items-center justify-between transition-colors hover:border-[var(--brass)]"
+                className="card flex items-center justify-between transition-colors hover:border-[var(--accent)]"
               >
                 <div className="flex items-center gap-3">
                   <div
                     className="w-9 h-9 rounded-full flex items-center justify-center font-display font-semibold text-sm shrink-0"
-                    style={{ background: 'var(--ledger)', color: 'var(--on-ledger)' }}
+                    style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
                   >
                     {(group.name || 'U').charAt(0).toUpperCase()}
                   </div>
                   <div>
                     <h3 className="font-semibold">{group.name || 'Untitled Group'}</h3>
-                    <p className="text-sm" style={{ color: 'var(--ink-muted)' }}>
+                    <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
                       {group.memberCount || 0} {group.memberCount === 1 ? 'member' : 'members'}
                     </p>
                   </div>
                 </div>
-                {group.role === 'owner' && <span className="badge badge-brass">Owner</span>}
+                {group.role === 'owner' && <span className="badge badge-accent">Owner</span>}
               </Link>
             ))}
           </div>

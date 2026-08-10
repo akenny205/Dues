@@ -54,6 +54,7 @@ interface Session {
   pendingRejection?: boolean
   waitingForApproval?: boolean // Editor is waiting for others to approve
   pendingIsDeletion?: boolean // The in-flight approval (either direction above) is a deletion request, not an amount edit
+  rejectedByMeAsProposal?: boolean // I rejected this and it never had any real SessionPayment rows (a brand-new payment/session proposal) — hide it from my list entirely rather than showing an empty shell
 }
 
 interface Due {
@@ -150,7 +151,7 @@ export default function GroupDetailPage() {
   const [selectedLiveSession, setSelectedLiveSession] = useState<number | null>(null)
   const [liveSessionAmount, setLiveSessionAmount] = useState('')
   const [pendingApprovals, setPendingApprovals] = useState<Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string; is_deletion?: boolean }>>([])
-  const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean }>>([])
+  const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean; rejection_reason?: string | null }>>([])
   const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
   const [pendingRejectionNotices, setPendingRejectionNotices] = useState<Array<{ id: number; session_id: number; session_description: string; rejected_by_name?: string; is_deletion?: boolean }>>([])
   const [originalPayments, setOriginalPayments] = useState<Array<{ user_id: number; amount: number }>>([])
@@ -159,6 +160,8 @@ export default function GroupDetailPage() {
   const [confirmCancelSessionId, setConfirmCancelSessionId] = useState<number | null>(null)
   const [confirmDeleteSessionId, setConfirmDeleteSessionId] = useState<number | null>(null)
   const [confirmCancelEditSessionId, setConfirmCancelEditSessionId] = useState<number | null>(null)
+  const [rejectingApproval, setRejectingApproval] = useState<{ approvalId: number; sessionId: number; editorUserId: number; isDeletion?: boolean } | null>(null)
+  const [rejectReasonDraft, setRejectReasonDraft] = useState('')
   const [confirmRemoveMemberId, setConfirmRemoveMemberId] = useState<number | null>(null)
   const [editingNotesSessionId, setEditingNotesSessionId] = useState<number | null>(null)
   const [notesDraft, setNotesDraft] = useState('')
@@ -530,6 +533,23 @@ export default function GroupDetailPage() {
 
           // Mark as pending rejection if there's an undismissed rejection
           const hasPendingRejection = !!rejectionData
+
+          // Did *I* reject this as the approver? If so, and the session never had any
+          // real SessionPayment rows (a brand-new payment/session proposal rather than
+          // an edit to one that already existed), it should disappear from my view
+          // right away rather than sitting around as an empty shell — I already said
+          // "no" to it. The editor still sees a rejection notice until they dismiss it
+          // (see the dismiss handler in renderSessionExpansion), which is what actually
+          // deletes the underlying rows.
+          const { data: myRejection } = await supabase
+            .from('SessionEditApproval')
+            .select('id')
+            .eq('session_id', session.id)
+            .eq('approver_user_id', userId)
+            .eq('status', 'rejected')
+            .maybeSingle()
+
+          const rejectedByMeAsProposal = !!myRejection && (session.memberCount || 0) === 0
           
           // Debug logging - log all sessions to see what's happening
           console.log(`Session ${session.id} (${session.Description || 'Untitled'}):`, {
@@ -546,6 +566,7 @@ export default function GroupDetailPage() {
             pendingApproval: !!userApproval,
             pendingRejection: hasPendingRejection,
             waitingForApproval: waitingForApproval,
+            rejectedByMeAsProposal,
             pendingIsDeletion: !!userApproval?.is_deletion || !!editorPendingApprovals?.[0]?.is_deletion
           }
         })
@@ -572,7 +593,7 @@ export default function GroupDetailPage() {
         .eq('status', 'pending')
 
       let formattedApprovals: Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string }> = []
-      let formattedRejections: Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string }> = []
+      let formattedRejections: Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; rejection_reason?: string | null }> = []
       
       if (approvalsData) {
         // Filter to only approvals for sessions in this group
@@ -703,7 +724,8 @@ export default function GroupDetailPage() {
             approver_name: approverName,
             approver_email: approver?.email || 'Unknown',
             rejected_at: r.created_at || new Date().toISOString(),
-            is_deletion: !!r.is_deletion
+            is_deletion: !!r.is_deletion,
+            rejection_reason: r.rejection_reason || null
           }
         })
 
@@ -1127,12 +1149,12 @@ export default function GroupDetailPage() {
     }
   }
 
-  const handleRejectEdit = async (approvalId: number, sessionId: number, editorUserId: number) => {
+  const handleRejectEdit = async (approvalId: number, sessionId: number, editorUserId: number, reason: string) => {
     try {
       // Update approval status to rejected
       const { data: rejectedRow, error: updateError } = await supabase
         .from('SessionEditApproval')
-        .update({ status: 'rejected' })
+        .update({ status: 'rejected', rejection_reason: reason })
         .eq('id', approvalId)
         .select('is_deletion')
         .single()
@@ -1199,7 +1221,8 @@ export default function GroupDetailPage() {
             status: 'rejected',
             old_amount: 0,
             new_amount: 0,
-            is_deletion: isDeletion
+            is_deletion: isDeletion,
+            rejection_reason: reason
           }])
           .select()
           .single()
@@ -1218,7 +1241,8 @@ export default function GroupDetailPage() {
                 approver_user_id: userId,
                 status: 'rejected',
                 old_amount: 0,
-                new_amount: 0
+                new_amount: 0,
+                rejection_reason: reason
               }])
               .select()
               .single()
@@ -2198,8 +2222,19 @@ export default function GroupDetailPage() {
             )}
           </div>
 
+          {pendingRejection.rejection_reason && (
+            <div className="mb-4">
+              <p className="eyebrow mb-1">Reason</p>
+              <p className="text-sm whitespace-pre-wrap">{pendingRejection.rejection_reason}</p>
+            </div>
+          )}
+
           <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
-            You can edit the session again if needed.
+            {pendingRejection.is_deletion
+              ? 'You can request deletion again if needed.'
+              : sessionDetails.length === 0
+                ? 'This will be removed once you close this notice.'
+                : 'You can edit the session again if needed.'}
           </p>
 
           <button
@@ -2234,6 +2269,20 @@ export default function GroupDetailPage() {
                     console.error('Error dismissing rejection:', dismissError)
                     showToast('Failed to dismiss rejection. Please try again.')
                     return
+                  }
+
+                  // A rejected proposal that never had any real SessionPayment rows
+                  // (a brand-new payment or session, not an edit to an existing one —
+                  // see the matching sessionDetails.length check in the copy above)
+                  // has nothing worth keeping around now that the editor has seen why
+                  // it was rejected. Clean up the session and its approval trail so it
+                  // disappears for the editor too, matching how it already disappeared
+                  // for the rejector the moment they rejected it. Deletion requests are
+                  // the opposite case — rejecting one means "keep the session" — so
+                  // those are excluded here.
+                  if (!pendingRejection.is_deletion && sessionDetails.length === 0) {
+                    await supabase.from('SessionEditApproval').delete().eq('session_id', session.id)
+                    await supabase.from('Session').delete().eq('id', session.id)
                   }
 
                   // Close the expanded row immediately
@@ -2387,7 +2436,15 @@ export default function GroupDetailPage() {
               <Check size={18} /> {pendingApproval?.is_deletion ? 'Approve deletion' : 'Approve'}
             </button>
             <button
-              onClick={() => handleRejectEdit(pendingApproval.id, session.id, pendingApproval.editor_user_id)}
+              onClick={() => {
+                setRejectReasonDraft('')
+                setRejectingApproval({
+                  approvalId: pendingApproval.id,
+                  sessionId: session.id,
+                  editorUserId: pendingApproval.editor_user_id,
+                  isDeletion: pendingApproval?.is_deletion,
+                })
+              }}
               className="btn-reject flex-1 py-3"
             >
               <X size={18} /> {pendingApproval?.is_deletion ? 'Keep session' : 'Reject'}
@@ -2405,7 +2462,8 @@ export default function GroupDetailPage() {
     return (
       <>
         {session.is_payment && session.payment_method && (
-          <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+          <p className="text-sm mb-4 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+            <PaymentMethodIcon method={session.payment_method} size={14} />
             Paid via <span className="font-medium">{paymentMethodLabel(session.payment_method)}</span>
           </p>
         )}
@@ -2464,7 +2522,39 @@ export default function GroupDetailPage() {
 
         <div>
           <p className="eyebrow mb-3">Member payments</p>
-          {sessionDetails.length === 0 ? (
+          {sessionDetails.length === 0 && allSessionApprovals.length > 0 ? (
+            // Nothing has landed in SessionPayment yet — this is a just-created
+            // payment still waiting on the other side to confirm (see
+            // handleMakePayment/handleApproveEdit). Show the proposed amounts
+            // from the approval records instead of falsely claiming there are
+            // no payments.
+            <>
+              <p className="text-sm mb-3 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+                <Hourglass size={14} />
+                Not final yet — waiting for confirmation.
+              </p>
+              <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+                {allSessionApprovals.map((approval) => {
+                  const member = members.find(m => m.user_id === approval.user_id)
+                  const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+                  return (
+                    <div key={approval.user_id} className="flex items-center justify-between py-3">
+                      <div className="flex items-center gap-3">
+                        <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                        <p className="font-medium text-sm">{displayName}</p>
+                      </div>
+                      <p
+                        className="amount text-lg font-semibold"
+                        style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                      >
+                        {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
+                      </p>
+                    </div>
+                  )
+                })}
+              </div>
+            </>
+          ) : sessionDetails.length === 0 ? (
             <p style={{ color: 'var(--text-muted)' }}>No payments in this session.</p>
           ) : (
             <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
@@ -3028,7 +3118,7 @@ export default function GroupDetailPage() {
                   ) : (
                     <div className="space-y-2">
                       {sessions
-                        .filter(session => session.id !== editingSessionId)
+                        .filter(session => session.id !== editingSessionId && !session.rejectedByMeAsProposal)
                         .sort((a, b) => {
                           // Check if sessions have special statuses
                           const aHasSpecialStatus = a.pendingApproval || a.pendingRejection || a.waitingForApproval
@@ -3104,9 +3194,11 @@ export default function GroupDetailPage() {
                                     </p>
                                   )}
                                   {session.is_payment && session.payment_method && (
-                                    <span className="badge badge-outline">
-                                      <PaymentMethodIcon method={session.payment_method} size={11} />
-                                      {paymentMethodLabel(session.payment_method)}
+                                    <span
+                                      className="inline-flex"
+                                      title={paymentMethodLabel(session.payment_method) || undefined}
+                                    >
+                                      <PaymentMethodIcon method={session.payment_method} size={16} />
                                     </span>
                                   )}
                                   {session.is_live && <span className="badge badge-accent-solid">Live</span>}
@@ -3385,6 +3477,47 @@ export default function GroupDetailPage() {
                   </div>
                 )
               })()}
+
+              {rejectingApproval !== null && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">
+                      {rejectingApproval.isDeletion ? 'Keep this session?' : 'Reject this edit?'}
+                    </h3>
+                    <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+                      Let the editor know why — they&apos;ll see this on the rejection notice.
+                    </p>
+                    <textarea
+                      value={rejectReasonDraft}
+                      onChange={(e) => setRejectReasonDraft(e.target.value)}
+                      className="field mb-4"
+                      rows={3}
+                      placeholder={rejectingApproval.isDeletion ? 'e.g. We still need this for something' : 'e.g. I never received this payment'}
+                      autoFocus
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => {
+                          const reason = rejectReasonDraft.trim()
+                          if (!reason || !rejectingApproval) return
+                          handleRejectEdit(rejectingApproval.approvalId, rejectingApproval.sessionId, rejectingApproval.editorUserId, reason)
+                          setRejectingApproval(null)
+                        }}
+                        disabled={!rejectReasonDraft.trim()}
+                        className="btn-danger flex-1"
+                      >
+                        {rejectingApproval.isDeletion ? 'Keep session' : 'Reject'}
+                      </button>
+                      <button
+                        onClick={() => setRejectingApproval(null)}
+                        className="btn-secondary"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {showCreateLiveSessionModal && (
                 <div className="modal-overlay">

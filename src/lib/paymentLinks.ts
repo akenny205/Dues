@@ -10,6 +10,10 @@ export interface PaymentMethods {
   cashapp_cashtag?: string | null
   paypal_username?: string | null
   zelle_handle?: string | null
+  // Which of the four above to lead with — set from the profile page,
+  // defaults to unset (falls back to the fixed venmo/cashapp/paypal/zelle
+  // order below).
+  preferred_payment_method?: string | null
 }
 
 // Strips whatever leading punctuation people naturally type into the field
@@ -41,23 +45,29 @@ export interface PayLinkOption {
   key: 'venmo' | 'cashapp' | 'paypal'
   label: string
   url: string
+  preferred: boolean
 }
 
 // Quick-pay links for whichever apps this person has set up. Zelle is
 // deliberately excluded here — it has no public deep link (payments are
 // brokered bank-to-bank), so callers should show zelle_handle as
 // copy-to-clipboard text instead of a link.
+//
+// Whichever method is marked preferred (if any, and if it's one of these
+// three — Zelle has no link to sort in) is moved to the front, so callers
+// that just render this list in order lead with it for free.
 export function getPayLinks(methods: PaymentMethods, amount?: number, note?: string): PayLinkOption[] {
   const links: PayLinkOption[] = []
   if (methods.venmo_username) {
-    links.push({ key: 'venmo', label: 'Venmo', url: venmoLink(methods.venmo_username, amount, note) })
+    links.push({ key: 'venmo', label: 'Venmo', url: venmoLink(methods.venmo_username, amount, note), preferred: methods.preferred_payment_method === 'venmo' })
   }
   if (methods.cashapp_cashtag) {
-    links.push({ key: 'cashapp', label: 'Cash App', url: cashAppLink(methods.cashapp_cashtag, amount) })
+    links.push({ key: 'cashapp', label: 'Cash App', url: cashAppLink(methods.cashapp_cashtag, amount), preferred: methods.preferred_payment_method === 'cashapp' })
   }
   if (methods.paypal_username) {
-    links.push({ key: 'paypal', label: 'PayPal', url: paypalLink(methods.paypal_username, amount) })
+    links.push({ key: 'paypal', label: 'PayPal', url: paypalLink(methods.paypal_username, amount), preferred: methods.preferred_payment_method === 'paypal' })
   }
+  links.sort((a, b) => Number(b.preferred) - Number(a.preferred))
   return links
 }
 

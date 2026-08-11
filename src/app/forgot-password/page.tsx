@@ -12,6 +12,7 @@ export default function ForgotPasswordPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (isLoading) return
 
     if (!email.trim()) {
       setMessage('Please enter your email address')

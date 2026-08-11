@@ -21,7 +21,7 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Dues — split evenly, settle simply",
+  title: "Dues. split evenly, settle simply",
   description: "Track group expenses and dues without the spreadsheet.",
 };
 

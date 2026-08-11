@@ -1,12 +1,13 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import {
   ArrowLeft,
   ArrowRight,
   ArrowRightLeft,
+  Camera,
   Check,
   ClipboardList,
   Hourglass,
@@ -25,8 +26,10 @@ import InfoTooltip from '@/components/InfoTooltip'
 import PaymentMethodIcon, { PaymentMethodBadge } from '@/components/PaymentMethodIcon'
 import useAuth from '@/hooks/useAuth'
 import useToast from '@/hooks/useToast'
+import useAsyncGuard from '@/hooks/useAsyncGuard'
 import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
+import BannerCropModal from '@/components/BannerCropModal'
 import { PAYMENT_METHOD_OPTIONS, paymentMethodLabel } from '@/lib/paymentLinks'
 
 interface Group {
@@ -35,6 +38,10 @@ interface Group {
   created_at: string
   created_by: number | null
   pin?: string | null
+  description?: string | null
+  pin_enabled?: boolean
+  deleted_at?: string | null
+  banner_url?: string | null
 }
 
 interface Session {
@@ -92,6 +99,16 @@ const blockNumberArrowKeys = (e: React.KeyboardEvent<HTMLInputElement>) => {
   }
 }
 
+// Blocks the trackpad/mouse-wheel from stepping a focused number input by a
+// cent. React's wheel listener is passive, so calling preventDefault() here
+// wouldn't actually stop the browser's default behavior (and would just log
+// a warning) — blurring the input the moment a wheel event starts over it is
+// what actually prevents the value from changing, while leaving page scroll
+// completely unaffected.
+const blockNumberScroll = (e: React.WheelEvent<HTMLInputElement>) => {
+  e.currentTarget.blur()
+}
+
 // Helper function to format names: "First L." with last initial only if duplicate
 // first names — and "First Last" (full last name) if the last initial alone
 // still wouldn't tell them apart (e.g. "Andrew Kenn" vs. "Andrew Kenny").
@@ -131,11 +148,110 @@ const formatDisplayName = (members: GroupMember[], currentMember: GroupMember): 
   return `${capitalizedFirstName} ${lastInitial}.`
 }
 
+// Turns a set of net balances into the smallest possible set of payments that
+// zero everyone out, instead of the naive "everyone settles with the group"
+// approach (which is exactly as many transactions as there are non-zero
+// balances). Standard greedy cash-flow minimization: at each step, match
+// whoever owes the most against whoever is owed the most, so every match
+// fully clears at least one side. Not provably minimal in every edge case
+// (that's NP-hard in general), but it's the same heuristic Splitwise-style
+// apps use and it's minimal in practice.
+const computeSettlementPlan = (
+  balances: { user_id: number; balance: number }[]
+): { from: number; to: number; amount: number }[] => {
+  const creditors = balances
+    .filter(b => Math.round(b.balance) >= 1)
+    .map(b => ({ user_id: b.user_id, amount: Math.round(b.balance) }))
+    .sort((a, b) => b.amount - a.amount)
+  const debtors = balances
+    .filter(b => Math.round(b.balance) <= -1)
+    .map(b => ({ user_id: b.user_id, amount: -Math.round(b.balance) }))
+    .sort((a, b) => b.amount - a.amount)
+
+  const plan: { from: number; to: number; amount: number }[] = []
+  let i = 0
+  let j = 0
+  while (i < debtors.length && j < creditors.length) {
+    const debtor = debtors[i]
+    const creditor = creditors[j]
+    const amount = Math.min(debtor.amount, creditor.amount)
+    plan.push({ from: debtor.user_id, to: creditor.user_id, amount })
+    debtor.amount -= amount
+    creditor.amount -= amount
+    if (debtor.amount === 0) i++
+    if (creditor.amount === 0) j++
+  }
+  return plan
+}
+
+// A "make a payment" or "settle up" action creates a brand-new Session that's
+// pending approval — it isn't an edit to an existing one, even though both
+// flows reuse the same SessionEditApproval machinery under the hood (see
+// handleSettleUp/handleMakePayment). This tells the two apart from a real
+// edit so the UI stops calling withdrawing a payment "cancelling an edit".
+// Settle-ups are identified by their fixed Description (set once, in
+// handleSettleUp, and never user-editable while pending) since there's no
+// dedicated flag for them.
+type PendingSessionKind = 'deletion' | 'settleUp' | 'payment' | 'edit'
+
+// Both the whole-group plan (handleSettleUp) and the single-member version
+// scoped to just your own balance (handleSettleBalance) write one of these
+// two fixed Descriptions, never user-editable while pending — this is how
+// the two are told apart from a real edit/payment everywhere else below.
+const isSettleUpDescription = (description?: string | null): boolean =>
+  description === 'Group settle up' || description === 'Settle up'
+
+const pendingSessionKind = (session: {
+  pendingIsDeletion?: boolean
+  is_payment?: boolean | null
+  Description?: string | null
+}): PendingSessionKind => {
+  if (session.pendingIsDeletion) return 'deletion'
+  if (isSettleUpDescription(session.Description)) return 'settleUp'
+  if (session.is_payment) return 'payment'
+  return 'edit'
+}
+
+const cancelActionLabel = (kind: PendingSessionKind): string => {
+  switch (kind) {
+    case 'deletion': return 'Cancel deletion request'
+    case 'settleUp': return 'Cancel settle up'
+    case 'payment': return 'Cancel payment'
+    default: return 'Cancel edit'
+  }
+}
+
+const cancelActionCopy = (kind: PendingSessionKind): { title: string; body: string } => {
+  switch (kind) {
+    case 'deletion':
+      return {
+        title: 'Cancel this deletion request?',
+        body: 'The session will stay exactly as it is. Anyone who already approved or rejected the deletion will be notified that the request was cancelled.',
+      }
+    case 'settleUp':
+      return {
+        title: 'Cancel this settle up?',
+        body: "It'll be withdrawn and no balances will change. Anyone who already confirmed it will be notified that it was cancelled.",
+      }
+    case 'payment':
+      return {
+        title: 'Cancel this payment?',
+        body: "It'll be withdrawn and no balances will change. Anyone who already confirmed it will be notified that it was cancelled.",
+      }
+    default:
+      return {
+        title: 'Cancel this edit?',
+        body: 'The session will keep its current amounts. Anyone who already approved or rejected your changes will be notified that the edit was cancelled.',
+      }
+  }
+}
+
 export default function GroupDetailPage() {
   const router = useRouter()
   const params = useParams()
   const groupId = parseInt(params.id as string)
   const { user, loading: authLoading } = useAuth()
+  const bannerInputRef = useRef<HTMLInputElement>(null)
   const [group, setGroup] = useState<Group | null>(null)
   const [dues, setDues] = useState<Due[]>([])
   const [loading, setLoading] = useState(true)
@@ -150,6 +266,23 @@ export default function GroupDetailPage() {
   const [paymentDescription, setPaymentDescription] = useState('')
   const [paymentMethod, setPaymentMethod] = useState('')
   const [isSubmittingPayment, setIsSubmittingPayment] = useState(false)
+  const [showSettleUpModal, setShowSettleUpModal] = useState(false)
+  const [isSubmittingSettleUp, setIsSubmittingSettleUp] = useState(false)
+  // Editable who-pays-who breakdown for the settle up modal — seeded from the
+  // auto-computed minimal plan but freely reassignable, so members can match
+  // however they actually intend to pay instead of the fewest-transactions
+  // default. `id` is a stable React key independent of from/to/amount so
+  // rows don't get remounted (and lose focus) as they're edited.
+  const [settleUpLegs, setSettleUpLegs] = useState<{ id: number; from: number | null; to: number | null; amount: string }[]>([])
+  const settleUpLegIdRef = useRef(0)
+  const [showSettleBalanceModal, setShowSettleBalanceModal] = useState(false)
+  const [isSubmittingSettleBalance, setIsSubmittingSettleBalance] = useState(false)
+  // Scoped-down sibling of settleUpLegs: every row pays or receives against
+  // "you" specifically (direction is fixed by the sign of your own balance,
+  // see settleBalanceDirection), so each leg only needs a counterparty and an
+  // amount rather than a full from/to pair.
+  const [settleBalanceLegs, setSettleBalanceLegs] = useState<{ id: number; counterpartyId: number | null; amount: string }[]>([])
+  const settleBalanceLegIdRef = useRef(0)
   const [members, setMembers] = useState<GroupMember[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [showAddSession, setShowAddSession] = useState(false)
@@ -176,6 +309,25 @@ export default function GroupDetailPage() {
   const [rejectingApproval, setRejectingApproval] = useState<{ approvalId: number; sessionId: number; editorUserId: number; isDeletion?: boolean } | null>(null)
   const [rejectReasonDraft, setRejectReasonDraft] = useState('')
   const [confirmRemoveMemberId, setConfirmRemoveMemberId] = useState<number | null>(null)
+  const [confirmLeaveGroup, setConfirmLeaveGroup] = useState(false)
+  const [leavingGroup, setLeavingGroup] = useState(false)
+  const [groupNameDraft, setGroupNameDraft] = useState('')
+  const [groupDescriptionDraft, setGroupDescriptionDraft] = useState('')
+  const [savingGroupDetails, setSavingGroupDetails] = useState(false)
+  const [uploadingBanner, setUploadingBanner] = useState(false)
+  const [bannerError, setBannerError] = useState('')
+  const [confirmRemoveBanner, setConfirmRemoveBanner] = useState(false)
+  const [pendingBannerFile, setPendingBannerFile] = useState<File | null>(null)
+  // Staged photo (data URL) or color (hex) waiting on the approve popup —
+  // nothing here is saved until handleApproveBanner runs.
+  const [pendingBannerValue, setPendingBannerValue] = useState<string | null>(null)
+  const [pinActionLoading, setPinActionLoading] = useState(false)
+  const [showDeleteGroupConfirm, setShowDeleteGroupConfirm] = useState(false)
+  const [showDeleteBalanceWarning, setShowDeleteBalanceWarning] = useState(false)
+  const [deletingGroup, setDeletingGroup] = useState(false)
+  const [transferTargetUserId, setTransferTargetUserId] = useState<number | null>(null)
+  const [showTransferConfirm, setShowTransferConfirm] = useState(false)
+  const [transferringOwnership, setTransferringOwnership] = useState(false)
   const [editingNotesSessionId, setEditingNotesSessionId] = useState<number | null>(null)
   const [notesDraft, setNotesDraft] = useState('')
   const [savingNotes, setSavingNotes] = useState(false)
@@ -184,6 +336,10 @@ export default function GroupDetailPage() {
   const [profileModalUserId, setProfileModalUserId] = useState<number | null>(null)
   const [profileModalContext, setProfileModalContext] = useState<{ amount?: number; note?: string }>({})
   const { toasts, showToast, dismiss } = useToast()
+  // Blocks a second click on the same button (or a fast double Enter-key
+  // submit) from firing a network call twice while the first is still in
+  // flight — see useAsyncGuard for how the per-action `key`s are scoped.
+  const { isBusy, guard } = useAsyncGuard()
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -218,12 +374,28 @@ export default function GroupDetailPage() {
       }
       
       if (data) {
+        // A deleted group is a soft flag, not an absence — the row (and its
+        // history) is still right there in the DB, and the owner can bring
+        // it back from the "Archived Groups" list on their account Settings
+        // page (src/app/profile/page.tsx). But this page itself still
+        // treats it as gone, so anyone landing here gets bounced the same
+        // way they would for a group that never existed.
+        if (data.deleted_at) {
+          showToast('This group has been deleted.')
+          router.push('/')
+          return
+        }
+
         setGroup({
           id: data.id,
           name: data.name,
           created_at: data.created_at,
           created_by: data.created_by,
-          pin: data.pin
+          pin: data.pin,
+          description: data.description ?? null,
+          pin_enabled: data.pin_enabled !== false,
+          deleted_at: data.deleted_at ?? null,
+          banner_url: data.banner_url ?? null
         })
       }
     } catch (error) {
@@ -852,7 +1024,7 @@ export default function GroupDetailPage() {
 
   const handleAddSessionClick = () => {
     if (!userId || members.length === 0) return
-    
+
     // Auto-add current user to session
     const currentUserMember = members.find(m => m.user_id === userId)
     if (currentUserMember) {
@@ -902,12 +1074,17 @@ export default function GroupDetailPage() {
     }
   }
 
-  const handleViewSession = async (sessionId: number) => {
-    setViewingSessionId(sessionId)
-    await loadSessionDetails(sessionId)
-  }
+  const handleViewSession = guard(
+    (sessionId: number) => `viewSession:${sessionId}`,
+    async (sessionId: number) => {
+      setViewingSessionId(sessionId)
+      await loadSessionDetails(sessionId)
+    }
+  )
 
-  const handleEditSession = async (sessionId: number) => {
+  const handleEditSession = guard(
+    (sessionId: number) => `editSession:${sessionId}`,
+    async (sessionId: number) => {
     try {
       // Check if there are pending approvals for this session
       const { data: existingApprovals } = await supabase
@@ -967,7 +1144,8 @@ export default function GroupDetailPage() {
       console.error('Error loading session for edit:', error)
       showToast('Failed to load session: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   const handleAddMemberToSession = (memberId?: number) => {
     // Find members not already in session (current members only — a removed
@@ -1156,7 +1334,38 @@ export default function GroupDetailPage() {
     }
   }
 
-  const handleApproveEdit = async (approvalId: number, sessionId: number) => {
+  // A cancelled settle up / payment proposal has no real SessionPayment rows
+  // to fall back to (see handleCancelEdit) — it should disappear once
+  // there's nothing left for anyone to see about it, rather than sit around
+  // forever as an empty $0 session. Call this after any dismissal; it's a
+  // no-op for a real session (which always still has its SessionPayment
+  // rows) or a proposal someone still needs to see something about.
+  const cleanupOrphanedProposalSession = async (sessionId: number) => {
+    const { data: paymentRows } = await supabase
+      .from('SessionPayment')
+      .select('id')
+      .eq('session_id', sessionId)
+      .limit(1)
+    if (paymentRows && paymentRows.length > 0) return
+
+    const { data: approvalRows } = await supabase
+      .from('SessionEditApproval')
+      .select('status, dismissed_at')
+      .eq('session_id', sessionId)
+    const stillOutstanding = (approvalRows || []).some(
+      (r: any) => r.status === 'pending' || (r.status !== 'approved' && !r.dismissed_at)
+    )
+    if (stillOutstanding) return
+
+    await supabase.from('SessionEditApproval').delete().eq('session_id', sessionId)
+    await supabase.from('Session').delete().eq('id', sessionId)
+
+    if (viewingSessionId === sessionId) setViewingSessionId(null)
+  }
+
+  const handleApproveEdit = guard(
+    (approvalId: number, sessionId: number) => `approveEdit:${approvalId}`,
+    async (approvalId: number, sessionId: number) => {
     try {
       // Update approval status to approved
       const { error: updateError } = await supabase
@@ -1186,7 +1395,7 @@ export default function GroupDetailPage() {
             // Everyone approved deleting the session — remove it outright
             // rather than applying the $0 amounts, then stop.
             await performSessionDeletion(sessionId)
-            showToast('Everyone approved — session deleted.')
+            showToast('Everyone approved. session deleted.')
             await loadSessions()
             await loadDues()
             await loadPendingApprovals()
@@ -1210,7 +1419,7 @@ export default function GroupDetailPage() {
           showToast('Changes approved and applied.')
         }
       } else {
-        showToast('Approved — waiting on others.')
+        showToast('Approved. waiting on others.')
       }
 
       await loadSessions()
@@ -1220,9 +1429,12 @@ export default function GroupDetailPage() {
       console.error('Error approving edit:', error)
       showToast('Failed to approve edit: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
-  const handleRejectEdit = async (approvalId: number, sessionId: number, editorUserId: number, reason: string) => {
+  const handleRejectEdit = guard(
+    (approvalId: number, sessionId: number, editorUserId: number, reason: string) => `rejectEdit:${approvalId}`,
+    async (approvalId: number, sessionId: number, editorUserId: number, reason: string) => {
     try {
       // Update approval status to rejected
       const { data: rejectedRow, error: updateError } = await supabase
@@ -1329,7 +1541,7 @@ export default function GroupDetailPage() {
 
       showToast(
         isDeletion
-          ? 'Deletion rejected — the session was kept as-is. Everyone who was reviewing it has been notified.'
+          ? 'Deletion rejected. the session was kept as-is. Everyone who was reviewing it has been notified.'
           : 'Edit rejected. The editor and everyone else reviewing it have been notified.'
       )
 
@@ -1341,17 +1553,35 @@ export default function GroupDetailPage() {
       console.error('Error rejecting edit:', error)
       showToast('Failed to reject edit: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
-  // Editor cancels their own pending edit. The session keeps its pre-edit amounts.
-  // Approvers who hadn't acted yet are simply cleared (nothing to notify). Approvers
-  // who had already approved or rejected are marked 'cancelled' instead of deleted, so
-  // they can be notified their review was voided (surfaced in the Dues tab's Pending
-  // Actions area — see loadPendingApprovals / pendingCancellations).
-  const handleCancelEdit = async (sessionId: number) => {
+  // Editor cancels their own pending edit, settle up, payment, or deletion
+  // request. An 'edit' keeps the session at its pre-edit amounts and a
+  // 'deletion' request just stops threatening the session — neither one
+  // touches the Session row itself. A settle up / payment never had any real
+  // SessionPayment rows behind it in the first place (see PendingSessionKind
+  // above), so cancelling one removes the shell Session too — right away if
+  // nobody had acted on it yet, or once every approver who had already
+  // weighed in has seen the cancellation notice and dismissed it (see
+  // cleanupOrphanedProposalSession, called from handleDismissCancellation).
+  //
+  // Either way, approvers who hadn't acted yet are simply cleared (nothing
+  // to notify). Approvers who had already approved or rejected are marked
+  // 'cancelled' instead of deleted, so they can be notified their review was
+  // voided (surfaced in the Dues tab's Pending Actions area — see
+  // loadPendingApprovals / pendingCancellations) and view the session before
+  // dismissing it for good.
+  const handleCancelEdit = guard(
+    (sessionId: number) => `cancelEdit:${sessionId}`,
+    async (sessionId: number) => {
     if (!userId) return
 
     try {
+      const targetSession = sessions.find(s => s.id === sessionId)
+      const kind = pendingSessionKind(targetSession || {})
+      const isProposal = (kind === 'settleUp' || kind === 'payment') && (targetSession?.memberCount || 0) === 0
+
       const { data: rows, error: fetchError } = await supabase
         .from('SessionEditApproval')
         .select('*')
@@ -1377,17 +1607,23 @@ export default function GroupDetailPage() {
         }
       })
 
-      if (toDelete.length > 0) {
-        const { error } = await supabase.from('SessionEditApproval').delete().in('id', toDelete)
-        if (error) throw error
-      }
+      if (isProposal && toCancel.length === 0) {
+        // Nobody else had acted on it yet — nothing to notify, so the whole
+        // proposal just disappears.
+        await performSessionDeletion(sessionId)
+      } else {
+        if (toDelete.length > 0) {
+          const { error } = await supabase.from('SessionEditApproval').delete().in('id', toDelete)
+          if (error) throw error
+        }
 
-      if (toCancel.length > 0) {
-        const { error } = await supabase
-          .from('SessionEditApproval')
-          .update({ status: 'cancelled' })
-          .in('id', toCancel)
-        if (error) throw error
+        if (toCancel.length > 0) {
+          const { error } = await supabase
+            .from('SessionEditApproval')
+            .update({ status: 'cancelled' })
+            .in('id', toCancel)
+          if (error) throw error
+        }
       }
 
       setConfirmCancelEditSessionId(null)
@@ -1398,11 +1634,16 @@ export default function GroupDetailPage() {
       console.error('Error cancelling edit:', error)
       showToast('Failed to cancel edit: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Approver acknowledges that their review of an edit was voided by the editor cancelling it.
-  const handleDismissCancellation = async (id: number) => {
+  const handleDismissCancellation = guard(
+    (id: number) => `dismissCancellation:${id}`,
+    async (id: number) => {
     try {
+      const notice = pendingCancellations.find(c => c.id === id)
+
       const { error } = await supabase
         .from('SessionEditApproval')
         .update({ dismissed_at: new Date().toISOString() })
@@ -1410,14 +1651,24 @@ export default function GroupDetailPage() {
 
       if (error) throw error
       setPendingCancellations(prev => prev.filter(c => c.id !== id))
+
+      // If this was the last outstanding notice on a cancelled proposal,
+      // it's now safe to remove the shell Session for good.
+      if (notice) {
+        await cleanupOrphanedProposalSession(notice.session_id)
+        await loadSessions()
+      }
     } catch (error: any) {
       console.error('Error dismissing cancellation notice:', error)
       showToast('Failed to dismiss notice: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Co-approver acknowledges that an edit they were reviewing was rejected by someone else.
-  const handleDismissRejectionNotice = async (id: number) => {
+  const handleDismissRejectionNotice = guard(
+    (id: number) => `dismissRejectionNotice:${id}`,
+    async (id: number) => {
     try {
       const { error } = await supabase
         .from('SessionEditApproval')
@@ -1430,7 +1681,8 @@ export default function GroupDetailPage() {
       console.error('Error dismissing rejection notice:', error)
       showToast('Failed to dismiss notice: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Helper function to update session payments
   // Thin wrapper: the session-edit form always knows the complete membership, so
@@ -1439,7 +1691,7 @@ export default function GroupDetailPage() {
     await reconcileSession(sessionId, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
   }
 
-  const handleCreateSession = async (e: React.FormEvent) => {
+  const handleCreateSession = guard('createSession', async (e: React.FormEvent) => {
     e.preventDefault()
     if (!groupId || !userId || sessionMembers.length === 0) return
 
@@ -1586,7 +1838,7 @@ export default function GroupDetailPage() {
 
               if (usersToNotify.length > 0) {
                 // Show message that users will be notified
-                showToast(`Edit saved — waiting on ${usersToNotify.length} approval${usersToNotify.length === 1 ? '' : 's'}.`)
+                showToast(`Edit saved. waiting on ${usersToNotify.length} approval${usersToNotify.length === 1 ? '' : 's'}.`)
               } else {
                 // Only the editor's value changed, so no approvals needed - update immediately
                 await updateSessionPayments(editingSessionId)
@@ -1648,9 +1900,9 @@ export default function GroupDetailPage() {
       console.error('Error saving session:', error)
       showToast('Failed to save session: ' + (error.message || 'Unknown error'))
     }
-  }
+  })
 
-  const handleCreateLiveSession = async (description: string) => {
+  const handleCreateLiveSession = guard('createLiveSession', async (description: string) => {
     if (!groupId || !userId) return
 
     try {
@@ -1675,9 +1927,11 @@ export default function GroupDetailPage() {
       console.error('Error creating live session:', error)
       showToast('Failed to create live session: ' + (error.message || 'Unknown error'))
     }
-  }
+  })
 
-  const handleAddToLiveSession = async (sessionId: number) => {
+  const handleAddToLiveSession = guard(
+    (sessionId: number) => `addToLiveSession:${sessionId}`,
+    async (sessionId: number) => {
     if (!userId || liveSessionAmount === '') return
 
     const amountValue = parseFloat(liveSessionAmount)
@@ -1701,13 +1955,16 @@ export default function GroupDetailPage() {
       console.error('Error adding to live session:', error)
       showToast('Failed to add payment: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
-  const handleOpenLiveSession = async (sessionId: number) => {
+  const handleOpenLiveSession = guard(
+    (sessionId: number) => `openLiveSession:${sessionId}`,
+    async (sessionId: number) => {
     if (!userId) return
 
     setSelectedLiveSession(sessionId)
-    
+
     // Load all payments for this session to show other users' values
     try {
       const { data: allPayments, error: paymentsError } = await supabase
@@ -1744,9 +2001,12 @@ export default function GroupDetailPage() {
       setLiveSessionAmount('')
       setSessionDetails([])
     }
-  }
+    }
+  )
 
-  const handleCloseLiveSession = async (sessionId: number) => {
+  const handleCloseLiveSession = guard(
+    (sessionId: number) => `closeLiveSession:${sessionId}`,
+    async (sessionId: number) => {
     try {
       // Get all payments for this session
       const { data: paymentsData, error: paymentsError } = await supabase
@@ -1785,11 +2045,14 @@ export default function GroupDetailPage() {
       console.error('Error closing live session:', error)
       showToast('Failed to close session: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Cancel (abandon) a live session — discards every payment entered so far and
   // removes the session entirely. Distinct from "Close," which finalizes it.
-  const handleCancelLiveSession = async (sessionId: number) => {
+  const handleCancelLiveSession = guard(
+    (sessionId: number) => `cancelLiveSession:${sessionId}`,
+    async (sessionId: number) => {
     try {
       const { error: paymentsError } = await supabase
         .from('SessionPayment')
@@ -1815,7 +2078,8 @@ export default function GroupDetailPage() {
       console.error('Error cancelling live session:', error)
       showToast('Failed to cancel session: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Permanently delete a closed session and everything tied to it.
   // Requests to delete a closed session. Needs unanimous approval from
@@ -1824,7 +2088,9 @@ export default function GroupDetailPage() {
   // every amount go to $0 with is_deletion marking what that really means.
   // Skips straight to performSessionDeletion only when the requester is the
   // sole participant, since there's no one else to ask.
-  const handleDeleteSession = async (sessionId: number) => {
+  const handleDeleteSession = guard(
+    (sessionId: number) => `deleteSession:${sessionId}`,
+    async (sessionId: number) => {
     if (!userId) return
 
     try {
@@ -1876,12 +2142,13 @@ export default function GroupDetailPage() {
       setConfirmDeleteSessionId(null)
       await loadSessions()
       await loadPendingApprovals()
-      showToast(`Deletion requested — ${others.length} member${others.length === 1 ? '' : 's'} must approve before the session is removed.`)
+      showToast(`Deletion requested. ${others.length} member${others.length === 1 ? '' : 's'} must approve before the session is removed.`)
     } catch (error: any) {
       console.error('Error requesting session deletion:', error)
       showToast('Failed to request deletion: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   const handleMakePayment = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1958,12 +2225,335 @@ export default function GroupDetailPage() {
       await loadSessions()
       await loadDues()
       await loadPendingApprovals()
-      showToast(`Payment recorded — waiting on ${payeeName} to confirm they received it.`)
+      showToast(`Payment recorded. waiting on ${payeeName} to confirm they received it.`)
     } catch (error: any) {
       console.error('Error making payment:', error)
       showToast('Failed to record payment: ' + (error.message || 'Unknown error'))
     } finally {
       setIsSubmittingPayment(false)
+    }
+  }
+
+  // Turns the computed minimal plan (or a blank row) into editable leg state.
+  const legsFromPlan = (plan: { from: number; to: number; amount: number }[]) =>
+    plan.map(leg => ({
+      id: settleUpLegIdRef.current++,
+      from: leg.from,
+      to: leg.to,
+      amount: (leg.amount / 100).toFixed(2),
+    }))
+
+  const openSettleUpModal = () => {
+    setSettleUpLegs(legsFromPlan(computeSettlementPlan(memberBalances)))
+    setShowSettleUpModal(true)
+  }
+
+  const resetSettleUpLegsToSuggested = () => {
+    setSettleUpLegs(legsFromPlan(computeSettlementPlan(memberBalances)))
+  }
+
+  const addSettleUpLeg = () => {
+    setSettleUpLegs(prev => [...prev, { id: settleUpLegIdRef.current++, from: null, to: null, amount: '' }])
+  }
+
+  const updateSettleUpLeg = (id: number, patch: Partial<{ from: number | null; to: number | null; amount: string }>) => {
+    setSettleUpLegs(prev => prev.map(leg => (leg.id === id ? { ...leg, ...patch } : leg)))
+  }
+
+  const removeSettleUpLeg = (id: number) => {
+    setSettleUpLegs(prev => prev.filter(leg => leg.id !== id))
+  }
+
+  // A leg only counts once both sides are picked, they're different people,
+  // and the amount parses to at least a penny — half-filled rows (still being
+  // edited) are simply ignored rather than treated as errors.
+  const settleUpLegCents = (leg: { from: number | null; to: number | null; amount: string }): number => {
+    if (leg.from === null || leg.to === null || leg.from === leg.to) return 0
+    const parsed = parseFloat(leg.amount)
+    if (isNaN(parsed) || parsed <= 0) return 0
+    return Math.round(parsed * 100)
+  }
+
+  // Net effect (in cents) each member's balance moves by if the current legs
+  // go through: paying money moves you toward $0 from below (+), receiving it
+  // moves you toward $0 from above (-).
+  const settleUpNetCents = (legs: { from: number | null; to: number | null; amount: string }[], userIdToCheck: number): number => {
+    return legs.reduce((sum, leg) => {
+      const cents = settleUpLegCents(leg)
+      if (cents === 0) return sum
+      if (leg.from === userIdToCheck) return sum + cents
+      if (leg.to === userIdToCheck) return sum - cents
+      return sum
+    }, 0)
+  }
+
+  // Zeroes out every member's balance in one shot instead of recording payments
+  // pair by pair. Same trust model as handleMakePayment: it only ever claims
+  // that debts are settled, so everyone whose balance would move (other than
+  // whoever clicked the button) has to confirm before anything actually lands
+  // in SessionPayment — see handleApproveEdit, which this reuses unmodified.
+  //
+  // Unlike a plain "zero everyone out" pass, the amounts here come from
+  // whatever payments the user built in the modal (settleUpLegs), not
+  // straight from -balance — that's what lets someone reroute who pays whom
+  // instead of accepting the auto-suggested minimal plan.
+  const handleSettleUp = async () => {
+    if (isSubmittingSettleUp) return
+    if (!userId || !groupId) return
+
+    const validLegs = settleUpLegs.filter(leg => settleUpLegCents(leg) > 0)
+
+    // Balances always sum to $0 across the group, so this only goes through
+    // once every member's balance plus the net effect of their payments lands
+    // exactly on $0 — the modal keeps the button disabled until that's true,
+    // this is just the last line of defense.
+    const stillUnbalanced = memberBalances.some(
+      m => m.balance + settleUpNetCents(validLegs, m.user_id) !== 0
+    )
+    if (stillUnbalanced) {
+      showToast('Adjust the payments so every balance reaches $0.00')
+      return
+    }
+
+    const entries = activeMembers
+      .map(m => ({ user_id: m.user_id, netCents: settleUpNetCents(validLegs, m.user_id) }))
+      .filter(e => e.netCents !== 0)
+      .map(e => ({ user_id: e.user_id, amount: e.netCents / 100 }))
+
+    if (entries.length === 0) {
+      showToast("Everyone's already settled up")
+      setShowSettleUpModal(false)
+      return
+    }
+
+    // Record who-pays-who — the actual payments chosen, not just the fact
+    // that everyone zeroed out — so the session's notes still explain itself
+    // later even after balances have moved on.
+    const settlementNotes = validLegs
+      .map(leg => {
+        const from = members.find(m => m.user_id === leg.from)
+        const to = members.find(m => m.user_id === leg.to)
+        const fromName = from ? formatDisplayName(members, from) : 'Unknown'
+        const toName = to ? formatDisplayName(members, to) : 'Unknown'
+        return `${fromName} pays ${toName} $${(settleUpLegCents(leg) / 100).toFixed(2)}`
+      })
+      .join('\n') || null
+
+    setIsSubmittingSettleUp(true)
+    try {
+      const { data: sessionData, error: sessionError } = await supabase
+        .from('Session')
+        .insert([{
+          group_id: groupId,
+          Description: 'Group settle up',
+          is_payment: true,
+          created_by: userId,
+          notes: settlementNotes,
+        }])
+        .select('id')
+        .single()
+
+      if (sessionError) throw sessionError
+
+      const approvalRecords = entries.map(entry => ({
+        session_id: sessionData.id,
+        editor_user_id: userId,
+        approver_user_id: entry.user_id,
+        status: entry.user_id === userId ? 'approved' : 'pending',
+        old_amount: 0,
+        new_amount: entry.amount,
+      }))
+
+      const { error: approvalError } = await supabase
+        .from('SessionEditApproval')
+        .insert(approvalRecords)
+
+      if (approvalError) throw approvalError
+
+      const othersCount = approvalRecords.filter(r => r.status === 'pending').length
+
+      setShowSettleUpModal(false)
+      await loadSessions()
+      await loadDues()
+      await loadPendingApprovals()
+      showToast(
+        othersCount > 0
+          ? `Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`
+          : 'Settled up!'
+      )
+    } catch (error: any) {
+      console.error('Error settling up:', error)
+      showToast('Failed to settle up: ' + (error.message || 'Unknown error'))
+    } finally {
+      setIsSubmittingSettleUp(false)
+    }
+  }
+
+  // Suggested legs for the personal "Settle your balance" modal: the same
+  // minimal cash-flow plan the whole-group modal uses, filtered down to just
+  // the edges that touch you. Which side of each edge you're on is implied
+  // (see settleBalanceDirection) since a member's balance can only be a net
+  // debtor or a net creditor, never both at once — so every row you'd ever
+  // be on runs the same direction.
+  const legsFromPersonalPlan = (plan: { from: number; to: number; amount: number }[]) =>
+    plan
+      .filter(leg => leg.from === userId || leg.to === userId)
+      .map(leg => ({
+        id: settleBalanceLegIdRef.current++,
+        counterpartyId: leg.from === userId ? leg.to : leg.from,
+        amount: (leg.amount / 100).toFixed(2),
+      }))
+
+  const openSettleBalanceModal = () => {
+    setSettleBalanceLegs(legsFromPersonalPlan(computeSettlementPlan(memberBalances)))
+    setShowSettleBalanceModal(true)
+  }
+
+  const resetSettleBalanceLegsToSuggested = () => {
+    setSettleBalanceLegs(legsFromPersonalPlan(computeSettlementPlan(memberBalances)))
+  }
+
+  const addSettleBalanceLeg = () => {
+    setSettleBalanceLegs(prev => [...prev, { id: settleBalanceLegIdRef.current++, counterpartyId: null, amount: '' }])
+  }
+
+  const updateSettleBalanceLeg = (id: number, patch: Partial<{ counterpartyId: number | null; amount: string }>) => {
+    setSettleBalanceLegs(prev => prev.map(leg => (leg.id === id ? { ...leg, ...patch } : leg)))
+  }
+
+  const removeSettleBalanceLeg = (id: number) => {
+    setSettleBalanceLegs(prev => prev.filter(leg => leg.id !== id))
+  }
+
+  // A leg only counts once a counterparty other than yourself is picked and
+  // the amount parses to at least a penny — half-filled rows are ignored
+  // rather than treated as errors, same as settleUpLegCents.
+  const settleBalanceLegCents = (leg: { counterpartyId: number | null; amount: string }): number => {
+    if (leg.counterpartyId === null || leg.counterpartyId === userId) return 0
+    const parsed = parseFloat(leg.amount)
+    if (isNaN(parsed) || parsed <= 0) return 0
+    return Math.round(parsed * 100)
+  }
+
+  const settleBalanceTotalCents = (legs: { counterpartyId: number | null; amount: string }[]): number =>
+    legs.reduce((sum, leg) => sum + settleBalanceLegCents(leg), 0)
+
+  // What a given member's balance would land on if the current draft legs
+  // went through — for you, that's every leg (they all run through you); for
+  // anyone else, only the legs naming them as the counterparty. Powers the
+  // "Balances" list in the modal, the same way settleUpNetCents powers it
+  // for the whole-group version.
+  const settleBalanceRemaining = (
+    member: { user_id: number; balance: number },
+    direction: 'pay' | 'receive',
+    legs: { counterpartyId: number | null; amount: string }[]
+  ): number => {
+    const cents = member.user_id === userId
+      ? settleBalanceTotalCents(legs)
+      : legs.reduce((sum, leg) => (leg.counterpartyId === member.user_id ? sum + settleBalanceLegCents(leg) : sum), 0)
+    if (cents === 0) return member.balance
+    // Paying moves you up toward $0, and moves whoever you paid down toward
+    // $0 by the same amount — and vice versa when you're the one being paid.
+    const towardZero = (member.user_id === userId) === (direction === 'pay') ? cents : -cents
+    return member.balance + towardZero
+  }
+
+  // Zeroes out just your own balance, not the whole group — unlike
+  // handleSettleUp, every row already pays or receives against you
+  // specifically, so the only thing that has to add up is your own total
+  // against what you owe or are owed. Same trust model as handleSettleUp:
+  // this only ever claims the debt is settled, so every counterparty still
+  // has to confirm before their balance (or yours) actually moves.
+  const handleSettleBalance = async () => {
+    if (isSubmittingSettleBalance) return
+    if (!userId || !groupId || netBalance === 0) return
+
+    const direction: 'pay' | 'receive' = netBalance < 0 ? 'pay' : 'receive'
+    const validLegs = settleBalanceLegs.filter(leg => settleBalanceLegCents(leg) > 0)
+    const totalCents = settleBalanceTotalCents(validLegs)
+
+    if (totalCents !== Math.abs(netBalance)) {
+      showToast('Adjust the payments so your balance reaches $0.00')
+      return
+    }
+
+    // Collapse rows against the same counterparty into one approval record.
+    const counterpartyCents = new Map<number, number>()
+    validLegs.forEach(leg => {
+      const id = leg.counterpartyId as number
+      counterpartyCents.set(id, (counterpartyCents.get(id) || 0) + settleBalanceLegCents(leg))
+    })
+
+    // Record who-pays-who — the actual payments chosen — so the session's
+    // notes still explain itself later even after balances have moved on.
+    const settlementNotes = validLegs
+      .map(leg => {
+        const counterparty = members.find(m => m.user_id === leg.counterpartyId)
+        const counterpartyName = counterparty ? formatDisplayName(members, counterparty) : 'Unknown'
+        const cents = settleBalanceLegCents(leg)
+        return direction === 'pay'
+          ? `You pay ${counterpartyName} $${(cents / 100).toFixed(2)}`
+          : `${counterpartyName} pays you $${(cents / 100).toFixed(2)}`
+      })
+      .join('\n') || null
+
+    setIsSubmittingSettleBalance(true)
+    try {
+      const { data: sessionData, error: sessionError } = await supabase
+        .from('Session')
+        .insert([{
+          group_id: groupId,
+          Description: 'Settle up',
+          is_payment: true,
+          created_by: userId,
+          notes: settlementNotes,
+        }])
+        .select('id')
+        .single()
+
+      if (sessionError) throw sessionError
+
+      const approvalRecords = [
+        {
+          session_id: sessionData.id,
+          editor_user_id: userId,
+          approver_user_id: userId,
+          status: 'approved',
+          old_amount: 0,
+          new_amount: (direction === 'pay' ? totalCents : -totalCents) / 100,
+        },
+        ...Array.from(counterpartyCents.entries()).map(([counterpartyId, cents]) => ({
+          session_id: sessionData.id,
+          editor_user_id: userId,
+          approver_user_id: counterpartyId,
+          status: 'pending',
+          old_amount: 0,
+          new_amount: (direction === 'pay' ? -cents : cents) / 100,
+        })),
+      ]
+
+      const { error: approvalError } = await supabase
+        .from('SessionEditApproval')
+        .insert(approvalRecords)
+
+      if (approvalError) throw approvalError
+
+      const othersCount = approvalRecords.length - 1
+
+      setShowSettleBalanceModal(false)
+      await loadSessions()
+      await loadDues()
+      await loadPendingApprovals()
+      showToast(
+        othersCount > 0
+          ? `Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`
+          : 'Settled up!'
+      )
+    } catch (error: any) {
+      console.error('Error settling balance:', error)
+      showToast('Failed to settle up: ' + (error.message || 'Unknown error'))
+    } finally {
+      setIsSubmittingSettleBalance(false)
     }
   }
 
@@ -1979,6 +2569,15 @@ export default function GroupDetailPage() {
       loadJoinRequests()
     }
   }, [userId, groupId, loadGroup, loadDues, checkOwnership, loadMembers, loadSessions, loadPendingApprovals, loadJoinRequests])
+
+  // Keep the group settings form in sync with the loaded group — re-syncs
+  // after a save too, so the drafts reflect whatever actually persisted.
+  useEffect(() => {
+    if (group) {
+      setGroupNameDraft(group.name || '')
+      setGroupDescriptionDraft(group.description || '')
+    }
+  }, [group?.id, group?.name, group?.description])
 
   // Load session details when viewing a session
   useEffect(() => {
@@ -2098,21 +2697,26 @@ export default function GroupDetailPage() {
   // Both run server-side (approve_join_request / reject_join_request), since
   // adding someone else to GroupMember isn't something the owner's own RLS
   // permissions allow directly — see add_join_requests.sql.
-  const handleApproveJoinRequest = async (requestId: number) => {
+  const handleApproveJoinRequest = guard(
+    (requestId: number) => `approveJoinRequest:${requestId}`,
+    async (requestId: number) => {
     try {
       const { error } = await supabase.rpc('approve_join_request', { request_id: requestId })
       if (error) throw error
 
       setPendingJoinRequests(prev => prev.filter(r => r.id !== requestId))
       await loadMembers()
-      showToast('Request approved — they now have access to the group.')
+      showToast('Request approved. they now have access to the group.')
     } catch (error: any) {
       console.error('Error approving join request:', error)
       showToast('Failed to approve request: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
-  const handleRejectJoinRequest = async (requestId: number) => {
+  const handleRejectJoinRequest = guard(
+    (requestId: number) => `rejectJoinRequest:${requestId}`,
+    async (requestId: number) => {
     try {
       const { error } = await supabase.rpc('reject_join_request', { request_id: requestId })
       if (error) throw error
@@ -2123,12 +2727,15 @@ export default function GroupDetailPage() {
       console.error('Error rejecting join request:', error)
       showToast('Failed to reject request: ' + (error.message || 'Unknown error'))
     }
-  }
+    }
+  )
 
   // Runs server-side (remove_group_member) — it re-checks the $0 balance rule
   // itself rather than trusting the client, and flips status to 'removed'
   // instead of deleting the row, so their session/payment history is untouched.
-  const handleRemoveMember = async (targetUserId: number) => {
+  const handleRemoveMember = guard(
+    (targetUserId: number) => `removeMember:${targetUserId}`,
+    async (targetUserId: number) => {
     if (!groupId) return
 
     try {
@@ -2146,12 +2753,217 @@ export default function GroupDetailPage() {
       console.error('Error removing member:', error)
       showToast('Failed to remove member: ' + (error.message || 'Unknown error'))
     }
+    }
+  )
+
+  // Runs server-side (leave_group) — it re-checks the $0 balance rule and
+  // that you're not the owner itself rather than trusting the client, same
+  // as remove_group_member above. The difference is it's self-scoped: no
+  // target_user_id, the RPC always acts on whoever's calling it.
+  const handleLeaveGroup = async () => {
+    if (!groupId || leavingGroup) return
+
+    setLeavingGroup(true)
+    try {
+      const { error } = await supabase.rpc('leave_group', {
+        target_group_id: groupId,
+      })
+
+      if (error) throw error
+
+      showToast('You left the group.')
+      router.push('/')
+    } catch (error: any) {
+      console.error('Error leaving group:', error)
+      showToast('Failed to leave group: ' + (error.message || 'Unknown error'))
+      setConfirmLeaveGroup(false)
+    } finally {
+      setLeavingGroup(false)
+    }
+  }
+
+  // The group settings actions below (rename/description, pin, delete,
+  // transfer ownership) all run through owner-gated RPCs — see
+  // 20260811000003_add_group_settings.sql and its follow-ups — rather than
+  // a plain table update, since these are the one corner of the app where
+  // membership alone isn't enough and it has to actually be the owner.
+
+  const handleSaveGroupDetails = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!groupId || savingGroupDetails) return
+
+    const trimmedName = groupNameDraft.trim()
+    if (!trimmedName) {
+      showToast('Group name cannot be empty')
+      return
+    }
+
+    setSavingGroupDetails(true)
+    try {
+      const { error } = await supabase.rpc('update_group_details', {
+        target_group_id: groupId,
+        new_name: trimmedName,
+        new_description: groupDescriptionDraft.trim() || null,
+      })
+
+      if (error) throw error
+
+      await loadGroup()
+      showToast('Group details saved.')
+    } catch (error: any) {
+      console.error('Error saving group details:', error)
+      showToast('Failed to save group details: ' + (error.message || 'Unknown error'))
+    } finally {
+      setSavingGroupDetails(false)
+    }
+  }
+
+  // Picking a file just opens BannerCropModal so the owner can choose how it
+  // fits the banner strip by hand. That doesn't save right away either — it
+  // just stages a value (pendingBannerValue) and opens the approve popup
+  // below, so nothing actually lands on Group.banner_url until the owner
+  // explicitly confirms the preview. handleApproveBanner is the one place
+  // that actually calls update_group_banner — see
+  // 20260811000008_add_group_banner.sql for why this needs its own
+  // owner-gated RPC rather than a plain table update.
+  const handleBannerFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow picking the same file again later
+    if (!file) return
+    setBannerError('')
+    setPendingBannerFile(file)
+  }
+
+  const handleBannerCropConfirm = (dataUrl: string) => {
+    setPendingBannerFile(null)
+    setBannerError('')
+    setPendingBannerValue(dataUrl)
+  }
+
+  const handleCancelPendingBanner = () => {
+    setPendingBannerValue(null)
+    setBannerError('')
+  }
+
+  const handleApproveBanner = async () => {
+    if (!pendingBannerValue || !groupId || uploadingBanner) return
+    setBannerError('')
+    setUploadingBanner(true)
+    try {
+      const { error } = await supabase.rpc('update_group_banner', {
+        target_group_id: groupId,
+        new_banner_url: pendingBannerValue,
+      })
+      if (error) throw error
+      setGroup((prev) => (prev ? { ...prev, banner_url: pendingBannerValue } : prev))
+      showToast('Group banner updated')
+      setPendingBannerValue(null)
+    } catch (err: any) {
+      // Left set on failure (rather than cleared) so the popup stays open
+      // with the preview still up — the owner can just hit Save again.
+      setBannerError(err instanceof Error ? err.message : (err?.message || 'Failed to update banner'))
+    } finally {
+      setUploadingBanner(false)
+    }
+  }
+
+  const handleRemoveBanner = async () => {
+    if (!groupId || uploadingBanner) return
+    setConfirmRemoveBanner(false)
+    setBannerError('')
+    setUploadingBanner(true)
+    try {
+      const { error } = await supabase.rpc('update_group_banner', {
+        target_group_id: groupId,
+        new_banner_url: null,
+      })
+      if (error) throw error
+      setGroup((prev) => (prev ? { ...prev, banner_url: null } : prev))
+      showToast('Group banner removed')
+    } catch (err: any) {
+      setBannerError(err instanceof Error ? err.message : (err?.message || 'Failed to remove banner'))
+    } finally {
+      setUploadingBanner(false)
+    }
+  }
+
+  const handleRegeneratePin = async () => {
+    if (!groupId || pinActionLoading) return
+    setPinActionLoading(true)
+    try {
+      const { error } = await supabase.rpc('regenerate_group_pin', { target_group_id: groupId })
+      if (error) throw error
+      await loadGroup()
+      setShowPin(true)
+      showToast('New join pin generated.')
+    } catch (error: any) {
+      console.error('Error regenerating pin:', error)
+      showToast('Failed to regenerate pin: ' + (error.message || 'Unknown error'))
+    } finally {
+      setPinActionLoading(false)
+    }
+  }
+
+  const handleTogglePinEnabled = async (enabled: boolean) => {
+    if (!groupId || pinActionLoading) return
+    setPinActionLoading(true)
+    try {
+      const { error } = await supabase.rpc('set_group_pin_enabled', { target_group_id: groupId, enabled })
+      if (error) throw error
+      await loadGroup()
+      showToast(enabled ? 'Join pin enabled.' : 'Join pin disabled. no one can join with it until you re-enable it.')
+    } catch (error: any) {
+      console.error('Error updating pin status:', error)
+      showToast('Failed to update pin: ' + (error.message || 'Unknown error'))
+    } finally {
+      setPinActionLoading(false)
+    }
+  }
+
+  const handleDeleteGroup = async () => {
+    if (!groupId || deletingGroup) return
+    setDeletingGroup(true)
+    try {
+      const { error } = await supabase.rpc('delete_group', { target_group_id: groupId })
+      if (error) throw error
+      showToast('Group deleted.')
+      router.push('/')
+    } catch (error: any) {
+      console.error('Error deleting group:', error)
+      showToast('Failed to delete group: ' + (error.message || 'Unknown error'))
+      setDeletingGroup(false)
+    }
+  }
+
+  const handleTransferOwnership = async () => {
+    if (!groupId || !transferTargetUserId || transferringOwnership) return
+    setTransferringOwnership(true)
+    try {
+      const { error } = await supabase.rpc('transfer_group_ownership', {
+        target_group_id: groupId,
+        new_owner_user_id: transferTargetUserId,
+      })
+      if (error) throw error
+
+      setShowTransferConfirm(false)
+      setTransferTargetUserId(null)
+      await checkOwnership()
+      await loadMembers()
+      setActiveTab('dues')
+      showToast('Ownership transferred.')
+    } catch (error: any) {
+      console.error('Error transferring ownership:', error)
+      showToast('Failed to transfer ownership: ' + (error.message || 'Unknown error'))
+    } finally {
+      setTransferringOwnership(false)
+    }
   }
 
   // Runs server-side (update_session_notes) — it re-checks that you're the
   // session's creator itself rather than trusting the client, since the
   // general "any member can update a session" rule doesn't apply to notes.
   const handleSaveNotes = async (sessionId: number) => {
+    if (savingNotes) return
     setSavingNotes(true)
     try {
       const { error } = await supabase.rpc('update_session_notes', {
@@ -2249,6 +3061,21 @@ export default function GroupDetailPage() {
     }
   }).sort((a, b) => b.balance - a.balance) // owed money first, those who owe last
 
+  // Deleting doesn't require everyone to be settled up first (unlike leaving
+  // or being removed) — but if anyone still has a balance, that money just
+  // disappears along with the group, so the confirm flow below routes
+  // through an extra warning instead of deleting outright.
+  const hasUnsettledBalances = memberBalances.some(m => Math.abs(m.balance) >= 1)
+
+  const handleDeleteGroupConfirmClick = () => {
+    if (hasUnsettledBalances) {
+      setShowDeleteGroupConfirm(false)
+      setShowDeleteBalanceWarning(true)
+    } else {
+      handleDeleteGroup()
+    }
+  }
+
   const tabs: Array<{ key: typeof activeTab; label: string }> = [
     { key: 'dues', label: 'Dues' },
     { key: 'members', label: 'Group Members' },
@@ -2275,7 +3102,7 @@ export default function GroupDetailPage() {
             </h2>
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
               {pendingRejection.is_deletion
-                ? 'Your request to delete this session was rejected — it was kept as-is.'
+                ? 'Your request to delete this session was rejected. it was kept as-is.'
                 : 'Your edit to this session was rejected.'}
             </p>
           </div>
@@ -2396,8 +3223,12 @@ export default function GroupDetailPage() {
             </h2>
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
               {pendingApproval?.is_deletion
-                ? 'A group member wants to delete this session — every amount below is going to $0.'
-                : 'This session has been edited. Review the changes below.'}
+                ? 'A group member wants to delete this session. every amount below is going to $0.'
+                : isSettleUpDescription(session.Description)
+                  ? 'A group member started a settle up. Review the changes below.'
+                  : session.is_payment
+                    ? 'A group member recorded a payment. Review the changes below.'
+                    : 'This session has been edited. Review the changes below.'}
             </p>
             {session.is_payment && session.payment_method && (
               <p className="text-sm mt-1 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
@@ -2506,6 +3337,7 @@ export default function GroupDetailPage() {
           <div className="flex gap-3">
             <button
               onClick={() => handleApproveEdit(pendingApproval.id, session.id)}
+              disabled={isBusy(`approveEdit:${pendingApproval.id}`)}
               className="btn-approve flex-1 py-3"
             >
               <Check size={18} /> {pendingApproval?.is_deletion ? 'Approve deletion' : 'Approve'}
@@ -2606,7 +3438,7 @@ export default function GroupDetailPage() {
             <>
               <p className="text-sm mb-3 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
                 <Hourglass size={14} />
-                Not final yet — waiting for confirmation.
+                Not final yet. waiting for confirmation.
               </p>
               <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
                 {allSessionApprovals.map((approval) => {
@@ -2673,7 +3505,19 @@ export default function GroupDetailPage() {
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto px-6 py-8 flex flex-col gap-6 md:flex-row md:gap-0">
+      {group.banner_url && (
+        <div className="max-w-7xl mx-auto px-6 pt-8">
+          {/* eslint-disable-next-line @next/next/no-img-element -- data: URL, not worth next/image's optimizer here */}
+          <img
+            src={group.banner_url}
+            alt=""
+            className="w-full rounded-xl object-cover"
+            style={{ height: 160, border: '1px solid var(--border)' }}
+          />
+        </div>
+      )}
+
+      <div className={`max-w-7xl mx-auto px-6 pb-8 flex flex-col gap-6 md:flex-row md:gap-0 ${group.banner_url ? 'pt-6' : 'pt-8'}`}>
         {/* Sidebar — split from the content by a hairline, the same way the
             topbar is split from the page, rather than boxing it in a panel. */}
         <aside className="md:w-56 flex-shrink-0 md:border-r md:pr-6 md:mr-6" style={{ borderColor: 'var(--border)' }}>
@@ -2694,7 +3538,17 @@ export default function GroupDetailPage() {
         <div className="flex-1">
           {activeTab === 'dues' && (
             <div className="mb-6">
-              <h2 className="font-display text-2xl font-semibold mb-6">Dues</h2>
+              <div className="flex items-center justify-between gap-4 mb-6">
+                <h2 className="font-display text-2xl font-semibold">Dues</h2>
+                <button
+                  onClick={openSettleBalanceModal}
+                  className="btn-primary shrink-0"
+                  disabled={Math.abs(netBalance) < 1}
+                  title={Math.abs(netBalance) < 1 ? "You're already settled up" : undefined}
+                >
+                  Settle your balance
+                </button>
+              </div>
 
               {/* Your balance */}
               <div className="card mb-8 flex items-center justify-between gap-4">
@@ -2703,7 +3557,7 @@ export default function GroupDetailPage() {
                     Your balance
                     <InfoTooltip label="What this balance means">
                       A positive balance means the group owes you money; negative means you owe the
-                      group. Recording a payment moves both numbers toward zero — it never moves money itself.
+                      group. Recording a payment moves both numbers toward zero. it never moves money itself.
                     </InfoTooltip>
                   </p>
                   <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
@@ -2752,7 +3606,7 @@ export default function GroupDetailPage() {
                                   </p>
                                   <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
                                     {s.pendingApproval
-                                      ? s.pendingIsDeletion ? 'Someone wants to delete this — needs your review' : 'Needs your review'
+                                      ? s.pendingIsDeletion ? 'Someone wants to delete this. needs your review' : 'Needs your review'
                                       : s.pendingIsDeletion ? 'Waiting on others to approve deleting this' : 'Waiting on others to approve your changes'}
                                   </p>
                                 </div>
@@ -2816,12 +3670,13 @@ export default function GroupDetailPage() {
                                 <XCircle size={18} style={{ color: 'var(--text-muted)' }} />
                                 <p className="text-sm font-medium">
                                   {rn.is_deletion
-                                    ? <>The request to delete &ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'} — it was kept</>
-                                    : <>&ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'} — the edit did not go through</>}
+                                    ? <>The request to delete &ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'}. it was kept</>
+                                    : <>&ldquo;{rn.session_description}&rdquo; was rejected by {rn.rejected_by_name || 'a member'}. the edit did not go through</>}
                                 </p>
                               </div>
                               <button
                                 onClick={() => handleDismissRejectionNotice(rn.id)}
+                                disabled={isBusy(`dismissRejectionNotice:${rn.id}`)}
                                 className="btn-secondary text-sm shrink-0"
                               >
                                 Dismiss
@@ -2838,20 +3693,186 @@ export default function GroupDetailPage() {
                                 <Undo2 size={18} style={{ color: 'var(--text-muted)' }} />
                                 <p className="text-sm font-medium">
                                   {pc.is_deletion
-                                    ? <>The request to delete &ldquo;{pc.session_description}&rdquo; was cancelled — your review is no longer needed</>
+                                    ? <>The request to delete &ldquo;{pc.session_description}&rdquo; was cancelled. your review is no longer needed</>
                                     : <>Your review on &ldquo;{pc.session_description}&rdquo; was cancelled by the editor</>}
                                 </p>
                               </div>
-                              <button
-                                onClick={() => handleDismissCancellation(pc.id)}
-                                className="btn-secondary text-sm shrink-0"
-                              >
-                                Dismiss
-                              </button>
+                              <div className="flex gap-2 shrink-0">
+                                <button
+                                  onClick={() => {
+                                    setActiveTab('sessions')
+                                    setViewingSessionId(pc.session_id)
+                                  }}
+                                  className="btn-secondary text-sm"
+                                >
+                                  View
+                                </button>
+                                <button
+                                  onClick={() => handleDismissCancellation(pc.id)}
+                                  disabled={isBusy(`dismissCancellation:${pc.id}`)}
+                                  className="btn-secondary text-sm"
+                                >
+                                  Dismiss
+                                </button>
+                              </div>
                             </div>
                           ))}
                         </div>
                       )}
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {showSettleBalanceModal && (() => {
+                const direction: 'pay' | 'receive' = netBalance < 0 ? 'pay' : 'receive'
+                const validLegs = settleBalanceLegs.filter(leg => settleBalanceLegCents(leg) > 0)
+                const totalCents = settleBalanceTotalCents(validLegs)
+                const remaining = netBalance + (direction === 'pay' ? totalCents : -totalCents)
+                const isSettled = remaining === 0
+                const canSubmit = isSettled && validLegs.length > 0
+
+                return (
+                  <div className="modal-overlay">
+                    <div className="modal-panel">
+                      <h3 className="font-display text-xl font-semibold mb-4 flex items-center gap-2">
+                        Settle your balance
+                        <InfoTooltip label="How this affects balances">
+                          This creates one session that zeroes out just your balance below, the
+                          same way recording a payment does. Split it across as many people as
+                          you like below — it just has to add up to your balance landing on
+                          $0.00. It won&apos;t change anyone&apos;s balance until they confirm —
+                          that way no one can clear a debt they still owe by just claiming it&apos;s
+                          settled.
+                        </InfoTooltip>
+                      </h3>
+
+                      <p className="eyebrow mb-2">Balances</p>
+                      <div className="divide-y mb-4" style={{ borderColor: 'var(--border)' }}>
+                        {memberBalances.map((member) => {
+                          const memberRemaining = settleBalanceRemaining(member, direction, validLegs)
+                          const isMemberZero = memberRemaining === 0
+                          return (
+                            <div key={member.user_id} className="flex items-center justify-between gap-4 py-3">
+                              <div className="flex items-center gap-3">
+                                <Avatar url={member.avatar_url} name={formatDisplayName(members, member)} size={32} />
+                                <p className="text-sm font-medium">
+                                  {member.user_id === userId ? 'You' : formatDisplayName(members, member)}
+                                </p>
+                              </div>
+                              <p
+                                className="amount text-sm font-semibold"
+                                style={{
+                                  color: isMemberZero
+                                    ? 'var(--text-muted)'
+                                    : memberRemaining > 0 ? 'var(--accent)' : 'var(--negative)',
+                                }}
+                              >
+                                {memberRemaining >= 0 ? '+' : ''}${(memberRemaining / 100).toFixed(2)}
+                              </p>
+                            </div>
+                          )
+                        })}
+                      </div>
+
+                      <div className="mb-1 flex items-center justify-between gap-2">
+                        <p className="eyebrow">{direction === 'pay' ? 'Who you pay' : 'Who pays you'}</p>
+                        <button
+                          type="button"
+                          onClick={resetSettleBalanceLegsToSuggested}
+                          className="text-xs font-medium hover:underline shrink-0"
+                          style={{ color: 'var(--accent)' }}
+                        >
+                          Reset to suggested
+                        </button>
+                      </div>
+                      <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+                        These are the real payments members will make (Venmo, cash, etc).
+                        Edit, remove, or add rows until your balance above reads $0.00.
+                      </p>
+
+                      <div className="space-y-2 mb-2">
+                        {settleBalanceLegs.map((leg) => (
+                          <div key={leg.id} className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+                              {direction === 'pay' ? 'You pay' : 'Receive from'}
+                            </span>
+                            <select
+                              value={leg.counterpartyId ?? ''}
+                              onChange={(e) =>
+                                updateSettleBalanceLeg(leg.id, { counterpartyId: e.target.value ? Number(e.target.value) : null })
+                              }
+                              className="field text-sm flex-1 min-w-0"
+                              aria-label={direction === 'pay' ? 'Who you pay' : 'Who pays you'}
+                            >
+                              <option value="" disabled>Select a member</option>
+                              {activeMembers
+                                .filter(m => m.user_id !== userId)
+                                .map((m) => (
+                                  <option key={m.user_id} value={m.user_id}>
+                                    {formatDisplayName(members, m)}
+                                  </option>
+                                ))}
+                            </select>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              value={leg.amount}
+                              onChange={(e) => updateSettleBalanceLeg(leg.id, { amount: e.target.value })}
+                              onWheel={blockNumberScroll}
+                              placeholder="0.00"
+                              aria-label="Amount"
+                              className="field amount text-sm shrink-0"
+                              style={{ width: '6.5rem' }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => removeSettleBalanceLeg(leg.id)}
+                              className="shrink-0 text-sm"
+                              style={{ color: 'var(--text-muted)' }}
+                              aria-label="Remove payment"
+                              title="Remove payment"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={addSettleBalanceLeg}
+                        className="text-xs font-medium hover:underline mb-4"
+                        style={{ color: 'var(--accent)' }}
+                      >
+                        + Add payment
+                      </button>
+
+                      {!isSettled && (
+                        <p className="text-xs mb-4" style={{ color: 'var(--negative)' }}>
+                          Adjust the payments above until your balance reaches $0.00.
+                        </p>
+                      )}
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleSettleBalance}
+                          disabled={isSubmittingSettleBalance || !canSubmit}
+                          className="btn-primary flex-1"
+                          title={canSubmit ? undefined : 'Adjust the payments so your balance reaches $0.00'}
+                        >
+                          {isSubmittingSettleBalance ? 'Requesting…' : 'Settle up'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowSettleBalanceModal(false)}
+                          className="btn-secondary"
+                          disabled={isSubmittingSettleBalance}
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )
@@ -2861,7 +3882,17 @@ export default function GroupDetailPage() {
 
           {activeTab === 'members' && (
             <div>
-              <h2 className="font-display text-2xl font-semibold mb-6">Group Members</h2>
+              <div className="flex items-center justify-between gap-4 mb-6">
+                <h2 className="font-display text-2xl font-semibold">Group Members</h2>
+                <button
+                  onClick={openSettleUpModal}
+                  className="btn-primary shrink-0"
+                  disabled={!hasUnsettledBalances}
+                  title={hasUnsettledBalances ? undefined : "Everyone's already settled up"}
+                >
+                  Settle up
+                </button>
+              </div>
 
               {isOwner && pendingJoinRequests.length > 0 && (
                 <div className="mb-8">
@@ -2881,10 +3912,10 @@ export default function GroupDetailPage() {
                           </div>
                         </div>
                         <div className="flex gap-2 shrink-0">
-                          <button onClick={() => handleApproveJoinRequest(req.id)} className="btn-primary text-sm">
+                          <button onClick={() => handleApproveJoinRequest(req.id)} disabled={isBusy(`approveJoinRequest:${req.id}`)} className="btn-primary text-sm">
                             Approve
                           </button>
-                          <button onClick={() => handleRejectJoinRequest(req.id)} className="btn-secondary text-sm">
+                          <button onClick={() => handleRejectJoinRequest(req.id)} disabled={isBusy(`rejectJoinRequest:${req.id}`)} className="btn-secondary text-sm">
                             Reject
                           </button>
                         </div>
@@ -2997,11 +4028,189 @@ export default function GroupDetailPage() {
                       <div className="flex gap-2">
                         <button
                           onClick={() => handleRemoveMember(confirmRemoveMemberId)}
+                          disabled={isBusy(`removeMember:${confirmRemoveMemberId}`)}
                           className="btn-danger flex-1"
                         >
                           Remove member
                         </button>
                         <button onClick={() => setConfirmRemoveMemberId(null)} className="btn-secondary">
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {showSettleUpModal && (() => {
+                const unsettled = memberBalances.filter(m => Math.abs(m.balance) >= 1)
+                const validLegs = settleUpLegs.filter(leg => settleUpLegCents(leg) > 0)
+                const allSettled = memberBalances.every(
+                  m => m.balance + settleUpNetCents(validLegs, m.user_id) === 0
+                )
+                const canSubmit = allSettled && validLegs.length > 0
+
+                return (
+                  <div className="modal-overlay">
+                    <div className="modal-panel">
+                      <h3 className="font-display text-xl font-semibold mb-4 flex items-center gap-2">
+                        Settle up
+                        <InfoTooltip label="How this affects balances">
+                          This creates one session that zeroes out every balance below, the same
+                          way recording a payment does. Reassign who pays whom below as needed —
+                          it just has to add up to everyone landing on $0.00. It won&apos;t change
+                          anyone&apos;s balance until they confirm — that way no one can clear a
+                          debt they still owe by just claiming it&apos;s settled.
+                        </InfoTooltip>
+                      </h3>
+
+                      {unsettled.length === 0 ? (
+                        <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                          Everyone&apos;s already settled up.
+                        </p>
+                      ) : (
+                        <>
+                          <p className="eyebrow mb-2">Balances</p>
+                          <div className="divide-y mb-4" style={{ borderColor: 'var(--border)' }}>
+                            {memberBalances.map((member) => {
+                              const remaining = member.balance + settleUpNetCents(validLegs, member.user_id)
+                              const isZero = remaining === 0
+                              return (
+                                <div key={member.user_id} className="flex items-center justify-between gap-4 py-3">
+                                  <div className="flex items-center gap-3">
+                                    <Avatar url={member.avatar_url} name={formatDisplayName(members, member)} size={32} />
+                                    <p className="text-sm font-medium">
+                                      {member.user_id === userId ? 'You' : formatDisplayName(members, member)}
+                                    </p>
+                                  </div>
+                                  <p
+                                    className="amount text-sm font-semibold"
+                                    style={{
+                                      color: isZero
+                                        ? 'var(--text-muted)'
+                                        : remaining > 0 ? 'var(--accent)' : 'var(--negative)',
+                                    }}
+                                  >
+                                    {remaining >= 0 ? '+' : ''}${(remaining / 100).toFixed(2)}
+                                  </p>
+                                </div>
+                              )
+                            })}
+                          </div>
+
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <p className="eyebrow">Payments</p>
+                            <button
+                              type="button"
+                              onClick={resetSettleUpLegsToSuggested}
+                              className="text-xs font-medium hover:underline shrink-0"
+                              style={{ color: 'var(--accent)' }}
+                            >
+                              Reset to suggested
+                            </button>
+                          </div>
+                          <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+                            These are the real payments members will make (Venmo, cash, etc).
+                            Each row moves the two balances above — edit, remove, or add rows
+                            until every balance up top reads $0.00.
+                          </p>
+
+                          <div className="space-y-2 mb-2">
+                            {settleUpLegs.map((leg) => (
+                              <div key={leg.id} className="flex flex-wrap items-center gap-2">
+                                <select
+                                  value={leg.from ?? ''}
+                                  onChange={(e) =>
+                                    updateSettleUpLeg(leg.id, { from: e.target.value ? Number(e.target.value) : null })
+                                  }
+                                  className="field text-sm flex-1 min-w-0"
+                                  aria-label="Who pays"
+                                >
+                                  <option value="" disabled>Who pays?</option>
+                                  {activeMembers.map((m) => (
+                                    <option key={m.user_id} value={m.user_id} disabled={m.user_id === leg.to}>
+                                      {m.user_id === userId ? 'You' : formatDisplayName(members, m)}
+                                    </option>
+                                  ))}
+                                </select>
+                                <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+                                  pays
+                                </span>
+                                <select
+                                  value={leg.to ?? ''}
+                                  onChange={(e) =>
+                                    updateSettleUpLeg(leg.id, { to: e.target.value ? Number(e.target.value) : null })
+                                  }
+                                  className="field text-sm flex-1 min-w-0"
+                                  aria-label="Who receives it"
+                                >
+                                  <option value="" disabled>Who receives?</option>
+                                  {activeMembers.map((m) => (
+                                    <option key={m.user_id} value={m.user_id} disabled={m.user_id === leg.from}>
+                                      {m.user_id === userId ? 'You' : formatDisplayName(members, m)}
+                                    </option>
+                                  ))}
+                                </select>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  value={leg.amount}
+                                  onChange={(e) => updateSettleUpLeg(leg.id, { amount: e.target.value })}
+                                  onWheel={blockNumberScroll}
+                                  placeholder="0.00"
+                                  aria-label="Amount"
+                                  className="field amount text-sm shrink-0"
+                                  style={{ width: '6.5rem' }}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeSettleUpLeg(leg.id)}
+                                  className="shrink-0 text-sm"
+                                  style={{ color: 'var(--text-muted)' }}
+                                  aria-label="Remove payment"
+                                  title="Remove payment"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={addSettleUpLeg}
+                            className="text-xs font-medium hover:underline mb-4"
+                            style={{ color: 'var(--accent)' }}
+                          >
+                            + Add payment
+                          </button>
+
+                          {!allSettled && (
+                            <p className="text-xs mb-4" style={{ color: 'var(--negative)' }}>
+                              Adjust the payments above until everyone&apos;s balance reaches $0.00.
+                            </p>
+                          )}
+                        </>
+                      )}
+
+                      <div className="flex gap-2">
+                        {unsettled.length > 0 && (
+                          <button
+                            onClick={handleSettleUp}
+                            disabled={isSubmittingSettleUp || !canSubmit}
+                            className="btn-primary flex-1"
+                            title={canSubmit ? undefined : "Adjust the payments so every balance reaches $0.00"}
+                          >
+                            {isSubmittingSettleUp ? 'Requesting…' : 'Settle up'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setShowSettleUpModal(false)}
+                          className="btn-secondary"
+                          disabled={isSubmittingSettleUp}
+                        >
                           Cancel
                         </button>
                       </div>
@@ -3061,6 +4270,7 @@ export default function GroupDetailPage() {
                             value={splitTotalAmount}
                             onChange={(e) => setSplitTotalAmount(e.target.value)}
                             onKeyDown={blockNumberArrowKeys}
+                            onWheel={blockNumberScroll}
                             className="field amount no-spinner w-28 px-2 py-1"
                             placeholder="0.00"
                           />
@@ -3093,7 +4303,7 @@ export default function GroupDetailPage() {
                         </button>
                       </div>
                       <p className="text-xs mt-2" style={{ color: 'var(--text-muted)' }}>
-                        Add everyone splitting the bill below, then split the total evenly between them — you can still fine-tune any amount after.
+                        Add everyone splitting the bill below, then split the total evenly between them. you can still fine-tune any amount after.
                       </p>
                     </div>
 
@@ -3176,6 +4386,7 @@ export default function GroupDetailPage() {
                                   setSessionMembers(updated)
                                 }}
                                 onKeyDown={blockNumberArrowKeys}
+                                onWheel={blockNumberScroll}
                                 className="field amount no-spinner w-24 px-2 py-1"
                                 placeholder="0.00"
                                 required
@@ -3214,7 +4425,7 @@ export default function GroupDetailPage() {
                     </div>
 
                     <div className="flex gap-2">
-                      <button type="submit" className="btn-primary">
+                      <button type="submit" disabled={isBusy('createSession')} className="btn-primary">
                         {editingSessionId ? 'Update session' : 'Create session'}
                       </button>
                       <button
@@ -3372,6 +4583,7 @@ export default function GroupDetailPage() {
                                         e.stopPropagation()
                                         handleCloseLiveSession(session.id)
                                       }}
+                                      disabled={isBusy(`closeLiveSession:${session.id}`)}
                                       className="btn-danger text-sm py-1"
                                     >
                                       Close session
@@ -3387,7 +4599,7 @@ export default function GroupDetailPage() {
                                     className="btn-secondary text-sm py-1"
                                     style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
                                   >
-                                    {session.pendingIsDeletion ? 'Cancel deletion request' : 'Cancel edit'}
+                                    {cancelActionLabel(pendingSessionKind(session))}
                                   </button>
                                 )}
                                 {!session.is_live && !session.pendingApproval && !hasUndismissedRejection && !session.waitingForApproval && (
@@ -3397,6 +4609,7 @@ export default function GroupDetailPage() {
                                         e.stopPropagation()
                                         handleEditSession(session.id)
                                       }}
+                                      disabled={isBusy(`editSession:${session.id}`)}
                                       className="btn-secondary text-sm py-1"
                                     >
                                       Edit
@@ -3477,6 +4690,7 @@ export default function GroupDetailPage() {
                                       step="0.01"
                                       value={liveSessionAmount}
                                       onChange={(e) => setLiveSessionAmount(e.target.value)}
+                                      onWheel={blockNumberScroll}
                                       className="field amount flex-1"
                                       placeholder="0.00"
                                       autoFocus
@@ -3484,7 +4698,7 @@ export default function GroupDetailPage() {
                                     <button
                                       onClick={() => handleAddToLiveSession(session.id)}
                                       className="btn-primary"
-                                      disabled={liveSessionAmount === ''}
+                                      disabled={liveSessionAmount === '' || isBusy(`addToLiveSession:${session.id}`)}
                                     >
                                       {liveSessionAmount && session.userPayment !== null && session.userPayment !== undefined && parseFloat(liveSessionAmount) !== session.userPayment ? 'Update' : 'Save'}
                                     </button>
@@ -3541,6 +4755,7 @@ export default function GroupDetailPage() {
                     <div className="flex gap-2">
                       <button
                         onClick={() => handleCancelLiveSession(confirmCancelSessionId)}
+                        disabled={isBusy(`cancelLiveSession:${confirmCancelSessionId}`)}
                         className="btn-danger flex-1"
                       >
                         Cancel session
@@ -3563,6 +4778,7 @@ export default function GroupDetailPage() {
                     <div className="flex gap-2">
                       <button
                         onClick={() => handleDeleteSession(confirmDeleteSessionId)}
+                        disabled={isBusy(`deleteSession:${confirmDeleteSessionId}`)}
                         className="btn-danger flex-1"
                       >
                         Request deletion
@@ -3576,24 +4792,21 @@ export default function GroupDetailPage() {
               )}
 
               {confirmCancelEditSessionId !== null && (() => {
-                const isDeletionRequest = sessions.find(s => s.id === confirmCancelEditSessionId)?.pendingIsDeletion
+                const targetSession = sessions.find(s => s.id === confirmCancelEditSessionId)
+                const kind = pendingSessionKind(targetSession || {})
+                const copy = cancelActionCopy(kind)
                 return (
                   <div className="modal-overlay">
                     <div className="modal-panel">
-                      <h3 className="font-display text-xl font-semibold mb-2">
-                        {isDeletionRequest ? 'Cancel this deletion request?' : 'Cancel this edit?'}
-                      </h3>
-                      <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
-                        {isDeletionRequest
-                          ? 'The session will stay exactly as it is. Anyone who already approved or rejected the deletion will be notified that the request was cancelled.'
-                          : 'The session will keep its current amounts. Anyone who already approved or rejected your changes will be notified that the edit was cancelled.'}
-                      </p>
+                      <h3 className="font-display text-xl font-semibold mb-2">{copy.title}</h3>
+                      <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>{copy.body}</p>
                       <div className="flex gap-2">
                         <button
                           onClick={() => handleCancelEdit(confirmCancelEditSessionId)}
+                          disabled={isBusy(`cancelEdit:${confirmCancelEditSessionId}`)}
                           className="btn-danger flex-1"
                         >
-                          {isDeletionRequest ? 'Cancel deletion request' : 'Cancel edit'}
+                          {cancelActionLabel(kind)}
                         </button>
                         <button onClick={() => setConfirmCancelEditSessionId(null)} className="btn-secondary">
                           Keep waiting
@@ -3611,7 +4824,7 @@ export default function GroupDetailPage() {
                       {rejectingApproval.isDeletion ? 'Keep this session?' : 'Reject this edit?'}
                     </h3>
                     <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
-                      Let the editor know why — they&apos;ll see this on the rejection notice.
+                      Let the editor know why. they&apos;ll see this on the rejection notice.
                     </p>
                     <textarea
                       value={rejectReasonDraft}
@@ -3629,7 +4842,7 @@ export default function GroupDetailPage() {
                           handleRejectEdit(rejectingApproval.approvalId, rejectingApproval.sessionId, rejectingApproval.editorUserId, reason)
                           setRejectingApproval(null)
                         }}
-                        disabled={!rejectReasonDraft.trim()}
+                        disabled={!rejectReasonDraft.trim() || isBusy(`rejectEdit:${rejectingApproval.approvalId}`)}
                         className="btn-danger flex-1"
                       >
                         {rejectingApproval.isDeletion ? 'Keep session' : 'Reject'}
@@ -3671,7 +4884,7 @@ export default function GroupDetailPage() {
                         />
                       </div>
                       <div className="flex gap-2">
-                        <button type="submit" className="btn-primary flex-1">
+                        <button type="submit" disabled={isBusy('createLiveSession')} className="btn-primary flex-1">
                           Start session
                         </button>
                         <button
@@ -3698,9 +4911,9 @@ export default function GroupDetailPage() {
                 <h3 className="font-display text-xl font-semibold mb-4 flex items-center gap-2">
                   Make a payment
                   <InfoTooltip label="How this affects balances">
-                    This records money you already sent outside the app (Venmo, cash, etc.) —
+                    This records money you already sent outside the app (Venmo, cash, etc.).
                     Dues doesn&apos;t move money itself. It won&apos;t affect either balance until the
-                    other person confirms they received it — that way no one can clear their own
+                    other person confirms they received it. that way no one can clear their own
                     debt by just claiming a payment that didn&apos;t happen. Once confirmed, your
                     balance goes up (you owe less, or you&apos;re owed more) and theirs goes down by
                     the same amount.
@@ -3743,6 +4956,7 @@ export default function GroupDetailPage() {
                       min="0.01"
                       value={paymentAmount}
                       onChange={(e) => setPaymentAmount(e.target.value)}
+                      onWheel={blockNumberScroll}
                       className="field amount"
                       placeholder="0.00"
                       required
@@ -3851,16 +5065,14 @@ export default function GroupDetailPage() {
 
           {activeTab === 'info' && (
             <div>
-              <h2 className="font-display text-2xl font-semibold mb-6">{group.name || 'Group Info'}</h2>
+              <div className="flex items-center gap-2 mb-6 flex-wrap">
+                <h2 className="font-display text-2xl font-semibold">{group.name || 'Group Info'}</h2>
+                {isOwner && <span className="badge badge-accent">Owner</span>}
+              </div>
 
-              {/* Owner Information */}
-              {isOwner && (
-                <div className="mb-4">
-                  <span className="badge badge-accent">Owner</span>
-                </div>
-              )}
-
-              {/* Group Details */}
+              {/* Group Details — description isn't shown here anymore (see
+                  the group card on the home page instead); this stays
+                  numbers-only. */}
               <div className="card mb-6">
                 <p className="eyebrow mb-3">Group details</p>
                 <div>
@@ -3879,9 +5091,12 @@ export default function GroupDetailPage() {
                 </div>
               </div>
 
-              {/* Group Pin — the ticket stub signature */}
-              {group.pin && (
-                <div>
+              {/* Group Pin — the ticket stub signature. Hidden entirely for
+                  everyone once the owner disables it, rather than just greyed
+                  out — it no longer does anything, so showing it invites
+                  confused "why doesn't this work" support requests. */}
+              {group.pin && group.pin_enabled !== false && (
+                <div className="mb-6">
                   <p className="eyebrow mb-3">Group pin</p>
                   <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
                     Share this pin with others so they can join your group.
@@ -3892,12 +5107,390 @@ export default function GroupDetailPage() {
                         {showPin ? group.pin : '••••••'}
                       </p>
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 flex-wrap">
                       <button onClick={() => setShowPin(!showPin)} className="btn-secondary text-sm">
                         {showPin ? 'Hide' : 'Show'}
                       </button>
                       <button onClick={handleCopyPin} className="btn-primary text-sm">
                         Copy
+                      </button>
+                      {isOwner && (
+                        <>
+                          <button onClick={handleRegeneratePin} className="btn-secondary text-sm" disabled={pinActionLoading}>
+                            Regenerate
+                          </button>
+                          <button onClick={() => handleTogglePinEnabled(false)} className="btn-secondary text-sm" disabled={pinActionLoading}>
+                            Disable pin
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {isOwner && group.pin_enabled === false && (
+                <div className="card mb-6">
+                  <p className="eyebrow mb-3">Group pin</p>
+                  <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+                    The join pin is disabled — no one can use it to join this group right now.
+                  </p>
+                  <button onClick={() => handleTogglePinEnabled(true)} className="btn-primary text-sm" disabled={pinActionLoading}>
+                    Enable pin
+                  </button>
+                </div>
+              )}
+
+              {isOwner && (
+                <>
+                  {/* Banner — just a small thumbnail here, not the full-size
+                      hero (that's already visible for real at the top of
+                      the page). One settings row: icon on the left, status
+                      + actions on the right, all vertically centered — this
+                      card used to also hold the color swatch picker, but
+                      with that gone (photo-only now) a single row reads
+                      better than the icon-then-caption stack it was before. */}
+                  <div className="card mb-6">
+                    <p className="eyebrow mb-3">Group banner</p>
+                    <div className="flex items-center gap-4">
+                      <button
+                        type="button"
+                        onClick={() => bannerInputRef.current?.click()}
+                        disabled={uploadingBanner}
+                        className="relative rounded-md overflow-hidden shrink-0 disabled:opacity-50"
+                        style={{ width: 56, height: 56, background: 'var(--accent-soft)', border: '1px solid var(--border)' }}
+                        title={group.banner_url ? 'Change photo' : 'Upload a photo'}
+                      >
+                        {group.banner_url ? (
+                          // eslint-disable-next-line @next/next/no-img-element -- data: URL thumbnail, not worth next/image's optimizer here
+                          <img src={group.banner_url} alt="" className="w-full h-full object-cover" />
+                        ) : (
+                          <Camera size={18} className="mx-auto" style={{ color: 'var(--text-muted)' }} />
+                        )}
+                      </button>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium">
+                          {group.banner_url ? 'Shown at the top of the group page' : 'No banner set yet'}
+                        </p>
+                        <div className="flex items-center gap-3 text-xs mt-1">
+                          {uploadingBanner ? (
+                            <span style={{ color: 'var(--text-muted)' }}>Saving banner…</span>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => bannerInputRef.current?.click()}
+                                className="hover:underline font-medium"
+                                style={{ color: 'var(--accent)' }}
+                              >
+                                {group.banner_url ? 'Change photo' : 'Upload photo'}
+                              </button>
+                              {group.banner_url && (
+                                <button type="button" onClick={() => setConfirmRemoveBanner(true)} className="hover:underline" style={{ color: 'var(--text-muted)' }}>
+                                  Remove
+                                </button>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <input
+                      ref={bannerInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={handleBannerFileSelected}
+                      className="hidden"
+                    />
+                    {bannerError && !pendingBannerValue && (
+                      <p className="text-xs mt-2" style={{ color: 'var(--negative)' }}>{bannerError}</p>
+                    )}
+                  </div>
+
+                  {pendingBannerFile && (
+                    <BannerCropModal
+                      file={pendingBannerFile}
+                      onCancel={() => setPendingBannerFile(null)}
+                      onConfirm={handleBannerCropConfirm}
+                    />
+                  )}
+
+                  {pendingBannerValue && (
+                    <div className="modal-overlay">
+                      <div className="modal-panel">
+                        <h3 className="font-display text-xl font-semibold mb-2">Update group banner?</h3>
+                        <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+                          Here&apos;s how it&apos;ll look at the top of the group page.
+                        </p>
+                        <div className="rounded-lg overflow-hidden mb-4" style={{ height: 100, border: '1px solid var(--border)' }}>
+                          {/* eslint-disable-next-line @next/next/no-img-element -- data: URL preview, not worth next/image's optimizer here */}
+                          <img src={pendingBannerValue} alt="" className="w-full h-full object-cover" />
+                        </div>
+                        {bannerError && (
+                          <p className="text-xs mb-3" style={{ color: 'var(--negative)' }}>{bannerError}</p>
+                        )}
+                        <div className="flex gap-2">
+                          <button onClick={handleApproveBanner} className="btn-primary flex-1" disabled={uploadingBanner}>
+                            {uploadingBanner ? 'Saving…' : 'Save banner'}
+                          </button>
+                          <button onClick={handleCancelPendingBanner} className="btn-secondary" disabled={uploadingBanner}>
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {confirmRemoveBanner && (
+                    <div className="modal-overlay">
+                      <div className="modal-panel">
+                        <h3 className="font-display text-xl font-semibold mb-2">Remove group banner?</h3>
+                        <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                          You&apos;ll go back to no banner until you upload a new one.
+                        </p>
+                        <div className="flex gap-2">
+                          <button onClick={handleRemoveBanner} className="btn-danger flex-1" disabled={uploadingBanner}>
+                            {uploadingBanner ? 'Removing…' : 'Remove banner'}
+                          </button>
+                          <button onClick={() => setConfirmRemoveBanner(false)} className="btn-secondary" disabled={uploadingBanner}>
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Rename / description */}
+                  <div className="card mb-6">
+                    <p className="eyebrow mb-3">Edit group details</p>
+                    <form onSubmit={handleSaveGroupDetails} className="space-y-3">
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Group name</label>
+                        <input
+                          type="text"
+                          value={groupNameDraft}
+                          onChange={(e) => setGroupNameDraft(e.target.value)}
+                          className="field"
+                          placeholder="e.g., Apartment 4B"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Description (optional)</label>
+                        <textarea
+                          value={groupDescriptionDraft}
+                          onChange={(e) => setGroupDescriptionDraft(e.target.value)}
+                          className="field"
+                          rows={2}
+                          placeholder="What this group is for"
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        className="btn-primary text-sm"
+                        disabled={savingGroupDetails || (groupNameDraft.trim() === (group.name || '').trim() && groupDescriptionDraft.trim() === (group.description || '').trim())}
+                      >
+                        {savingGroupDetails ? 'Saving…' : 'Save changes'}
+                      </button>
+                    </form>
+                  </div>
+
+                  {/* Transfer ownership */}
+                  <div className="card mb-6">
+                    <p className="eyebrow mb-3">Transfer ownership</p>
+                    {activeMembers.filter(m => m.user_id !== userId).length === 0 ? (
+                      <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                        There&apos;s no one else in this group to transfer ownership to yet.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="text-sm mb-3" style={{ color: 'var(--text-muted)' }}>
+                          Makes someone else the owner. You&apos;ll become a regular member.
+                        </p>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <select
+                            value={transferTargetUserId ?? ''}
+                            onChange={(e) => setTransferTargetUserId(e.target.value ? Number(e.target.value) : null)}
+                            className="field px-2 py-1"
+                          >
+                            <option value="">Choose a member…</option>
+                            {activeMembers.filter(m => m.user_id !== userId).map((member) => (
+                              <option key={member.user_id} value={member.user_id}>
+                                {formatDisplayName(members, member)}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            onClick={() => setShowTransferConfirm(true)}
+                            className="btn-secondary text-sm"
+                            disabled={!transferTargetUserId}
+                          >
+                            Transfer ownership
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Danger zone */}
+                  <div className="card mb-6" style={{ borderColor: 'var(--negative)' }}>
+                    <p className="eyebrow mb-3" style={{ color: 'var(--negative)' }}>Danger zone</p>
+                    <div className="flex items-center justify-between gap-4 flex-wrap">
+                      <div>
+                        <p className="text-sm font-medium">Delete this group</p>
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                          Everyone loses access immediately. You can restore it later from your account Settings.
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setShowDeleteGroupConfirm(true)}
+                        className="btn-danger text-sm shrink-0"
+                      >
+                        Delete group
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Leave group — owners can't leave (someone has to hold the
+                  pin/settings) unless they transfer ownership first, and
+                  leave_group enforces the same $0-balance rule as removing a
+                  member, so this stays disabled until settled up too. */}
+              <div className="card mt-6">
+                <p className="eyebrow mb-3">Leave group</p>
+                {isOwner ? (
+                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                    As the owner, you can&apos;t leave this group. Transfer ownership to another member first, or delete the group instead.
+                  </p>
+                ) : (
+                  <>
+                    <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+                      You&apos;ll lose access to this group. Your balance must be $0.00 first. settle up before leaving.
+                    </p>
+                    <button
+                      onClick={() => setConfirmLeaveGroup(true)}
+                      className="btn-danger"
+                      disabled={Math.abs(netBalance) >= 1}
+                      title={Math.abs(netBalance) >= 1 ? 'Your balance must be $0.00 before you can leave' : undefined}
+                    >
+                      Leave group
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {confirmLeaveGroup && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">Leave {group.name || 'this group'}?</h3>
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                      You&apos;ll lose access right away, but your past sessions and payments stay untouched. You can request to rejoin later.
+                    </p>
+                    <div className="flex gap-2">
+                      <button onClick={handleLeaveGroup} className="btn-danger flex-1" disabled={leavingGroup}>
+                        {leavingGroup ? 'Leaving…' : 'Leave group'}
+                      </button>
+                      <button onClick={() => setConfirmLeaveGroup(false)} className="btn-secondary" disabled={leavingGroup}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {showTransferConfirm && transferTargetUserId && (() => {
+                const target = activeMembers.find(m => m.user_id === transferTargetUserId)
+                return (
+                  <div className="modal-overlay">
+                    <div className="modal-panel">
+                      <h3 className="font-display text-xl font-semibold mb-2">
+                        Transfer ownership to {target ? formatDisplayName(members, target) : 'this member'}?
+                      </h3>
+                      <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                        They&apos;ll become the owner of {group.name || 'this group'} and you&apos;ll become a regular member. This can be undone by them transferring it back.
+                      </p>
+                      <div className="flex gap-2">
+                        <button onClick={handleTransferOwnership} className="btn-primary flex-1" disabled={transferringOwnership}>
+                          {transferringOwnership ? 'Transferring…' : 'Transfer ownership'}
+                        </button>
+                        <button onClick={() => setShowTransferConfirm(false)} className="btn-secondary" disabled={transferringOwnership}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {showDeleteGroupConfirm && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">Delete {group.name || 'this group'}?</h3>
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                      Every member loses access right away, and it disappears from everyone&apos;s group list. You (as the owner) can restore it later from your account Settings.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleDeleteGroupConfirmClick}
+                        className="btn-danger flex-1"
+                        disabled={deletingGroup}
+                      >
+                        {deletingGroup ? 'Deleting…' : 'Delete group'}
+                      </button>
+                      <button
+                        onClick={() => setShowDeleteGroupConfirm(false)}
+                        className="btn-secondary"
+                        disabled={deletingGroup}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Extra step when the group isn't fully settled up — deleting
+                  doesn't require a $0 balance (unlike leaving/removal), but
+                  whatever anyone's still owed just disappears with the group,
+                  so that's worth a second, more explicit confirmation. */}
+              {showDeleteBalanceWarning && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2 flex items-center gap-2">
+                      <TriangleAlert size={20} style={{ color: 'var(--negative)' }} />
+                      Members still have a balance
+                    </h3>
+                    <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+                      Not everyone in {group.name || 'this group'} is settled up yet:
+                    </p>
+                    <div className="space-y-1 mb-4">
+                      {memberBalances.filter(m => Math.abs(m.balance) >= 1).map(m => (
+                        <div key={m.user_id} className="ledger-row">
+                          <span className="text-sm">{formatDisplayName(members, m)}</span>
+                          <span className="amount text-sm font-semibold" style={{ color: m.balance >= 0 ? 'var(--accent)' : 'var(--negative)' }}>
+                            {m.balance >= 0 ? '+' : ''}${(m.balance / 100).toFixed(2)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                      Deleting won&apos;t settle these — they just disappear along with the group.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleDeleteGroup}
+                        className="btn-danger flex-1"
+                        disabled={deletingGroup}
+                      >
+                        {deletingGroup ? 'Deleting…' : 'Delete anyway'}
+                      </button>
+                      <button
+                        onClick={() => setShowDeleteBalanceWarning(false)}
+                        className="btn-secondary"
+                        disabled={deletingGroup}
+                      >
+                        Cancel
                       </button>
                     </div>
                   </div>

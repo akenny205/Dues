@@ -12,3 +12,6 @@ ADD COLUMN IF NOT EXISTS avatar_url text;
 -- No new RLS policies needed — "Users can read all profiles" (broad SELECT)
 -- and "Users can update own profile" (self-only UPDATE), both already in
 -- 20260807000001_lockdown_rls.sql, cover this column the same as first_name/last_name.
+-- Those policies gate *whose* row can be written, not what goes in it — see
+-- 20260811000004_avatar_url_check_constraint.sql for the format/size check
+-- that does that part.

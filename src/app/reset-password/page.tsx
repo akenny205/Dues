@@ -52,6 +52,7 @@ export default function ResetPasswordPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (isLoading) return
 
     if (password.length < 6) {
       setMessage('Password must be at least 6 characters')

@@ -20,6 +20,7 @@ interface Group {
   pin?: string | null
   role?: string | null
   memberCount?: number
+  description?: string | null
 }
 
 // Connects the three steps in the landing page's workflow section — points
@@ -43,6 +44,8 @@ export default function HomePage() {
   const [joinError, setJoinError] = useState('')
   const [showCreateGroupModal, setShowCreateGroupModal] = useState(false)
   const [newGroupName, setNewGroupName] = useState('')
+  const [creatingGroup, setCreatingGroup] = useState(false)
+  const [joiningGroup, setJoiningGroup] = useState(false)
   const { toasts, showToast, dismiss } = useToast()
 
   const loadGroups = useCallback(async () => {
@@ -72,17 +75,20 @@ export default function HomePage() {
       const groupsList: (Group | null)[] = (memberData || [])
         .map((member: any) => {
           const group = member.Group
-          if (!group) return null
+          // A deleted group is a soft flag on the row, not an absence — filter
+          // it out here rather than ever showing it.
+          if (!group || group.deleted_at) return null
           return {
             id: group.id,
             name: group.name,
             created_at: group.created_at,
             created_by: group.created_by,
             pin: group.pin || null,
-            role: member.role || null
+            role: member.role || null,
+            description: group.description || null
           } as Group
         })
-      
+
       const mappedData: Group[] = groupsList
         .filter((g): g is Group => g !== null)
         .sort((a, b) => {
@@ -177,8 +183,9 @@ export default function HomePage() {
   }, [user, authLoading, router, loadGroups])
 
   const handleCreateGroup = async (name: string) => {
-    if (!name || !user) return
+    if (!name || !user || creatingGroup) return
 
+    setCreatingGroup(true)
     try {
       // Get or create user in User table
       console.log('Creating group - getting user ID for:', user.email)
@@ -243,6 +250,8 @@ export default function HomePage() {
     } catch (error) {
       console.error('Error creating group:', error)
       showToast('Failed to create group')
+    } finally {
+      setCreatingGroup(false)
     }
   }
 
@@ -255,10 +264,11 @@ export default function HomePage() {
 
   const handleJoinGroup = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!joinPin || !user) return
+    if (!joinPin || !user || joiningGroup) return
 
     setJoinError('')
-    
+    setJoiningGroup(true)
+
     try {
       // Get user ID
       const dbUserId = await getOrCreateUser(user)
@@ -305,7 +315,7 @@ export default function HomePage() {
         .maybeSingle()
 
       if (existingRequest) {
-        setJoinError('You already have a request pending for this group — waiting on the owner to approve it.')
+        setJoinError('You already have a request pending for this group. waiting on the owner to approve it.')
         return
       }
 
@@ -332,6 +342,8 @@ export default function HomePage() {
     } catch (error: any) {
       console.error('Error requesting to join group:', error)
       setJoinError(error.message || 'Failed to send join request')
+    } finally {
+      setJoiningGroup(false)
     }
   }
 
@@ -396,7 +408,6 @@ export default function HomePage() {
           {/* Hero Section */}
           <div className="grid lg:grid-cols-[1.1fr_0.9fr] gap-14 items-center mb-24">
             <div>
-              <p className="eyebrow mb-4">Group expenses, kept honest</p>
               <h2 className="font-display text-5xl sm:text-6xl font-semibold tracking-tight leading-[1.05] mb-6">
                 Split evenly.<br />Settle simply.
               </h2>
@@ -534,8 +545,8 @@ export default function HomePage() {
                   />
                 </div>
                 <div className="flex gap-2">
-                  <button type="submit" className="btn-primary flex-1">
-                    Create group
+                  <button type="submit" disabled={creatingGroup} className="btn-primary flex-1">
+                    {creatingGroup ? 'Creating…' : 'Create group'}
                   </button>
                   <button
                     type="button"
@@ -584,8 +595,8 @@ export default function HomePage() {
                   </div>
                 )}
                 <div className="flex gap-2">
-                  <button type="submit" className="btn-primary flex-1">
-                    Send request
+                  <button type="submit" disabled={joiningGroup} className="btn-primary flex-1">
+                    {joiningGroup ? 'Sending…' : 'Send request'}
                   </button>
                   <button
                     type="button"
@@ -619,21 +630,29 @@ export default function HomePage() {
                 href={`/groups/${group.id}`}
                 className="card flex items-center justify-between transition-colors hover:border-[var(--accent)]"
               >
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 min-w-0">
                   <div
                     className="w-9 h-9 rounded-full flex items-center justify-center font-display font-semibold text-sm shrink-0"
                     style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}
                   >
                     {(group.name || 'U').charAt(0).toUpperCase()}
                   </div>
-                  <div>
-                    <h3 className="font-semibold">{group.name || 'Untitled Group'}</h3>
+                  <div className="min-w-0">
+                    <h3 className="font-semibold truncate">{group.name || 'Untitled Group'}</h3>
+                    {/* The only place a group's description shows up now —
+                        dropped from the group page's own Info tab, which was
+                        just burying it. */}
+                    {group.description && (
+                      <p className="text-sm truncate" style={{ color: 'var(--text-muted)' }}>
+                        {group.description}
+                      </p>
+                    )}
                     <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
                       {group.memberCount || 0} {group.memberCount === 1 ? 'member' : 'members'}
                     </p>
                   </div>
                 </div>
-                {group.role === 'owner' && <span className="badge badge-accent">Owner</span>}
+                {group.role === 'owner' && <span className="badge badge-accent shrink-0">Owner</span>}
               </Link>
             ))}
           </div>

@@ -18,6 +18,7 @@ export default function AuthPanel() {
   const { user, loading, signOut } = useAuth()
   const router = useRouter()
   const [profile, setProfile] = useState<HeaderProfile | null>(null)
+  const [signingOut, setSigningOut] = useState(false)
 
   useEffect(() => {
     if (!user) return
@@ -43,6 +44,8 @@ export default function AuthPanel() {
   }
 
   const handleSignOut = async () => {
+    if (signingOut) return
+    setSigningOut(true)
     await signOut()
     // Redirect to home page (which will show landing page for unauthenticated users)
     router.push('/')
@@ -54,6 +57,7 @@ export default function AuthPanel() {
     <div className="flex items-center gap-4">
       <button
         onClick={handleSignOut}
+        disabled={signingOut}
         className="text-xs font-medium hover:underline"
         style={{ color: 'var(--text-muted)' }}
       >

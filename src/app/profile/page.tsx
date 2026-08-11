@@ -14,6 +14,12 @@ import { supabase } from '@/lib/supabase'
 import { getOrCreateUser } from '@/lib/userHelper'
 import { resizeImageToDataUrl } from '@/lib/avatar'
 
+interface DeletedGroup {
+  id: number
+  name: string | null
+  deleted_at: string
+}
+
 interface ProfileRow {
   first_name: string | null
   last_name: string | null
@@ -24,6 +30,7 @@ interface ProfileRow {
   cashapp_cashtag: string | null
   paypal_username: string | null
   zelle_handle: string | null
+  preferred_payment_method: string | null
 }
 
 type UsernameStatus = 'unchanged' | 'invalid' | 'checking' | 'available' | 'taken' | 'unknown'
@@ -43,6 +50,7 @@ export default function ProfilePage() {
 
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
   const [photoError, setPhotoError] = useState('')
+  const [confirmRemovePhoto, setConfirmRemovePhoto] = useState(false)
 
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
@@ -55,8 +63,12 @@ export default function ProfilePage() {
   const [cashapp, setCashapp] = useState('')
   const [paypal, setPaypal] = useState('')
   const [zelle, setZelle] = useState('')
+  const [preferredMethod, setPreferredMethod] = useState('')
   const [savingPayment, setSavingPayment] = useState(false)
   const [paymentError, setPaymentError] = useState('')
+
+  const [deletedGroups, setDeletedGroups] = useState<DeletedGroup[]>([])
+  const [restoringGroupId, setRestoringGroupId] = useState<number | null>(null)
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -76,7 +88,7 @@ export default function ProfilePage() {
       setUserId(id)
       const { data } = await supabase
         .from('User')
-        .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle')
+        .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle, preferred_payment_method')
         .eq('id', id)
         .maybeSingle()
       if (!mounted) return
@@ -88,12 +100,57 @@ export default function ProfilePage() {
       setCashapp(data?.cashapp_cashtag || '')
       setPaypal(data?.paypal_username || '')
       setZelle(data?.zelle_handle || '')
+      setPreferredMethod(data?.preferred_payment_method || '')
       setLoading(false)
     })
     return () => {
       mounted = false
     }
   }, [user])
+
+  // Groups you own that have been deleted (soft — see groups/[id]/page.tsx's
+  // handleDeleteGroup) sit here so they're reachable for restoring. They
+  // can't be reached from the group's own page anymore, since visiting a
+  // deleted group's page just redirects you away.
+  const loadDeletedGroups = async (ownerId: number) => {
+    const { data, error } = await supabase
+      .from('GroupMember')
+      .select('id, role, Group(*)')
+      .eq('user_id', ownerId)
+      .eq('role', 'owner')
+
+    if (error) {
+      console.error('Error loading deleted groups:', error)
+      return
+    }
+
+    const deleted = (data || [])
+      .map((m: any) => m.Group)
+      .filter((g: any) => g && g.deleted_at)
+      .map((g: any) => ({ id: g.id, name: g.name, deleted_at: g.deleted_at }))
+
+    setDeletedGroups(deleted)
+  }
+
+  useEffect(() => {
+    if (userId) loadDeletedGroups(userId)
+  }, [userId])
+
+  const handleRestoreGroup = async (groupId: number) => {
+    if (restoringGroupId !== null) return
+    setRestoringGroupId(groupId)
+    try {
+      const { error } = await supabase.rpc('restore_group', { target_group_id: groupId })
+      if (error) throw error
+      setDeletedGroups((prev) => prev.filter((g) => g.id !== groupId))
+      showToast('Group restored.')
+    } catch (error: any) {
+      console.error('Error restoring group:', error)
+      showToast('Failed to restore group: ' + (error.message || 'Unknown error'))
+    } finally {
+      setRestoringGroupId(null)
+    }
+  }
 
   // Debounced availability check as you type a new username — mirrors the
   // check used at signup (src/app/login/page.tsx), but excludes your own row.
@@ -136,7 +193,7 @@ export default function ProfilePage() {
   const handlePhotoPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = '' // allow picking the same file again later
-    if (!file || !userId) return
+    if (!file || !userId || uploadingPhoto) return
 
     setPhotoError('')
     setUploadingPhoto(true)
@@ -154,7 +211,8 @@ export default function ProfilePage() {
   }
 
   const handleRemovePhoto = async () => {
-    if (!userId) return
+    if (!userId || uploadingPhoto) return
+    setConfirmRemovePhoto(false)
     setPhotoError('')
     setUploadingPhoto(true)
     try {
@@ -171,7 +229,7 @@ export default function ProfilePage() {
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!userId || !profile) return
+    if (!userId || !profile || savingProfile) return
 
     const trimmedUsername = username.trim()
     if (trimmedUsername.length < 3) {
@@ -183,7 +241,7 @@ export default function ProfilePage() {
       return
     }
     if (usernameStatus === 'checking') {
-      setProfileError('Still checking that username — try again in a moment')
+      setProfileError('Still checking that username. try again in a moment')
       return
     }
 
@@ -218,16 +276,19 @@ export default function ProfilePage() {
 
   const handleSavePayment = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!userId) return
+    if (!userId || savingPayment) return
 
     setSavingPayment(true)
     setPaymentError('')
 
+    const handlesByMethod: Record<string, string> = { venmo, cashapp, paypal, zelle }
     const patch = {
       venmo_username: venmo.trim() || null,
       cashapp_cashtag: cashapp.trim() || null,
       paypal_username: paypal.trim() || null,
       zelle_handle: zelle.trim() || null,
+      // Can't stay "preferred" if its own handle just got cleared out.
+      preferred_payment_method: preferredMethod && handlesByMethod[preferredMethod].trim() ? preferredMethod : null,
     }
     const { error } = await supabase.from('User').update(patch).eq('id', userId)
     setSavingPayment(false)
@@ -239,6 +300,7 @@ export default function ProfilePage() {
     }
 
     setProfile((prev) => (prev ? { ...prev, ...patch } : prev))
+    setPreferredMethod(patch.preferred_payment_method || '')
     showToast('Payment methods saved')
   }
 
@@ -282,7 +344,7 @@ export default function ProfilePage() {
       case 'invalid':
         return { text: 'Must be at least 3 characters', color: 'var(--negative)' }
       case 'unknown':
-        return { text: 'Could not check availability — try again', color: 'var(--negative)' }
+        return { text: 'Could not check availability. try again', color: 'var(--negative)' }
       default:
         return null
     }
@@ -332,7 +394,7 @@ export default function ProfilePage() {
           <div className="mt-2 flex items-center gap-2 text-xs">
             {uploadingPhoto && <span style={{ color: 'var(--text-muted)' }}>Saving photo…</span>}
             {!uploadingPhoto && profile.avatar_url && (
-              <button type="button" onClick={handleRemovePhoto} className="hover:underline" style={{ color: 'var(--text-muted)' }}>
+              <button type="button" onClick={() => setConfirmRemovePhoto(true)} className="hover:underline" style={{ color: 'var(--text-muted)' }}>
                 Remove photo
               </button>
             )}
@@ -341,6 +403,25 @@ export default function ProfilePage() {
             <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>{photoError}</p>
           )}
         </div>
+
+        {confirmRemovePhoto && (
+          <div className="modal-overlay">
+            <div className="modal-panel">
+              <h3 className="font-display text-xl font-semibold mb-2">Remove profile photo?</h3>
+              <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                You&apos;ll go back to a plain initial until you upload a new one.
+              </p>
+              <div className="flex gap-2">
+                <button onClick={handleRemovePhoto} className="btn-danger flex-1" disabled={uploadingPhoto}>
+                  {uploadingPhoto ? 'Removing…' : 'Remove photo'}
+                </button>
+                <button onClick={() => setConfirmRemovePhoto(false)} className="btn-secondary" disabled={uploadingPhoto}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Profile info */}
         <div className="card">
@@ -419,8 +500,7 @@ export default function ProfilePage() {
         <div className="card">
           <p className="eyebrow mb-3">Payment methods</p>
           <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
-            Add the handles group-mates can use to pay you back. Dues just links out to these apps —
-            it never touches your money.
+            Add the handles group-mates can use to pay you back. Dues just links out to these apps.
           </p>
           <form onSubmit={handleSavePayment} className="space-y-4">
             <div>
@@ -467,7 +547,26 @@ export default function ProfilePage() {
                 placeholder="you@example.com"
               />
               <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-                Zelle doesn&apos;t support pay links — group-mates will copy this into their own banking app.
+                Zelle doesn&apos;t support pay links. Group-mates must copy this into their own banking app.
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="preferredMethod" className="block text-sm font-medium mb-1">Preferred method</label>
+              <select
+                id="preferredMethod"
+                value={preferredMethod}
+                onChange={(e) => setPreferredMethod(e.target.value)}
+                className="field"
+              >
+                <option value="">No preference</option>
+                {venmo.trim() && <option value="venmo">Venmo</option>}
+                {cashapp.trim() && <option value="cashapp">Cash App</option>}
+                {paypal.trim() && <option value="paypal">PayPal</option>}
+                {zelle.trim() && <option value="zelle">Zelle</option>}
+              </select>
+              <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                Shown first to group-mates paying you back. Only methods with a handle above are selectable.
               </p>
             </div>
 
@@ -482,6 +581,37 @@ export default function ProfilePage() {
             </button>
           </form>
         </div>
+
+        {/* Deleted groups you own — a deleted group bounces anyone away the
+            moment its own page loads, so this is the only place left to
+            bring one back. */}
+        {deletedGroups.length > 0 && (
+          <div className="card">
+            <p className="eyebrow mb-1">Archived Groups</p>
+            <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+              Groups you deleted stay here so you can bring them back. Nothing was lost — members, sessions, and payment history are all still there.
+            </p>
+            <div className="space-y-3">
+              {deletedGroups.map((g) => (
+                <div key={g.id} className="flex items-center justify-between gap-4 flex-wrap">
+                  <div>
+                    <p className="text-sm font-medium">{g.name || 'Untitled Group'}</p>
+                    <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                      Deleted {new Date(g.deleted_at).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleRestoreGroup(g.id)}
+                    className="btn-secondary text-sm shrink-0"
+                    disabled={restoringGroupId === g.id}
+                  >
+                    {restoringGroupId === g.id ? 'Restoring…' : 'Restore'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Room for what's next — notifications, theme, account controls.
             Kept as an honest placeholder rather than wiring up toggles that

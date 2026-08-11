@@ -29,8 +29,8 @@ export const mockUsers = [
 ]
 
 export const mockGroups = [
-  { id: 1, created_at: daysAgo(90), name: 'Apartment 4B', created_by: 1, pin: '482913' },
-  { id: 2, created_at: daysAgo(20), name: 'Cabin Trip', created_by: 6, pin: '119284' },
+  { id: 1, created_at: daysAgo(90), name: 'Apartment 4B', created_by: 1, pin: '482913', description: 'Shared bills for 4B — rent split separately.', pin_enabled: true, deleted_at: null as string | null, banner_url: null as string | null },
+  { id: 2, created_at: daysAgo(20), name: 'Cabin Trip', created_by: 6, pin: '119284', description: null as string | null, pin_enabled: true, deleted_at: null as string | null, banner_url: null as string | null },
 ]
 
 export const mockGroupMembers = [
@@ -50,12 +50,12 @@ export const mockJoinRequests = [
 export const mockInvites: Array<{ id: number; created_at: string; group_id: number; email: string; token: string; expires_at: string | null; accepted_at: string | null; invited_by: number | null }> = []
 
 export const mockSessions = [
-  { id: 101, created_at: daysAgo(12), group_id: 1, Description: 'Costco run', is_live: false, is_payment: false, created_by: 2, notes: 'Included the big pack of paper towels + laundry detergent — split the usual way.' },
-  { id: 102, created_at: daysAgo(8), group_id: 1, Description: 'Electric bill — January', is_live: false, is_payment: false, created_by: 3, notes: null },
-  { id: 103, created_at: daysAgo(8), group_id: 1, Description: 'Internet bill — January', is_live: false, is_payment: false, created_by: 1, notes: null },
+  { id: 101, created_at: daysAgo(12), group_id: 1, Description: 'Costco run', is_live: false, is_payment: false, created_by: 2, notes: 'Included the big pack of paper towels + laundry detergent. split the usual way.' },
+  { id: 102, created_at: daysAgo(8), group_id: 1, Description: 'Electric bill. January', is_live: false, is_payment: false, created_by: 3, notes: null },
+  { id: 103, created_at: daysAgo(8), group_id: 1, Description: 'Internet bill. January', is_live: false, is_payment: false, created_by: 1, notes: null },
   { id: 104, created_at: daysAgo(5), group_id: 1, Description: 'Payment from Jordan R. to Alex C.', is_live: false, is_payment: true, created_by: 2, notes: null },
   { id: 105, created_at: daysAgo(2), group_id: 1, Description: 'Weekend groceries', is_live: true, is_payment: false, created_by: 1, notes: null },
-  { id: 106, created_at: daysAgo(6), group_id: 1, Description: 'Gas bill — January', is_live: false, is_payment: false, created_by: 4, notes: 'Recalculated after finding the actual bill — sorry for the mix-up!' },
+  { id: 106, created_at: daysAgo(6), group_id: 1, Description: 'Gas bill. January', is_live: false, is_payment: false, created_by: 4, notes: 'Recalculated after finding the actual bill. sorry for the mix-up!' },
   { id: 107, created_at: daysAgo(3), group_id: 1, Description: 'Streaming subscriptions', is_live: false, is_payment: false, created_by: 1, notes: null },
   { id: 108, created_at: daysAgo(4), group_id: 1, Description: 'Cleaning supplies', is_live: false, is_payment: false, created_by: 1, notes: null },
   { id: 201, created_at: daysAgo(15), group_id: 2, Description: 'Cabin rental', is_live: false, is_payment: false, created_by: 6, notes: null },

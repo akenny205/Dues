@@ -17,6 +17,7 @@ export default function InviteAcceptPage() {
   const [invite, setInvite] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
+  const [accepting, setAccepting] = useState(false)
 
   useEffect(() => {
     if (authLoading) return
@@ -80,8 +81,9 @@ export default function InviteAcceptPage() {
   }
 
   const handleAcceptInvite = async () => {
-    if (!user || !invite) return
+    if (!user || !invite || accepting) return
 
+    setAccepting(true)
     try {
       // Get or create user
       const dbUserId = await getOrCreateUser(user)
@@ -141,6 +143,8 @@ export default function InviteAcceptPage() {
     } catch (error: any) {
       console.error('Error accepting invite:', error)
       setError(error.message || 'Failed to accept invite')
+    } finally {
+      setAccepting(false)
     }
   }
 
@@ -195,8 +199,8 @@ export default function InviteAcceptPage() {
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Invited by {invite.email}</p>
           </div>
         </div>
-        <button onClick={handleAcceptInvite} className="btn-primary w-full">
-          Accept invitation
+        <button onClick={handleAcceptInvite} disabled={accepting} className="btn-primary w-full">
+          {accepting ? 'Joining…' : 'Accept invitation'}
         </button>
         <Link href="/" className="block text-center mt-4 text-sm hover:underline" style={{ color: 'var(--text-muted)' }}>
           Cancel

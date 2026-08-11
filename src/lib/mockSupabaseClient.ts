@@ -197,10 +197,29 @@ class MockQueryBuilder {
 
 // --- RPC handlers -----------------------------------------------------
 
+// Mirrors generate_group_pin() from the group_pin migration.
+function generateMockPin(): string {
+  let pin: string
+  do {
+    pin = Math.floor(Math.random() * 1000000).toString().padStart(6, '0')
+  } while (mockGroups.some((g) => g.pin === pin))
+  return pin
+}
+
+// Mirrors is_group_owner(): the caller must be the *active* owner row for this group.
+function callerOwnsGroup(groupId: number): { callerUserId: number | null; owns: boolean } {
+  const caller = mockUsers.find((u) => u.auth_user_id === currentAuthUserId)
+  if (!caller) return { callerUserId: null, owns: false }
+  const membership = mockGroupMembers.find((m) => m.id === groupId && m.user_id === caller.id)
+  return { callerUserId: caller.id, owns: !!membership && membership.role === 'owner' && membership.status === 'active' }
+}
+
 function rpc(name: string, params: Row) {
   switch (name) {
     case 'find_group_by_pin': {
-      const match = mockGroups.filter((g) => g.pin === params.input_pin).map((g) => ({ id: g.id, name: g.name }))
+      const match = mockGroups
+        .filter((g) => g.pin === params.input_pin && g.pin_enabled !== false && !g.deleted_at)
+        .map((g) => ({ id: g.id, name: g.name }))
       return { data: match, error: null }
     }
     case 'find_invite_by_token': {
@@ -248,6 +267,73 @@ function rpc(name: string, params: Row) {
         return { data: null, error: { message: `This member's balance must be $0.00 before they can be removed (currently $${balance.toFixed(2)})` } }
       }
       member.status = 'removed'
+      return { data: null, error: null }
+    }
+    case 'update_group_details': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can change group details' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      const newName = (params.new_name ?? '').trim()
+      if (!newName) return { data: null, error: { message: 'Group name cannot be empty' } }
+      group.name = newName
+      group.description = (params.new_description ?? '').trim() || null
+      return { data: null, error: null }
+    }
+    case 'update_group_banner': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can change the group banner' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      group.banner_url = params.new_banner_url ?? null
+      return { data: null, error: null }
+    }
+    case 'regenerate_group_pin': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can regenerate the join pin' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      group.pin = generateMockPin()
+      return { data: group.pin, error: null }
+    }
+    case 'set_group_pin_enabled': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can enable or disable the join pin' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      group.pin_enabled = !!params.enabled
+      return { data: null, error: null }
+    }
+    case 'delete_group': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can delete this group' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      // Soft delete — flips the flag, nothing is actually removed.
+      group.deleted_at = new Date().toISOString()
+      return { data: null, error: null }
+    }
+    case 'restore_group': {
+      const { owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns) return { data: null, error: { message: 'Only the group owner can restore this group' } }
+      const group = mockGroups.find((g) => g.id === params.target_group_id) as Row | undefined
+      if (!group) return { data: null, error: { message: 'Group not found' } }
+      group.deleted_at = null
+      return { data: null, error: null }
+    }
+    case 'transfer_group_ownership': {
+      const { callerUserId, owns } = callerOwnsGroup(params.target_group_id)
+      if (!owns || callerUserId == null) return { data: null, error: { message: 'Only the group owner can transfer ownership' } }
+      if (params.new_owner_user_id === callerUserId) {
+        return { data: null, error: { message: 'You are already the owner' } }
+      }
+      const newOwner = mockGroupMembers.find((m) => m.id === params.target_group_id && m.user_id === params.new_owner_user_id)
+      if (!newOwner || newOwner.status !== 'active') {
+        return { data: null, error: { message: 'That person is not an active member of this group' } }
+      }
+      const currentOwner = mockGroupMembers.find((m) => m.id === params.target_group_id && m.user_id === callerUserId)
+      newOwner.role = 'owner'
+      if (currentOwner) currentOwner.role = 'member'
       return { data: null, error: null }
     }
     case 'update_session_notes': {
@@ -305,7 +391,7 @@ function signInAsEmail(email: string) {
   if (!mockUser) {
     return {
       data: { session: null, user: null },
-      error: { message: 'No demo account with that email. See README-DEMO.md for the list of demo accounts — any password works.' },
+      error: { message: 'No demo account with that email. See README-DEMO.md for the list of demo accounts. any password works.' },
     }
   }
   currentAuthUserId = mockUser.auth_user_id

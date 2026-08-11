@@ -16,6 +16,7 @@ interface ProfileRow {
   cashapp_cashtag: string | null
   paypal_username: string | null
   zelle_handle: string | null
+  preferred_payment_method: string | null
 }
 
 interface ProfileModalProps {
@@ -49,7 +50,7 @@ export default function ProfileModal({ userId, currentUserId, onClose, amount, n
     let mounted = true
     supabase
       .from('User')
-      .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle')
+      .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle, preferred_payment_method')
       .eq('id', userId)
       .maybeSingle()
       .then(({ data }: { data: ProfileRow | null }) => {
@@ -86,12 +87,32 @@ export default function ProfileModal({ userId, currentUserId, onClose, amount, n
             <p className="eyebrow mb-3">Payment methods</p>
             {hasAnyPaymentMethod(profile) ? (
               <div className="flex flex-wrap gap-1.5 mb-6">
+                {profile.zelle_handle && profile.preferred_payment_method === 'zelle' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(profile.zelle_handle!)
+                      setZelleCopied(true)
+                    }}
+                    className="pay-pill"
+                    style={{ borderColor: 'var(--accent)', color: 'var(--accent)' }}
+                  >
+                    {zelleCopied ? 'Copied!' : 'Copy Zelle (preferred)'}
+                  </button>
+                )}
                 {getPayLinks(profile, amount, note).map((link) => (
-                  <a key={link.key} href={link.url} target="_blank" rel="noopener noreferrer" className="pay-pill">
-                    Pay via {link.label}
+                  <a
+                    key={link.key}
+                    href={link.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="pay-pill"
+                    style={link.preferred ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined}
+                  >
+                    Pay via {link.label}{link.preferred ? ' (preferred)' : ''}
                   </a>
                 ))}
-                {profile.zelle_handle && (
+                {profile.zelle_handle && profile.preferred_payment_method !== 'zelle' && (
                   <button
                     type="button"
                     onClick={() => {

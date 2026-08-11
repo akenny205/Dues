@@ -209,6 +209,17 @@ body {
     opacity: 0.7;
   }
 
+  /* Hides the native up/down steppers on a number input — used on dollar
+     amount fields, where nudging by $0.01 at a time isn't a real workflow. */
+  .no-spinner::-webkit-outer-spin-button,
+  .no-spinner::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .no-spinner {
+    -moz-appearance: textfield;
+  }
+
   /* Icon button inset inside a field — e.g. the password visibility
      toggle. Sits in the input's own padding rather than beside it. */
   .field-icon-btn {

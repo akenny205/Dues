@@ -81,6 +81,17 @@ interface GroupMember {
   avatar_url?: string | null
 }
 
+// Blocks the Up/Down arrow keys on a number input. The CSS that hides the
+// spinner buttons (`.no-spinner`) doesn't stop the browser from still
+// stepping the value by 1 cent on arrow-key presses — this is the other
+// half of that, for amount fields where nudging by a cent isn't a real
+// workflow.
+const blockNumberArrowKeys = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    e.preventDefault()
+  }
+}
+
 // Helper function to format names: "First L." with last initial only if duplicate
 // first names — and "First Last" (full last name) if the last initial alone
 // still wouldn't tell them apart (e.g. "Andrew Kenn" vs. "Andrew Kenny").
@@ -147,6 +158,8 @@ export default function GroupDetailPage() {
   const [sessionDescription, setSessionDescription] = useState('')
   const [sessionMembers, setSessionMembers] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: string }>>([])
   const [showMemberDropdown, setShowMemberDropdown] = useState(false)
+  const [splitTotalAmount, setSplitTotalAmount] = useState('')
+  const [splitPayerId, setSplitPayerId] = useState<number | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: number }>>([])
   const [selectedLiveSession, setSelectedLiveSession] = useState<number | null>(null)
   const [liveSessionAmount, setLiveSessionAmount] = useState('')
@@ -854,6 +867,8 @@ export default function GroupDetailPage() {
     }
     setEditingSessionId(null)
     setSessionDescription('')
+    setSplitTotalAmount('')
+    setSplitPayerId(userId)
     setShowAddSession(true)
   }
 
@@ -938,6 +953,8 @@ export default function GroupDetailPage() {
 
       setSessionDescription(sessionData.Description || '')
       setSessionMembers(paymentsWithUserInfo)
+      setSplitTotalAmount('')
+      setSplitPayerId(paymentsWithUserInfo.some((p: any) => p.user_id === userId) ? userId : (paymentsWithUserInfo[0]?.user_id ?? null))
       // Store original payments for comparison when saving
       setOriginalPayments((paymentsData || []).map((p: any) => ({
         user_id: p.user_id,
@@ -979,6 +996,9 @@ export default function GroupDetailPage() {
           last_name: memberToAdd.last_name || '',
           amount: ''
         }])
+        // Default the quick-split payer to someone actually in the session
+        // once there's a candidate, rather than leaving the dropdown blank.
+        setSplitPayerId(prev => prev ?? userId ?? memberToAdd.user_id)
         setShowMemberDropdown(false)
       }
     } else {
@@ -989,6 +1009,59 @@ export default function GroupDetailPage() {
 
   const handleRemoveMemberFromSession = (user_id: number) => {
     setSessionMembers(sessionMembers.filter(sm => sm.user_id !== user_id))
+    if (splitPayerId === user_id) {
+      setSplitPayerId(null)
+    }
+  }
+
+  // Fills in every member's amount from a total + a payer instead of making
+  // the user do the division themselves. Works in integer cents so the split
+  // always lands on an exact $0.00 sum (session amounts must net to zero) —
+  // any odd cents from an uneven division are handed out one at a time
+  // starting with the payer, and everyone's individual share is still
+  // editable afterward for an uneven split.
+  const handleSplitEvenly = () => {
+    const totalValue = parseFloat(splitTotalAmount)
+    if (!splitTotalAmount || isNaN(totalValue) || totalValue <= 0) {
+      showToast('Enter a total amount to split')
+      return
+    }
+    if (sessionMembers.length < 2) {
+      showToast('Add at least 2 members to split a payment between them')
+      return
+    }
+    const payerId = splitPayerId ?? sessionMembers[0].user_id
+    if (!sessionMembers.some(sm => sm.user_id === payerId)) {
+      showToast('Choose who paid')
+      return
+    }
+
+    const totalCents = Math.round(totalValue * 100)
+    const n = sessionMembers.length
+    const baseShareCents = Math.floor(totalCents / n)
+    let remainderCents = totalCents - baseShareCents * n
+
+    // Hand out the leftover pennies one at a time, starting with the payer,
+    // so the shares differ by at most a cent from each other.
+    const orderedIds = [payerId, ...sessionMembers.filter(sm => sm.user_id !== payerId).map(sm => sm.user_id)]
+    const shareCentsByUser = new Map<number, number>()
+    for (const id of orderedIds) {
+      const extra = remainderCents > 0 ? 1 : 0
+      if (extra) remainderCents -= 1
+      shareCentsByUser.set(id, baseShareCents + extra)
+    }
+
+    const updated = sessionMembers.map(sm => {
+      if (sm.user_id === payerId) {
+        // The payer fronted the whole bill, so they're owed back everyone
+        // else's share — their own share cancels out of what they front.
+        const owedToPayerCents = totalCents - (shareCentsByUser.get(payerId) || 0)
+        return { ...sm, amount: (owedToPayerCents / 100).toFixed(2) }
+      }
+      const shareCents = shareCentsByUser.get(sm.user_id) || 0
+      return { ...sm, amount: (-shareCents / 100).toFixed(2) }
+    })
+    setSessionMembers(updated)
   }
 
   // The one primitive that actually attributes a payment to the database: set this
@@ -1562,6 +1635,8 @@ export default function GroupDetailPage() {
       // Reset form and reload
       setSessionDescription('')
       setSessionMembers([])
+      setSplitTotalAmount('')
+      setSplitPayerId(null)
       setOriginalPayments([])
       setEditingSessionId(null)
       setViewingSessionId(null)
@@ -2974,6 +3049,54 @@ export default function GroupDetailPage() {
                       />
                     </div>
 
+                    <div className="p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
+                      <label className="block text-sm font-medium mb-2">Quick split</label>
+                      <div className="flex flex-wrap items-end gap-2">
+                        <div>
+                          <label className="block text-xs mb-1" style={{ color: 'var(--text-muted)' }}>Total amount</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={splitTotalAmount}
+                            onChange={(e) => setSplitTotalAmount(e.target.value)}
+                            onKeyDown={blockNumberArrowKeys}
+                            className="field amount no-spinner w-28 px-2 py-1"
+                            placeholder="0.00"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs mb-1" style={{ color: 'var(--text-muted)' }}>Paid by</label>
+                          <select
+                            value={splitPayerId ?? ''}
+                            onChange={(e) => setSplitPayerId(e.target.value ? Number(e.target.value) : null)}
+                            className="field px-2 py-1"
+                            disabled={sessionMembers.length === 0}
+                          >
+                            {sessionMembers.length === 0 && <option value="">Add members first</option>}
+                            {sessionMembers.map(sm => {
+                              const member = members.find(m => m.user_id === sm.user_id)
+                              const displayName = member ? formatDisplayName(members, member) : sm.username
+                              return (
+                                <option key={sm.user_id} value={sm.user_id}>{displayName}</option>
+                              )
+                            })}
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleSplitEvenly}
+                          className="btn-secondary text-sm py-1"
+                          disabled={sessionMembers.length < 2 || !splitTotalAmount}
+                        >
+                          Split evenly
+                        </button>
+                      </div>
+                      <p className="text-xs mt-2" style={{ color: 'var(--text-muted)' }}>
+                        Add everyone splitting the bill below, then split the total evenly between them — you can still fine-tune any amount after.
+                      </p>
+                    </div>
+
                     <div>
                       <div className="flex items-center justify-between mb-2">
                         <label className="block text-sm font-medium">Members & amounts</label>
@@ -3052,7 +3175,8 @@ export default function GroupDetailPage() {
                                   )
                                   setSessionMembers(updated)
                                 }}
-                                className="field amount w-24 px-2 py-1"
+                                onKeyDown={blockNumberArrowKeys}
+                                className="field amount no-spinner w-24 px-2 py-1"
                                 placeholder="0.00"
                                 required
                               />
@@ -3099,6 +3223,8 @@ export default function GroupDetailPage() {
                           setShowAddSession(false)
                           setSessionDescription('')
                           setSessionMembers([])
+                          setSplitTotalAmount('')
+                          setSplitPayerId(null)
                           setEditingSessionId(null)
                           setViewingSessionId(null)
                           setShowMemberDropdown(false)

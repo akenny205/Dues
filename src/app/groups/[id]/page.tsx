@@ -14,6 +14,7 @@ import {
   Trash2,
   TriangleAlert,
   Undo2,
+  UserPlus,
   X,
   XCircle,
 } from 'lucide-react'
@@ -458,7 +459,15 @@ export default function GroupDetailPage() {
         id: due.id,
         session_id: due.session_id,
         user_id: due.user_id,
-        amount: due.amount ? parseFloat(due.amount.toString()) * 100 : 0, // Convert to cents
+        // Convert to cents — rounded once here, at the source, rather than at
+        // each comparison site: due.amount is a Postgres numeric like 19.99,
+        // and 19.99 * 100 is 1998.9999999999998 in JS float math. Every
+        // balance downstream (memberBalances, netBalance) is a running sum of
+        // these, and several settle-up completion checks compare that sum
+        // against an integer cent total with strict === — without rounding
+        // here, those checks could never be satisfied for perfectly correct
+        // payments on plenty of ordinary dollar amounts.
+        amount: due.amount ? Math.round(parseFloat(due.amount.toString()) * 100) : 0,
         Description: due.Description,
         paid: false, // Your schema doesn't have a paid field, so we'll default to false
         created_at: due.created_at,
@@ -3578,7 +3587,12 @@ export default function GroupDetailPage() {
                   .filter((s) => s.pendingApproval || s.waitingForApproval)
                   .sort((a, b) => (a.pendingApproval === b.pendingApproval ? 0 : a.pendingApproval ? -1 : 1))
 
+                // Join requests only ever count toward this for the owner — they're
+                // the only one who can act on them (see isOwner check below), and
+                // they're also the only one RLS returns any rows to in the first
+                // place (see loadJoinRequests).
                 const notificationCount = pendingRejections.length + pendingCancellations.length + pendingRejectionNotices.length
+                  + (isOwner ? pendingJoinRequests.length : 0)
 
                 return (
                   <div className="grid md:grid-cols-2 gap-6">
@@ -3628,13 +3642,48 @@ export default function GroupDetailPage() {
 
                     {/* Notifications — resolved edits that still need acknowledging:
                         your edit got rejected, your review got cancelled by the editor,
-                        or an edit you were reviewing got rejected by someone else. */}
+                        or an edit you were reviewing got rejected by someone else. Owners
+                        also get pending join requests here, mirroring the Members tab's
+                        own "Pending requests" section — same handlers, same busy keys, so
+                        approving/rejecting from either place stays in sync. */}
                     <div>
                       <p className="eyebrow mb-3">Notifications</p>
                       {notificationCount === 0 ? (
                         <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No notifications.</p>
                       ) : (
                         <div className="space-y-2">
+                          {isOwner && pendingJoinRequests.map((req) => (
+                            <div
+                              key={`join-request-${req.id}`}
+                              className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                              style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
+                            >
+                              <div className="flex items-center gap-3">
+                                <UserPlus size={18} style={{ color: 'var(--accent)' }} />
+                                <Avatar url={req.avatar_url} name={req.displayName} size={36} />
+                                <div>
+                                  <p className="text-sm font-medium">{req.displayName}</p>
+                                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{req.username} · wants to join</p>
+                                </div>
+                              </div>
+                              <div className="flex gap-2 shrink-0">
+                                <button
+                                  onClick={() => handleApproveJoinRequest(req.id)}
+                                  disabled={isBusy(`approveJoinRequest:${req.id}`)}
+                                  className="btn-primary text-sm"
+                                >
+                                  Approve
+                                </button>
+                                <button
+                                  onClick={() => handleRejectJoinRequest(req.id)}
+                                  disabled={isBusy(`rejectJoinRequest:${req.id}`)}
+                                  className="btn-secondary text-sm"
+                                >
+                                  Reject
+                                </button>
+                              </div>
+                            </div>
+                          ))}
                           {pendingRejections.map((pr) => (
                             <div
                               key={`rejection-${pr.id}`}

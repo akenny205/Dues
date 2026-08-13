@@ -7,6 +7,41 @@ import { supabase } from '@/lib/supabase'
 import useAuth from '@/hooks/useAuth'
 import { Eye, EyeOff } from 'lucide-react'
 
+// Rolls back the auth user Supabase just created when the follow-up User
+// table insert fails, so a failed signup never leaves an orphaned auth
+// account behind. The API route needs the caller's own access token to
+// verify they're deleting their own (just-created) account rather than
+// trusting the id alone — see src/app/api/delete-auth-user/route.ts.
+async function deleteJustCreatedAuthUser(userId: string): Promise<boolean> {
+  try {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session?.access_token) {
+      console.error('Cannot delete auth user: no active session/access token')
+      return false
+    }
+
+    const response = await fetch('/api/delete-auth-user', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify({ userId }),
+    })
+
+    const result = await response.json().catch(() => null)
+    if (!response.ok) {
+      console.error('Failed to delete auth user:', result)
+      return false
+    }
+    console.log('Auth user deleted successfully:', result)
+    return true
+  } catch (error) {
+    console.error('Error calling delete-auth-user API:', error)
+    return false
+  }
+}
+
 function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -341,30 +376,7 @@ function LoginForm() {
               // ALWAYS delete auth user if User table insert fails
               // This prevents orphaned auth users
               if (data?.user?.id) {
-                console.log('Attempting to delete auth user:', data.user.id)
-                try {
-                  const deleteResponse = await fetch('/api/delete-auth-user', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ userId: data.user.id })
-                  })
-                  
-                  const deleteResult = await deleteResponse.json()
-
-                  if (!deleteResponse.ok) {
-                    // deleteResult already carries the error body — the response
-                    // stream can only be read once, so don't re-read it as text.
-                    console.error('Failed to delete auth user:', deleteResult)
-                  } else {
-                    console.log('Auth user deleted successfully:', deleteResult)
-                  }
-                } catch (deleteError) {
-                  console.error('Error calling delete-auth-user API:', deleteError)
-                  // Log the full error for debugging
-                  if (deleteError instanceof Error) {
-                    console.error('Delete error details:', deleteError.message, deleteError.stack)
-                  }
-                }
+                await deleteJustCreatedAuthUser(data.user.id)
               } else {
                 console.error('Cannot delete auth user: data.user.id is missing')
               }
@@ -436,16 +448,7 @@ function LoginForm() {
                     }
                   }
                   if (data?.user?.id) {
-                    try {
-                      await fetch('/api/delete-auth-user', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ userId: data.user.id })
-                      })
-                      console.log('Deleted auth user after invalid User record')
-                    } catch (deleteError) {
-                      console.error('Error deleting auth user:', deleteError)
-                    }
+                    await deleteJustCreatedAuthUser(data.user.id)
                   }
                   setSignupFailed(true)
                   await supabase.auth.signOut()
@@ -480,22 +483,12 @@ function LoginForm() {
               try {
                 const { data: { session } } = await supabase.auth.getSession()
                 if (session?.user?.id) {
-                  const deleteResponse = await fetch('/api/delete-auth-user', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ userId: session.user.id })
-                  })
-                  
-                  if (!deleteResponse.ok) {
-                    console.error('Failed to delete auth user, but continuing...')
-                  } else {
-                    console.log('Auth user deleted successfully')
-                  }
+                  await deleteJustCreatedAuthUser(session.user.id)
                 }
               } catch (deleteError) {
                 console.error('Error calling delete-auth-user API:', deleteError)
               }
-              
+
               // Sign out the user
               await supabase.auth.signOut()
               // Wait a moment to ensure signout completes
@@ -511,17 +504,7 @@ function LoginForm() {
             try {
               const { data: { session } } = await supabase.auth.getSession()
               if (session?.user?.id) {
-                const deleteResponse = await fetch('/api/delete-auth-user', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ userId: session.user.id })
-                })
-                
-                if (!deleteResponse.ok) {
-                  console.error('Failed to delete auth user, but continuing...')
-                } else {
-                  console.log('Auth user deleted successfully')
-                }
+                await deleteJustCreatedAuthUser(session.user.id)
               }
             } catch (deleteError) {
               console.error('Error calling delete-auth-user API:', deleteError)

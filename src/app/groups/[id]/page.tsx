@@ -902,6 +902,9 @@ export default function GroupDetailPage() {
       // Fetch user emails, usernames, names, and avatars. Payment method
       // handles live behind ProfileModal, which fetches them itself when
       // someone's profile is actually opened — no need to carry them here.
+      // Auto-approve preference isn't carried here either — it's looked up
+      // server-side by create_session_edit_approvals (see the migration),
+      // not read client-side.
       const userIds = [...new Set((memberData || []).map((m: any) => m.user_id))]
       const userMap: Record<number, { email: string; username: string; first_name: string; last_name: string; avatar_url: string | null }> = {}
 
@@ -2205,24 +2208,23 @@ export default function GroupDetailPage() {
               }
             }
             
-            // Create approval records for each affected user (excluding the editor)
-            const approvalRecords = usersToNotify.map(cu => ({
-              session_id: editingSessionId,
-              editor_user_id: userId,
+            // Create approval rows for each affected user (excluding the editor) —
+            // status isn't decided here; create_session_edit_approvals (see the
+            // migration) computes it server-side from each target's own
+            // auto_approve_sessions preference, since a plain insert can't be
+            // trusted to claim someone else is already "approved" (RLS blocks
+            // that outright — see 20260811000011_fix_critical_rls_gaps).
+            const approvalRows = usersToNotify.map(cu => ({
               approver_user_id: cu.user_id,
-              status: 'pending',
               old_amount: cu.old_amount,
               new_amount: cu.new_amount
             }))
-            
+
             // ALWAYS create an approval record for the editor if there are any changes
             // This allows us to display the editor's change in the approval UI
             if (editorChange) {
-              approvalRecords.push({
-                session_id: editingSessionId,
-                editor_user_id: userId,
+              approvalRows.push({
                 approver_user_id: userId, // Editor approves their own change (auto-approved)
-                status: 'approved', // Mark as approved since editor doesn't need to approve their own change
                 old_amount: editorChange.old_amount,
                 new_amount: editorChange.new_amount
               })
@@ -2230,7 +2232,6 @@ export default function GroupDetailPage() {
                 session_id: editingSessionId,
                 editor_user_id: userId,
                 approver_user_id: userId,
-                status: 'approved',
                 old_amount: editorChange.old_amount,
                 new_amount: editorChange.new_amount
               })
@@ -2238,26 +2239,35 @@ export default function GroupDetailPage() {
               console.warn('No editor change found, but there are other changes. This might indicate a bug.')
             }
 
-            console.log('Creating approval records:', approvalRecords)
+            console.log('Creating approval records:', approvalRows)
             console.log('Changed users:', changedUsers)
             console.log('Users to notify (excluding editor):', usersToNotify)
             console.log('Editor change:', editorChange)
-            
-            if (approvalRecords.length > 0) {
-              const { error: approvalError } = await supabase
-                .from('SessionEditApproval')
-                .insert(approvalRecords)
+
+            if (approvalRows.length > 0) {
+              const { data: insertedRows, error: approvalError } = await supabase.rpc('create_session_edit_approvals', {
+                p_session_id: editingSessionId,
+                p_rows: approvalRows,
+              })
 
               if (approvalError) {
                 console.error('Error creating approval records:', approvalError)
                 throw approvalError
               }
 
-              console.log('Successfully created approval records:', approvalRecords.length)
+              console.log('Successfully created approval records:', approvalRows.length)
 
               if (usersToNotify.length > 0) {
-                // Show message that users will be notified
-                showToast(`Edit saved. waiting on ${usersToNotify.length} approval${usersToNotify.length === 1 ? '' : 's'}.`)
+                // Some (or all) of usersToNotify may have auto-approved
+                // immediately (see create_session_edit_approvals) — only
+                // count who's actually still got a decision to make.
+                const stillPendingCount = (insertedRows || []).filter((r: any) => r.status === 'pending').length
+                if (stillPendingCount > 0) {
+                  showToast(`Edit saved. waiting on ${stillPendingCount} approval${stillPendingCount === 1 ? '' : 's'}.`)
+                } else {
+                  const outcome = await finalizeSessionIfFullyApproved(editingSessionId)
+                  showToast(outcome === 'applied' ? 'Session updated successfully!' : 'Edit saved.')
+                }
               } else {
                 // Only the editor's value changed, so no approvals needed - update immediately
                 await updateSessionPayments(editingSessionId)
@@ -2329,19 +2339,25 @@ export default function GroupDetailPage() {
           await reconcileSession(sessionData.id, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
           showToast('Session created successfully!')
         } else {
-          const approvalRecords = nonZeroMembers.map(sm => ({
-            session_id: sessionData.id,
-            editor_user_id: userId,
+          const approvalRows = nonZeroMembers.map(sm => ({
             approver_user_id: sm.user_id,
-            status: sm.user_id === userId ? 'approved' : 'pending',
             old_amount: 0,
             new_amount: parseFloat(sm.amount),
           }))
 
-          const { error: approvalError } = await supabase.from('SessionEditApproval').insert(approvalRecords)
+          const { data: insertedRows, error: approvalError } = await supabase.rpc('create_session_edit_approvals', {
+            p_session_id: sessionData.id,
+            p_rows: approvalRows,
+          })
           if (approvalError) throw approvalError
 
-          showToast(`Session created. waiting on ${others.length} approval${others.length === 1 ? '' : 's'}.`)
+          const stillPendingCount = (insertedRows || []).filter((r: any) => r.status === 'pending').length
+          if (stillPendingCount > 0) {
+            showToast(`Session created. waiting on ${stillPendingCount} approval${stillPendingCount === 1 ? '' : 's'}.`)
+          } else {
+            const outcome = await finalizeSessionIfFullyApproved(sessionData.id)
+            showToast(outcome === 'applied' ? 'Session created successfully!' : 'Session created.')
+          }
         }
       }
 
@@ -2876,17 +2892,15 @@ export default function GroupDetailPage() {
         return
       }
 
-      const { error: insertError } = await supabase.from('SessionEditApproval').insert(
-        participants.map(([targetId, cents]) => ({
-          session_id: sessionId,
-          editor_user_id: userId,
+      const { error: insertError } = await supabase.rpc('create_session_edit_approvals', {
+        p_session_id: sessionId,
+        p_rows: participants.map(([targetId, cents]) => ({
           approver_user_id: targetId,
-          status: targetId === userId ? 'approved' : 'pending',
           old_amount: 0,
           new_amount: cents / 100,
           is_live_close: true,
-        }))
-      )
+        })),
+      })
 
       if (insertError) throw insertError
 
@@ -2965,34 +2979,43 @@ export default function GroupDetailPage() {
 
       const selfPayment = (paymentsData || []).find((p: any) => p.user_id === userId)
 
-      const approvalRecords = [
+      const approvalRows = [
         ...others.map((p: any) => ({
-          session_id: sessionId,
-          editor_user_id: userId,
           approver_user_id: p.user_id,
-          status: 'pending',
+          // 'live_only' deliberately doesn't cover deletions — it's scoped
+          // to live-session closes specifically (see the RPC's own
+          // computed_status logic).
           old_amount: parseFloat(p.amount?.toString() || '0'),
           new_amount: 0,
           is_deletion: true,
         })),
         {
-          session_id: sessionId,
-          editor_user_id: userId,
           approver_user_id: userId,
-          status: 'approved',
           old_amount: selfPayment ? parseFloat(selfPayment.amount?.toString() || '0') : 0,
           new_amount: 0,
           is_deletion: true,
         },
       ]
 
-      const { error: insertError } = await supabase.from('SessionEditApproval').insert(approvalRecords)
+      const { data: insertedRows, error: insertError } = await supabase.rpc('create_session_edit_approvals', {
+        p_session_id: sessionId,
+        p_rows: approvalRows,
+      })
       if (insertError) throw insertError
 
+      const stillPendingCount = (insertedRows || []).filter((r: any) => r.status === 'pending').length
       setConfirmDeleteSessionId(null)
-      await loadSessions()
-      await loadPendingApprovals()
-      showToast(`Deletion requested. ${others.length} member${others.length === 1 ? '' : 's'} must approve before the session is removed.`)
+      if (stillPendingCount > 0) {
+        await loadSessions()
+        await loadPendingApprovals()
+        showToast(`Deletion requested. ${stillPendingCount} member${stillPendingCount === 1 ? '' : 's'} must approve before the session is removed.`)
+      } else {
+        const outcome = await finalizeSessionIfFullyApproved(sessionId)
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast(outcome === 'deleted' ? 'Session deleted.' : 'Deletion requested.')
+      }
     } catch (error: any) {
       console.error('Error requesting session deletion:', error)
       showToast('Failed to request deletion: ' + (error.message || 'Unknown error'))
@@ -3043,28 +3066,17 @@ export default function GroupDetailPage() {
       // side is auto-approved, the payee's is pending until they confirm,
       // and the amounts only land in SessionPayment once every pending row
       // clears (see handleApproveEdit).
-      const { error: approvalError } = await supabase
-        .from('SessionEditApproval')
-        .insert([
-          {
-            session_id: sessionData.id,
-            editor_user_id: userId,
-            approver_user_id: userId,
-            status: 'approved',
-            old_amount: 0,
-            new_amount: amountValue,
-          },
-          {
-            session_id: sessionData.id,
-            editor_user_id: userId,
-            approver_user_id: paymentPayee,
-            status: 'pending',
-            old_amount: 0,
-            new_amount: -amountValue,
-          },
-        ])
+      const { data: insertedRows, error: approvalError } = await supabase.rpc('create_session_edit_approvals', {
+        p_session_id: sessionData.id,
+        p_rows: [
+          { approver_user_id: userId, old_amount: 0, new_amount: amountValue },
+          { approver_user_id: paymentPayee, old_amount: 0, new_amount: -amountValue },
+        ],
+      })
 
       if (approvalError) throw approvalError
+
+      const payeeStatus = (insertedRows || []).find((r: any) => r.approver_user_id === paymentPayee)?.status || 'pending'
 
       // Reset form, close the modal, and reload
       setPaymentPayee(null)
@@ -3072,10 +3084,18 @@ export default function GroupDetailPage() {
       setPaymentDescription('')
       setPaymentMethod('')
       setShowMakePaymentModal(false)
-      await loadSessions()
-      await loadDues()
-      await loadPendingApprovals()
-      showToast(`Payment recorded. waiting on ${payeeName} to confirm they received it.`)
+      if (payeeStatus === 'pending') {
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast(`Payment recorded. waiting on ${payeeName} to confirm they received it.`)
+      } else {
+        const outcome = await finalizeSessionIfFullyApproved(sessionData.id)
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast(outcome === 'applied' ? 'Payment recorded.' : `Payment recorded. waiting on ${payeeName} to confirm they received it.`)
+      }
     } catch (error: any) {
       console.error('Error making payment:', error)
       showToast('Failed to record payment: ' + (error.message || 'Unknown error'))
@@ -3205,32 +3225,36 @@ export default function GroupDetailPage() {
 
       if (sessionError) throw sessionError
 
-      const approvalRecords = entries.map(entry => ({
-        session_id: sessionData.id,
-        editor_user_id: userId,
+      const approvalRows = entries.map(entry => ({
         approver_user_id: entry.user_id,
-        status: entry.user_id === userId ? 'approved' : 'pending',
         old_amount: 0,
         new_amount: entry.amount,
       }))
 
-      const { error: approvalError } = await supabase
-        .from('SessionEditApproval')
-        .insert(approvalRecords)
+      const { data: insertedRows, error: approvalError } = await supabase.rpc('create_session_edit_approvals', {
+        p_session_id: sessionData.id,
+        p_rows: approvalRows,
+      })
 
       if (approvalError) throw approvalError
 
-      const othersCount = approvalRecords.filter(r => r.status === 'pending').length
+      const othersCount = (insertedRows || []).filter((r: any) => r.status === 'pending').length
 
       setShowSettleUpModal(false)
-      await loadSessions()
-      await loadDues()
-      await loadPendingApprovals()
-      showToast(
-        othersCount > 0
-          ? `Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`
-          : 'Settled up!'
-      )
+      if (othersCount > 0) {
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast(`Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`)
+      } else {
+        // Everyone else either has auto-approve on, or (the original case
+        // this branch existed for) there simply was nobody else to ask.
+        await finalizeSessionIfFullyApproved(sessionData.id)
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast('Settled up!')
+      }
     } catch (error: any) {
       console.error('Error settling up:', error)
       showToast('Failed to settle up: ' + (error.message || 'Unknown error'))
@@ -3363,42 +3387,37 @@ export default function GroupDetailPage() {
 
       if (sessionError) throw sessionError
 
-      const approvalRecords = [
-        {
-          session_id: sessionData.id,
-          editor_user_id: userId,
-          approver_user_id: userId,
-          status: 'approved',
-          old_amount: 0,
-          new_amount: (direction === 'pay' ? totalCents : -totalCents) / 100,
-        },
+      const approvalRows = [
+        { approver_user_id: userId, old_amount: 0, new_amount: (direction === 'pay' ? totalCents : -totalCents) / 100 },
         ...Array.from(counterpartyCents.entries()).map(([counterpartyId, cents]) => ({
-          session_id: sessionData.id,
-          editor_user_id: userId,
           approver_user_id: counterpartyId,
-          status: 'pending',
           old_amount: 0,
           new_amount: (direction === 'pay' ? -cents : cents) / 100,
         })),
       ]
 
-      const { error: approvalError } = await supabase
-        .from('SessionEditApproval')
-        .insert(approvalRecords)
+      const { data: insertedRows, error: approvalError } = await supabase.rpc('create_session_edit_approvals', {
+        p_session_id: sessionData.id,
+        p_rows: approvalRows,
+      })
 
       if (approvalError) throw approvalError
 
-      const othersCount = approvalRecords.length - 1
+      const othersCount = (insertedRows || []).filter((r: any) => r.status === 'pending').length
 
       setShowSettleBalanceModal(false)
-      await loadSessions()
-      await loadDues()
-      await loadPendingApprovals()
-      showToast(
-        othersCount > 0
-          ? `Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`
-          : 'Settled up!'
-      )
+      if (othersCount > 0) {
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast(`Settle up requested. waiting on ${othersCount} member${othersCount === 1 ? '' : 's'} to confirm.`)
+      } else {
+        await finalizeSessionIfFullyApproved(sessionData.id)
+        await loadSessions()
+        await loadDues()
+        await loadPendingApprovals()
+        showToast('Settled up!')
+      }
     } catch (error: any) {
       console.error('Error settling balance:', error)
       showToast('Failed to settle up: ' + (error.message || 'Unknown error'))

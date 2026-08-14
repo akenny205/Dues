@@ -31,7 +31,10 @@ interface ProfileRow {
   paypal_username: string | null
   zelle_handle: string | null
   preferred_payment_method: string | null
+  auto_approve_sessions: string | null
 }
+
+type AutoApproveSessions = 'off' | 'live_only' | 'all'
 
 type UsernameStatus = 'unchanged' | 'invalid' | 'checking' | 'available' | 'taken' | 'unknown'
 
@@ -67,6 +70,9 @@ export default function ProfilePage() {
   const [savingPayment, setSavingPayment] = useState(false)
   const [paymentError, setPaymentError] = useState('')
 
+  const [autoApprove, setAutoApprove] = useState<AutoApproveSessions>('off')
+  const [savingApprovals, setSavingApprovals] = useState(false)
+
   const [deletedGroups, setDeletedGroups] = useState<DeletedGroup[]>([])
   const [restoringGroupId, setRestoringGroupId] = useState<number | null>(null)
 
@@ -88,7 +94,7 @@ export default function ProfilePage() {
       setUserId(id)
       const { data } = await supabase
         .from('User')
-        .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle, preferred_payment_method')
+        .select('first_name, last_name, username, email, avatar_url, venmo_username, cashapp_cashtag, paypal_username, zelle_handle, preferred_payment_method, auto_approve_sessions')
         .eq('id', id)
         .maybeSingle()
       if (!mounted) return
@@ -101,6 +107,7 @@ export default function ProfilePage() {
       setPaypal(data?.paypal_username || '')
       setZelle(data?.zelle_handle || '')
       setPreferredMethod(data?.preferred_payment_method || '')
+      setAutoApprove((data?.auto_approve_sessions as AutoApproveSessions) || 'off')
       setLoading(false)
     })
     return () => {
@@ -302,6 +309,25 @@ export default function ProfilePage() {
     setProfile((prev) => (prev ? { ...prev, ...patch } : prev))
     setPreferredMethod(patch.preferred_payment_method || '')
     showToast('Payment methods saved')
+  }
+
+  const handleSaveApprovals = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!userId || savingApprovals) return
+
+    setSavingApprovals(true)
+    const patch = { auto_approve_sessions: autoApprove }
+    const { error } = await supabase.from('User').update(patch).eq('id', userId)
+    setSavingApprovals(false)
+
+    if (error) {
+      console.error('Error saving approval preference:', error)
+      showToast('Failed to save. Please try again.')
+      return
+    }
+
+    setProfile((prev) => (prev ? { ...prev, ...patch } : prev))
+    showToast('Approval preference saved')
   }
 
   if (authLoading || loading) {
@@ -612,6 +638,48 @@ export default function ProfilePage() {
             </div>
           </div>
         )}
+
+        {/* Approvals */}
+        <div className="card">
+          <p className="eyebrow mb-3">Approvals</p>
+          <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
+            By default, anything that changes your balance — a new session, an edit,
+            a payment, a settle up — waits for you to approve it. Auto-approve skips
+            that click for the cases you pick below.
+          </p>
+          <form onSubmit={handleSaveApprovals} className="space-y-3">
+            {(
+              [
+                { value: 'off', label: 'Off', description: "Approve everything yourself — the default." },
+                { value: 'live_only', label: 'Live sessions only', description: "Skip approving a live session's final total when it closes. Its total already had to sum to $0.00 before anyone could even propose closing, so there's little left to review. Everything else still waits for you." },
+                { value: 'all', label: 'All sessions', description: 'Skip approving anything that lands on you — new sessions, edits, payments, settle ups, and deletions included. Only turn this on for groups you fully trust.' },
+              ] as { value: AutoApproveSessions; label: string; description: string }[]
+            ).map((option) => (
+              <label
+                key={option.value}
+                className="flex items-start gap-3 p-3 rounded-lg border cursor-pointer"
+                style={{ borderColor: autoApprove === option.value ? 'var(--accent)' : 'var(--border)' }}
+              >
+                <input
+                  type="radio"
+                  name="autoApprove"
+                  value={option.value}
+                  checked={autoApprove === option.value}
+                  onChange={() => setAutoApprove(option.value)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="block text-sm font-medium">{option.label}</span>
+                  <span className="block text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{option.description}</span>
+                </span>
+              </label>
+            ))}
+
+            <button type="submit" className="btn-primary" disabled={savingApprovals}>
+              {savingApprovals ? 'Saving…' : 'Save approval preference'}
+            </button>
+          </form>
+        </div>
 
         {/* Room for what's next — notifications, theme, account controls.
             Kept as an honest placeholder rather than wiring up toggles that

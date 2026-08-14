@@ -3433,10 +3433,24 @@ export default function GroupDetailPage() {
   // session is being viewed changing — see loadSessionApprovals above for
   // why an approval landing on the still-viewed session needs its own
   // explicit refresh instead of relying on this.
+  //
+  // A pending live-close approval also needs the underlying line items —
+  // they're what the itemized breakdown under each person's total is built
+  // from (see the pendingApproval/liveClose branch below). They're still
+  // real, queryable rows at this point: closing a live session doesn't
+  // delete LiveSessionEntry/Guest/GuestDelegation, only finalizing a fully-
+  // approved close does (see finalizeSessionIfFullyApproved), so they're
+  // there for as long as this approval is still pending.
   useEffect(() => {
     if (viewingSessionId) {
       loadSessionDetails(viewingSessionId)
       loadSessionApprovals(viewingSessionId)
+      const session = sessions.find((s) => s.id === viewingSessionId)
+      if (session && pendingSessionKind(session) === 'liveClose') {
+        loadLiveEntries(viewingSessionId)
+        loadLiveGuests(viewingSessionId)
+        loadLiveGuestDelegations(viewingSessionId)
+      }
     } else {
       setAllSessionApprovals([])
       setEditorUserId(null)
@@ -4017,13 +4031,16 @@ export default function GroupDetailPage() {
     // Approval needed — someone else's change (or a deletion) is waiting on this member.
     if (pendingApproval && session.pendingApproval) {
       const kind = pendingSessionKind(session)
-      // Only a real edit (or a live-session close finalizing a running total)
-      // has a genuine "before" value worth showing as a diff — a brand-new
-      // session, payment, or settle-up is proposing amounts from scratch, so
-      // old_amount is just a zero placeholder and showing it struck through
-      // next to the real number ("$0.00 → $40.00") reads as more confusing
-      // than informative. Those just show the plain proposed amount instead.
-      const showDiff = kind === 'edit' || kind === 'liveClose' || pendingApproval?.is_deletion
+      // Only a real edit has a genuine "before" value worth showing as a
+      // diff — a brand-new session, payment, settle-up, or live-session
+      // close is proposing amounts from scratch (old_amount is just a zero
+      // placeholder), so showing it struck through next to the real number
+      // ("$0.00 → $40.00") reads as more confusing than informative. Those
+      // just show the plain proposed amount instead — a live close also
+      // gets its own itemized breakdown below (see liveCloseEntries), since
+      // "here's the number" is a lot less reassuring than "here's what adds
+      // up to the number" for a total built from several people's entries.
+      const showDiff = kind === 'edit' || pendingApproval?.is_deletion
       return (
         <div className="card rounded-l-none" style={{ borderLeftWidth: 4, borderLeftColor: 'var(--accent)' }}>
           <div className="mb-4">
@@ -4039,6 +4056,7 @@ export default function GroupDetailPage() {
                       case 'settleUp': return 'A group member started a settle up. Review the amounts below.'
                       case 'payment': return 'A group member recorded a payment. Review the amounts below.'
                       case 'creation': return 'A group member added a new session that includes you. Review the amounts below.'
+                      case 'liveClose': return 'A live session was closed. Review each final total, and what it’s made up of, below.'
                       default: return 'This session has been edited. Review the changes below.'
                     }
                   })()}
@@ -4054,7 +4072,7 @@ export default function GroupDetailPage() {
           <div className="mb-4">
             {/* Show all members' changes */}
             <div className="mb-4">
-              <p className="eyebrow mb-2">{showDiff ? 'All changes' : 'Amounts'}</p>
+              <p className="eyebrow mb-2">{showDiff ? 'All changes' : kind === 'liveClose' ? 'Final totals' : 'Amounts'}</p>
               <div>
                 {(() => {
                   // Combine all members: those with approval records and those in current session
@@ -4099,53 +4117,88 @@ export default function GroupDetailPage() {
 
                   return allMembersToShow.map((memberInfo) => {
                     const isCurrentUser = memberInfo.user_id === userId
+                    // For a live-session close, the number by itself doesn't say
+                    // much — it's a sum of however many line items (and however
+                    // many guests) landed on this person. Pull those back up so
+                    // "here's the number" reads as "here's what adds up to it".
+                    const ownEntries = kind === 'liveClose'
+                      ? liveEntries.filter((e) => e.target_user_id === memberInfo.user_id)
+                      : []
+                    const delegatedFromGuests = kind === 'liveClose'
+                      ? liveGuestDelegations.filter((d) => d.user_id === memberInfo.user_id)
+                      : []
 
                     return (
-                      <div key={memberInfo.user_id} className="ledger-row">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium">
-                            {memberInfo.displayName}
-                          </span>
-                          {isCurrentUser && <span className="badge badge-accent">You</span>}
-                        </div>
-                        <div className="flex items-center gap-2 amount">
-                          {memberInfo.approvalRecord && showDiff ? (
-                            <>
-                              <span
-                                className="text-sm font-medium"
-                                style={{ color: 'var(--text-muted)', textDecoration: 'line-through' }}
-                              >
-                                {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
-                              </span>
-                              <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
+                      <div key={memberInfo.user_id} className="mb-2">
+                        <div className="ledger-row">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">
+                              {memberInfo.displayName}
+                            </span>
+                            {isCurrentUser && <span className="badge badge-accent">You</span>}
+                          </div>
+                          <div className="flex items-center gap-2 amount">
+                            {memberInfo.approvalRecord && showDiff ? (
+                              <>
+                                <span
+                                  className="text-sm font-medium"
+                                  style={{ color: 'var(--text-muted)', textDecoration: 'line-through' }}
+                                >
+                                  {memberInfo.approvalRecord.old_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.old_amount.toFixed(2)}
+                                </span>
+                                <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
+                                <span
+                                  className="text-sm font-semibold"
+                                  style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                >
+                                  {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
+                                </span>
+                              </>
+                            ) : memberInfo.approvalRecord ? (
                               <span
                                 className="text-sm font-semibold"
                                 style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
                               >
                                 {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
                               </span>
-                            </>
-                          ) : memberInfo.approvalRecord ? (
-                            <span
-                              className="text-sm font-semibold"
-                              style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                            >
-                              {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
-                            </span>
-                          ) : (
-                            <>
-                              <span
-                                className="text-sm font-semibold"
-                                style={{ color: memberInfo.currentAmount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                              >
-                                {memberInfo.currentAmount >= 0 ? '+' : ''}${memberInfo.currentAmount.toFixed(2)}
-                              </span>
-                              {memberInfo.currentAmount !== 0 && (
-                                <span className="text-xs" style={{ color: 'var(--text-muted)' }}>(no change)</span>
-                              )}
-                            </>
-                          )}
+                            ) : (
+                              <>
+                                <span
+                                  className="text-sm font-semibold"
+                                  style={{ color: memberInfo.currentAmount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                >
+                                  {memberInfo.currentAmount >= 0 ? '+' : ''}${memberInfo.currentAmount.toFixed(2)}
+                                </span>
+                                {memberInfo.currentAmount !== 0 && (
+                                  <span className="text-xs" style={{ color: 'var(--text-muted)' }}>(no change)</span>
+                                )}
+                              </>
+                            )}
+                          </div>
                         </div>
+                        {(ownEntries.length > 0 || delegatedFromGuests.length > 0) && (
+                          <div className="ml-1 mt-0.5 space-y-0.5">
+                            {ownEntries.map((entry) => (
+                              <div key={`entry-${entry.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                                <span className="truncate">{entry.note || 'Entry'}</span>
+                                <span className="amount shrink-0 ml-2">
+                                  {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
+                                </span>
+                              </div>
+                            ))}
+                            {delegatedFromGuests.map((d) => {
+                              const guest = liveGuests.find((g) => g.id === d.guest_id)
+                              return (
+                                <div key={`delegation-${d.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                                  <span className="truncate">{guest?.name || 'Guest'} (delegated)</span>
+                                  <span className="amount shrink-0 ml-2">
+                                    {d.amount >= 0 ? '+' : ''}${d.amount.toFixed(2)}
+                                  </span>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
                       </div>
                     )
                   })
@@ -4264,18 +4317,51 @@ export default function GroupDetailPage() {
                 {allSessionApprovals.map((approval) => {
                   const member = members.find(m => m.user_id === approval.user_id)
                   const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+                  // Same reasoning as the pendingApproval/liveClose branch above:
+                  // a live close's total is a sum of line items (and maybe
+                  // guest delegations), so show what it's made of, not just the
+                  // number — whoever's still waiting on someone else's approval
+                  // gets the same detail the approver themselves sees.
+                  const isLiveClose = pendingSessionKind(session) === 'liveClose'
+                  const ownEntries = isLiveClose ? liveEntries.filter((e) => e.target_user_id === approval.user_id) : []
+                  const delegatedFromGuests = isLiveClose ? liveGuestDelegations.filter((d) => d.user_id === approval.user_id) : []
                   return (
-                    <div key={approval.user_id} className="flex items-center justify-between py-3">
-                      <div className="flex items-center gap-3">
-                        <Avatar url={member?.avatar_url} name={displayName} size={32} />
-                        <p className="font-medium text-sm">{displayName}</p>
+                    <div key={approval.user_id} className="py-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                          <p className="font-medium text-sm">{displayName}</p>
+                        </div>
+                        <p
+                          className="amount text-lg font-semibold"
+                          style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                        >
+                          {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
+                        </p>
                       </div>
-                      <p
-                        className="amount text-lg font-semibold"
-                        style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                      >
-                        {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
-                      </p>
+                      {(ownEntries.length > 0 || delegatedFromGuests.length > 0) && (
+                        <div className="ml-11 mt-1 space-y-0.5">
+                          {ownEntries.map((entry) => (
+                            <div key={`entry-${entry.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                              <span className="truncate">{entry.note || 'Entry'}</span>
+                              <span className="amount shrink-0 ml-2">
+                                {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
+                              </span>
+                            </div>
+                          ))}
+                          {delegatedFromGuests.map((d) => {
+                            const guest = liveGuests.find((g) => g.id === d.guest_id)
+                            return (
+                              <div key={`delegation-${d.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                                <span className="truncate">{guest?.name || 'Guest'} (delegated)</span>
+                                <span className="amount shrink-0 ml-2">
+                                  {d.amount >= 0 ? '+' : ''}${d.amount.toFixed(2)}
+                                </span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
                     </div>
                   )
                 })}

@@ -299,6 +299,28 @@ body {
     @apply flex items-center justify-center rounded-lg;
   }
 
+  /* Small two-(or-more)-way segmented toggle — the sessions list's "My
+     sessions / All sessions" scope switch, and anywhere else a compact
+     single-select row of options is needed outside the payment-method
+     picker above (which keeps its own brand-colored variant). */
+  .segmented {
+    @apply inline-flex gap-0.5 rounded-lg border p-0.5;
+    border-color: var(--border);
+    background: var(--canvas);
+  }
+  .segmented-btn {
+    @apply rounded-md px-3 py-1 text-xs font-medium transition-colors;
+    color: var(--text-muted);
+  }
+  .segmented-btn:hover {
+    color: var(--text);
+  }
+  .segmented-btn.selected {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+  }
+
   /* Sidebar tabs */
   .tab-item {
     @apply w-full text-left px-4 py-2.5 rounded-md text-sm font-medium transition-colors;

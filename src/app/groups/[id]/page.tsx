@@ -62,6 +62,7 @@ interface Session {
   pendingRejection?: boolean
   waitingForApproval?: boolean // Editor is waiting for others to approve
   pendingIsDeletion?: boolean // The in-flight approval (either direction above) is a deletion request, not an amount edit
+  pendingIsLiveClose?: boolean // The in-flight approval is a live-session close proposal, not a deletion or a plain amount edit
   rejectedByMeAsProposal?: boolean // I rejected this and it never had any real SessionPayment rows (a brand-new payment/session proposal) — hide it from my list entirely rather than showing an empty shell
 }
 
@@ -185,6 +186,83 @@ const computeSettlementPlan = (
   return plan
 }
 
+type RemainderSplitMode = 'evenly' | 'winners' | 'losers' | 'biggestWinner' | 'biggestLoser'
+
+type SessionMemberDraft = { user_id: number; amount: string }
+
+// Pure preview of what a given remainder-split mode would do to the
+// currently-entered amounts, without touching state — lets the UI show
+// "here's what this option does" before the user commits to it (see
+// applyRemainderSplit below, and the "Split the remaining $X between" UI).
+// Returns null when the mode has nothing to act on (session already
+// balanced, or nobody on the relevant side of $0 for
+// 'winners'/'losers'/'biggestWinner'/'biggestLoser').
+const computeRemainderSplit = <T extends SessionMemberDraft>(
+  sessionMembers: T[],
+  mode: RemainderSplitMode
+): T[] | null => {
+  const amountCentsByUser = new Map(
+    sessionMembers.map(sm => [sm.user_id, Math.round(parseFloat(sm.amount || '0') * 100)])
+  )
+  const totalCents = [...amountCentsByUser.values()].reduce((sum, c) => sum + c, 0)
+  if (totalCents === 0) return null
+
+  // What needs to land on the chosen recipients, in total, to zero the sum out.
+  const remainderCents = -totalCents
+
+  let targetIds: number[]
+  switch (mode) {
+    case 'evenly':
+      targetIds = sessionMembers.map(sm => sm.user_id)
+      break
+    case 'winners':
+      targetIds = sessionMembers.filter(sm => (amountCentsByUser.get(sm.user_id) || 0) > 0).map(sm => sm.user_id)
+      break
+    case 'losers':
+      targetIds = sessionMembers.filter(sm => (amountCentsByUser.get(sm.user_id) || 0) < 0).map(sm => sm.user_id)
+      break
+    case 'biggestWinner': {
+      const winner = sessionMembers.reduce((best, sm) =>
+        (amountCentsByUser.get(sm.user_id) || 0) > (amountCentsByUser.get(best.user_id) || 0) ? sm : best
+      )
+      targetIds = (amountCentsByUser.get(winner.user_id) || 0) > 0 ? [winner.user_id] : []
+      break
+    }
+    case 'biggestLoser': {
+      const loser = sessionMembers.reduce((worst, sm) =>
+        (amountCentsByUser.get(sm.user_id) || 0) < (amountCentsByUser.get(worst.user_id) || 0) ? sm : worst
+      )
+      targetIds = (amountCentsByUser.get(loser.user_id) || 0) < 0 ? [loser.user_id] : []
+      break
+    }
+  }
+
+  if (targetIds.length === 0) return null
+
+  // Same leftover-penny distribution as handleSplitEvenly: hand out whole
+  // cents as evenly as possible, so the sum lands on exactly zero even when
+  // the remainder doesn't divide evenly across the recipients.
+  const n = targetIds.length
+  const sign = remainderCents < 0 ? -1 : 1
+  const absRemainder = Math.abs(remainderCents)
+  const baseShareCents = Math.floor(absRemainder / n)
+  let leftoverCents = absRemainder - baseShareCents * n
+
+  const extraByUser = new Map<number, number>()
+  for (const id of targetIds) {
+    const extra = leftoverCents > 0 ? 1 : 0
+    if (extra) leftoverCents -= 1
+    extraByUser.set(id, sign * (baseShareCents + extra))
+  }
+
+  return sessionMembers.map(sm => {
+    const extra = extraByUser.get(sm.user_id)
+    if (extra === undefined) return sm
+    const newCents = (amountCentsByUser.get(sm.user_id) || 0) + extra
+    return { ...sm, amount: (newCents / 100).toFixed(2) }
+  })
+}
+
 // A "make a payment" or "settle up" action creates a brand-new Session that's
 // pending approval — it isn't an edit to an existing one, even though both
 // flows reuse the same SessionEditApproval machinery under the hood (see
@@ -193,7 +271,7 @@ const computeSettlementPlan = (
 // Settle-ups are identified by their fixed Description (set once, in
 // handleSettleUp, and never user-editable while pending) since there's no
 // dedicated flag for them.
-type PendingSessionKind = 'deletion' | 'settleUp' | 'payment' | 'edit'
+type PendingSessionKind = 'deletion' | 'liveClose' | 'settleUp' | 'payment' | 'edit'
 
 // Both the whole-group plan (handleSettleUp) and the single-member version
 // scoped to just your own balance (handleSettleBalance) write one of these
@@ -204,10 +282,12 @@ const isSettleUpDescription = (description?: string | null): boolean =>
 
 const pendingSessionKind = (session: {
   pendingIsDeletion?: boolean
+  pendingIsLiveClose?: boolean
   is_payment?: boolean | null
   Description?: string | null
 }): PendingSessionKind => {
   if (session.pendingIsDeletion) return 'deletion'
+  if (session.pendingIsLiveClose) return 'liveClose'
   if (isSettleUpDescription(session.Description)) return 'settleUp'
   if (session.is_payment) return 'payment'
   return 'edit'
@@ -216,6 +296,7 @@ const pendingSessionKind = (session: {
 const cancelActionLabel = (kind: PendingSessionKind): string => {
   switch (kind) {
     case 'deletion': return 'Cancel deletion request'
+    case 'liveClose': return 'Cancel closing'
     case 'settleUp': return 'Cancel settle up'
     case 'payment': return 'Cancel payment'
     default: return 'Cancel edit'
@@ -239,6 +320,11 @@ const cancelActionCopy = (kind: PendingSessionKind): { title: string; body: stri
         title: 'Cancel this payment?',
         body: "It'll be withdrawn and no balances will change. Anyone who already confirmed it will be notified that it was cancelled.",
       }
+    case 'liveClose':
+      return {
+        title: 'Cancel closing this session?',
+        body: 'The session reopens for entries — nothing entered so far is lost. Anyone who already confirmed their total will be notified that it was cancelled.',
+      }
     default:
       return {
         title: 'Cancel this edit?',
@@ -261,6 +347,10 @@ export default function GroupDetailPage() {
   const [pendingJoinRequests, setPendingJoinRequests] = useState<Array<{ id: number; user_id: number; displayName: string; username: string; avatar_url: string | null; created_at: string }>>([])
   const [showPin, setShowPin] = useState(false)
   const [activeTab, setActiveTab] = useState<'dues' | 'members' | 'sessions' | 'info'>('dues')
+  // 'mine' filters the sessions list down to ones you actually have a
+  // payment row in (see session.userPayment) — everyone starts on 'all' so
+  // nothing already-visible disappears by default.
+  const [sessionsScope, setSessionsScope] = useState<'mine' | 'all'>('all')
   const [showMakePaymentModal, setShowMakePaymentModal] = useState(false)
   const [paymentPayee, setPaymentPayee] = useState<number | null>(null)
   const [paymentAmount, setPaymentAmount] = useState('')
@@ -291,12 +381,39 @@ export default function GroupDetailPage() {
   const [viewingSessionId, setViewingSessionId] = useState<number | null>(null)
   const [sessionDescription, setSessionDescription] = useState('')
   const [sessionMembers, setSessionMembers] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: string }>>([])
+  // The remainder-split option the user has selected but not yet confirmed —
+  // null means no option is picked, so no preview is shown. See
+  // applyRemainderSplit and computeRemainderSplit above.
+  const [remainderSplitMode, setRemainderSplitMode] = useState<RemainderSplitMode | null>(null)
   const [showMemberDropdown, setShowMemberDropdown] = useState(false)
   const [splitTotalAmount, setSplitTotalAmount] = useState('')
   const [splitPayerId, setSplitPayerId] = useState<number | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: number }>>([])
   const [selectedLiveSession, setSelectedLiveSession] = useState<number | null>(null)
-  const [liveSessionAmount, setLiveSessionAmount] = useState('')
+  // Individual line items for the currently-open live session — distinct from
+  // sessionDetails above, which is the one-amount-per-person view used by
+  // renderSessionExpansion for regular (non-live) sessions.
+  const [liveEntries, setLiveEntries] = useState<Array<{
+    id: number
+    entered_by: number
+    target_user_id: number
+    amount: number
+    note: string | null
+  }>>([])
+  const [newLiveEntryTargetId, setNewLiveEntryTargetId] = useState<number | null>(null)
+  const [newLiveEntryAmount, setNewLiveEntryAmount] = useState('')
+  const [newLiveEntryNote, setNewLiveEntryNote] = useState('')
+  const [editingLiveEntryId, setEditingLiveEntryId] = useState<number | null>(null)
+  const [editingLiveEntryAmount, setEditingLiveEntryAmount] = useState('')
+  const [editingLiveEntryNote, setEditingLiveEntryNote] = useState('')
+  // Same select → preview → confirm flow as remainderSplitMode/computeRemainderSplit
+  // above, applied to the live session's current per-person totals instead of
+  // sessionMembers — see handleApplyLiveRemainderSplit.
+  const [liveRemainderSplitMode, setLiveRemainderSplitMode] = useState<RemainderSplitMode | null>(null)
+  // Warning popup shown before actually proposing a close — separate from
+  // confirmCancelSessionId below, which confirms the destructive "throw the
+  // whole session away" action instead.
+  const [confirmCloseLiveSessionId, setConfirmCloseLiveSessionId] = useState<number | null>(null)
   const [pendingApprovals, setPendingApprovals] = useState<Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string; is_deletion?: boolean }>>([])
   const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean; rejection_reason?: string | null }>>([])
   const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
@@ -761,7 +878,8 @@ export default function GroupDetailPage() {
             pendingRejection: hasPendingRejection,
             waitingForApproval: waitingForApproval,
             rejectedByMeAsProposal,
-            pendingIsDeletion: !!userApproval?.is_deletion || !!editorPendingApprovals?.[0]?.is_deletion
+            pendingIsDeletion: !!userApproval?.is_deletion || !!editorPendingApprovals?.[0]?.is_deletion,
+            pendingIsLiveClose: !!userApproval?.is_live_close || !!editorPendingApprovals?.[0]?.is_live_close
           }
         })
       )
@@ -1251,6 +1369,19 @@ export default function GroupDetailPage() {
     setSessionMembers(updated)
   }
 
+  // Applying the remainder split is now a two-step select → preview → confirm
+  // flow (see the "Split the remaining $X between" UI) rather than an
+  // immediate action: picking an option just selects it, computeRemainderSplit
+  // (module scope, above) renders a live preview from it, and this only runs
+  // once the user hits "Confirm split".
+  const applyRemainderSplit = () => {
+    if (!remainderSplitMode) return
+    const updated = computeRemainderSplit(sessionMembers, remainderSplitMode)
+    if (!updated) return
+    setSessionMembers(updated)
+    setRemainderSplitMode(null)
+  }
+
   // The one primitive that actually attributes a payment to the database: set this
   // person's amount on this session, update-if-exists-else-insert. A $0 amount means
   // "no payment" and deletes the row instead, so no meaningless zero rows accumulate.
@@ -1372,6 +1503,58 @@ export default function GroupDetailPage() {
     if (viewingSessionId === sessionId) setViewingSessionId(null)
   }
 
+  // Applies every approved change once no pending rows remain for a session,
+  // then cleans up. Shared by handleApproveEdit (called after an approver
+  // votes) and handleProposeCloseLiveSession (called right after proposing —
+  // if the closer's own auto-approval was the only vote actually needed,
+  // e.g. a live session where they're the only one with a nonzero total,
+  // there's no separate "last approver" click to trigger this otherwise).
+  const finalizeSessionIfFullyApproved = async (
+    sessionId: number
+  ): Promise<'pending' | 'deleted' | 'applied' | 'none'> => {
+    const { data: stillPending } = await supabase
+      .from('SessionEditApproval')
+      .select('id')
+      .eq('session_id', sessionId)
+      .eq('status', 'pending')
+
+    if (stillPending && stillPending.length > 0) return 'pending'
+
+    const { data: approvedChanges } = await supabase
+      .from('SessionEditApproval')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('status', 'approved')
+
+    if (!approvedChanges || approvedChanges.length === 0) return 'none'
+
+    if (approvedChanges[0].is_deletion) {
+      // Everyone approved deleting the session — remove it outright rather
+      // than applying the $0 amounts, then stop.
+      await performSessionDeletion(sessionId)
+      return 'deleted'
+    }
+
+    // Apply each approved change. Only the changed rows are known here (not
+    // the session's full membership), so this upserts each one directly
+    // rather than reconciling against the full set — anyone whose amount
+    // didn't change isn't touched.
+    for (const change of approvedChanges) {
+      await upsertPayment(sessionId, change.approver_user_id, change.new_amount)
+    }
+
+    await supabase.from('SessionEditApproval').delete().eq('session_id', sessionId)
+
+    if (approvedChanges[0].is_live_close) {
+      // The line items were only ever scratch data — now that everyone's
+      // final total has been applied as a real SessionPayment, they're done.
+      await supabase.from('LiveSessionEntry').delete().eq('session_id', sessionId)
+      await supabase.from('Session').update({ is_live: false }).eq('id', sessionId)
+    }
+
+    return 'applied'
+  }
+
   const handleApproveEdit = guard(
     (approvalId: number, sessionId: number) => `approveEdit:${approvalId}`,
     async (approvalId: number, sessionId: number) => {
@@ -1384,50 +1567,12 @@ export default function GroupDetailPage() {
 
       if (updateError) throw updateError
 
-      // Check if all approvals for this session are now approved
-      const { data: allApprovals } = await supabase
-        .from('SessionEditApproval')
-        .select('*')
-        .eq('session_id', sessionId)
-        .eq('status', 'pending')
-
-      if (!allApprovals || allApprovals.length === 0) {
-        // All approvals are done — apply them
-        const { data: approvedChanges } = await supabase
-          .from('SessionEditApproval')
-          .select('*')
-          .eq('session_id', sessionId)
-          .eq('status', 'approved')
-
-        if (approvedChanges && approvedChanges.length > 0) {
-          if (approvedChanges[0].is_deletion) {
-            // Everyone approved deleting the session — remove it outright
-            // rather than applying the $0 amounts, then stop.
-            await performSessionDeletion(sessionId)
-            showToast('Everyone approved. session deleted.')
-            await loadSessions()
-            await loadDues()
-            await loadPendingApprovals()
-            return
-          }
-
-          // Apply each approved change. Only the changed rows are known here (not
-          // the session's full membership), so this upserts each one directly
-          // rather than reconciling against the full set — anyone whose amount
-          // didn't change isn't touched.
-          for (const change of approvedChanges) {
-            await upsertPayment(sessionId, change.approver_user_id, change.new_amount)
-          }
-
-          // Delete all approval records for this session
-          await supabase
-            .from('SessionEditApproval')
-            .delete()
-            .eq('session_id', sessionId)
-
-          showToast('Changes approved and applied.')
-        }
-      } else {
+      const outcome = await finalizeSessionIfFullyApproved(sessionId)
+      if (outcome === 'deleted') {
+        showToast('Everyone approved. session deleted.')
+      } else if (outcome === 'applied') {
+        showToast('Changes approved and applied.')
+      } else if (outcome === 'pending') {
         showToast('Approved. waiting on others.')
       }
 
@@ -1898,6 +2043,7 @@ export default function GroupDetailPage() {
       setSessionMembers([])
       setSplitTotalAmount('')
       setSplitPayerId(null)
+      setRemainderSplitMode(null)
       setOriginalPayments([])
       setEditingSessionId(null)
       setViewingSessionId(null)
@@ -1938,149 +2084,313 @@ export default function GroupDetailPage() {
     }
   })
 
-  const handleAddToLiveSession = guard(
-    (sessionId: number) => `addToLiveSession:${sessionId}`,
-    async (sessionId: number) => {
-    if (!userId || liveSessionAmount === '') return
+  // Reloads the individual line items for a live session — shared by opening
+  // the panel and by every add/edit/delete below, since each one needs the
+  // list to reflect what's actually in the database afterward.
+  const loadLiveEntries = async (sessionId: number) => {
+    const { data, error } = await supabase
+      .from('LiveSessionEntry')
+      .select('id, entered_by, target_user_id, amount, note')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: true })
 
-    const amountValue = parseFloat(liveSessionAmount)
+    if (error) {
+      console.error('Error loading live session entries:', error)
+      setLiveEntries([])
+      return
+    }
+
+    setLiveEntries(
+      (data || []).map((e: any) => ({
+        id: e.id,
+        entered_by: e.entered_by,
+        target_user_id: e.target_user_id,
+        amount: parseFloat(e.amount?.toString() || '0'),
+        note: e.note || null,
+      }))
+    )
+  }
+
+  const handleOpenLiveSession = guard(
+    (sessionId: number) => `openLiveSession:${sessionId}`,
+    async (sessionId: number) => {
+    if (!userId) return
+    setSelectedLiveSession(sessionId)
+    setNewLiveEntryTargetId(userId)
+    setNewLiveEntryAmount('')
+    setNewLiveEntryNote('')
+    setEditingLiveEntryId(null)
+    await loadLiveEntries(sessionId)
+    }
+  )
+
+  const closeLiveSessionPanel = () => {
+    setSelectedLiveSession(null)
+    setLiveEntries([])
+    setNewLiveEntryTargetId(null)
+    setNewLiveEntryAmount('')
+    setNewLiveEntryNote('')
+    setEditingLiveEntryId(null)
+    setLiveRemainderSplitMode(null)
+  }
+
+  const handleAddLiveEntry = guard(
+    (sessionId: number) => `addLiveEntry:${sessionId}`,
+    async (sessionId: number) => {
+    if (!userId || newLiveEntryTargetId === null || newLiveEntryAmount === '') return
+
+    const amountValue = parseFloat(newLiveEntryAmount)
     if (isNaN(amountValue)) {
       showToast('Please enter a valid amount')
       return
     }
 
     try {
-      // Only touch your own row — everyone else's contribution to this live session
-      // is untouched, so this can't reconcile against a "full set" (nobody knows the
-      // full set yet, that's the point of a live session).
-      await upsertPayment(sessionId, userId, amountValue)
+      const { error } = await supabase.from('LiveSessionEntry').insert([{
+        session_id: sessionId,
+        entered_by: userId,
+        target_user_id: newLiveEntryTargetId,
+        amount: amountValue,
+        note: newLiveEntryNote.trim() || null,
+      }])
 
-      // Close the form and reload sessions list to update stats
-      setSelectedLiveSession(null)
-      setLiveSessionAmount('')
-      setSessionDetails([])
+      if (error) throw error
+
+      setNewLiveEntryAmount('')
+      setNewLiveEntryNote('')
+      await loadLiveEntries(sessionId)
       await loadSessions()
     } catch (error: any) {
-      console.error('Error adding to live session:', error)
-      showToast('Failed to add payment: ' + (error.message || 'Unknown error'))
+      console.error('Error adding live session entry:', error)
+      showToast('Failed to add entry: ' + (error.message || 'Unknown error'))
     }
     }
   )
 
-  const handleOpenLiveSession = guard(
-    (sessionId: number) => `openLiveSession:${sessionId}`,
-    async (sessionId: number) => {
-    if (!userId) return
+  const handleStartEditLiveEntry = (entry: { id: number; amount: number; note: string | null }) => {
+    setEditingLiveEntryId(entry.id)
+    setEditingLiveEntryAmount(entry.amount.toString())
+    setEditingLiveEntryNote(entry.note || '')
+  }
 
-    setSelectedLiveSession(sessionId)
+  const handleSaveLiveEntryEdit = guard(
+    (entryId: number, sessionId: number) => `saveLiveEntry:${entryId}`,
+    async (entryId: number, sessionId: number) => {
+    if (editingLiveEntryAmount === '') return
+    const amountValue = parseFloat(editingLiveEntryAmount)
+    if (isNaN(amountValue)) {
+      showToast('Please enter a valid amount')
+      return
+    }
 
-    // Load all payments for this session to show other users' values
     try {
-      const { data: allPayments, error: paymentsError } = await supabase
-        .from('SessionPayment')
-        .select('amount, user_id')
+      const { error } = await supabase
+        .from('LiveSessionEntry')
+        .update({ amount: amountValue, note: editingLiveEntryNote.trim() || null })
+        .eq('id', entryId)
+
+      if (error) throw error
+
+      setEditingLiveEntryId(null)
+      await loadLiveEntries(sessionId)
+      await loadSessions()
+    } catch (error: any) {
+      console.error('Error updating live session entry:', error)
+      showToast('Failed to update entry: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  const handleDeleteLiveEntry = guard(
+    (entryId: number, sessionId: number) => `deleteLiveEntry:${entryId}`,
+    async (entryId: number, sessionId: number) => {
+    try {
+      const { error } = await supabase.from('LiveSessionEntry').delete().eq('id', entryId)
+      if (error) throw error
+
+      await loadLiveEntries(sessionId)
+      await loadSessions()
+    } catch (error: any) {
+      console.error('Error deleting live session entry:', error)
+      showToast('Failed to delete entry: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  // Same computeRemainderSplit used by the regular session form, just fed the
+  // live session's current per-person totals instead of sessionMembers. Unlike
+  // the form (which just overwrites local draft state), a live session's
+  // entries are already persisted, so applying a split here writes one new
+  // entry per affected person for their *share of the remainder* — not their
+  // new total — leaving every existing entry untouched. Re-fetches fresh from
+  // the database rather than trusting liveEntries, same reasoning as
+  // handleProposeCloseLiveSession: someone else's entry might not have made
+  // it into this client yet.
+  const handleApplyLiveRemainderSplit = guard(
+    (sessionId: number) => `applyLiveRemainderSplit:${sessionId}`,
+    async (sessionId: number) => {
+    if (!userId || !liveRemainderSplitMode) return
+
+    try {
+      const { data: entries, error } = await supabase
+        .from('LiveSessionEntry')
+        .select('target_user_id, amount')
         .eq('session_id', sessionId)
 
-      if (paymentsError) throw paymentsError
+      if (error) throw error
 
-      // Find the user's current payment
-      const userPayment = allPayments?.find((p: any) => p.user_id === userId)
-      if (userPayment) {
-        setLiveSessionAmount(parseFloat(userPayment.amount?.toString() || '0').toString())
-      } else {
-        setLiveSessionAmount('')
+      const centsByUser = new Map<number, number>()
+      for (const e of entries || []) {
+        const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
+        centsByUser.set(e.target_user_id, (centsByUser.get(e.target_user_id) || 0) + cents)
       }
 
-      // Store all payments for display
-      const paymentsWithUserInfo = (allPayments || []).map((payment: any) => {
-        const member = members.find(m => m.user_id === payment.user_id)
-        return {
-          user_id: payment.user_id,
-          email: member?.email || 'Unknown',
-          username: member?.username || 'Unknown',
-          first_name: member?.first_name || '',
-          last_name: member?.last_name || '',
-          amount: parseFloat(payment.amount?.toString() || '0')
-        }
-      })
+      const draftMembers = [...centsByUser.entries()].map(([id, cents]) => ({
+        user_id: id,
+        amount: (cents / 100).toFixed(2),
+      }))
 
-      setSessionDetails(paymentsWithUserInfo)
-    } catch (error) {
-      console.error('Error loading live session payments:', error)
-      setLiveSessionAmount('')
-      setSessionDetails([])
-    }
-    }
-  )
-
-  const handleCloseLiveSession = guard(
-    (sessionId: number) => `closeLiveSession:${sessionId}`,
-    async (sessionId: number) => {
-    try {
-      // Get all payments for this session
-      const { data: paymentsData, error: paymentsError } = await supabase
-        .from('SessionPayment')
-        .select('amount')
-        .eq('session_id', sessionId)
-
-      if (paymentsError) throw paymentsError
-
-      // Calculate sum
-      const total = (paymentsData || []).reduce((sum: number, payment: any) => {
-        return sum + parseFloat(payment.amount?.toString() || '0')
-      }, 0)
-
-      // Check if sum equals 0
-      if (Math.abs(total) > 0.01) {
-        showToast(`Cannot close session. The sum of all amounts must equal 0. Current sum: ${total.toFixed(2)}`)
+      const preview = computeRemainderSplit(draftMembers, liveRemainderSplitMode)
+      if (!preview) {
+        setLiveRemainderSplitMode(null)
         return
       }
 
-      // Close the session
-      const { error: updateError } = await supabase
-        .from('Session')
-        .update({ is_live: false })
-        .eq('id', sessionId)
+      const noteByMode: Record<RemainderSplitMode, string> = {
+        evenly: 'Balance adjustment — split evenly',
+        winners: 'Balance adjustment — split between winners',
+        losers: 'Balance adjustment — split between losers',
+        biggestWinner: 'Balance adjustment — biggest winner',
+        biggestLoser: 'Balance adjustment — biggest loser',
+      }
 
-      if (updateError) throw updateError
+      const rows = draftMembers
+        .map((sm, i) => ({
+          target_user_id: sm.user_id,
+          deltaCents: Math.round(parseFloat(preview[i].amount) * 100) - Math.round(parseFloat(sm.amount) * 100),
+        }))
+        .filter((r) => r.deltaCents !== 0)
+        .map((r) => ({
+          session_id: sessionId,
+          entered_by: userId,
+          target_user_id: r.target_user_id,
+          amount: r.deltaCents / 100,
+          note: noteByMode[liveRemainderSplitMode],
+        }))
 
-      // Close the popup and reload sessions
-      setSelectedLiveSession(null)
-      setLiveSessionAmount('')
-      setSessionDetails([])
+      if (rows.length === 0) {
+        setLiveRemainderSplitMode(null)
+        return
+      }
+
+      const { error: insertError } = await supabase.from('LiveSessionEntry').insert(rows)
+      if (insertError) throw insertError
+
+      setLiveRemainderSplitMode(null)
+      await loadLiveEntries(sessionId)
       await loadSessions()
-      showToast('Live session closed successfully!')
     } catch (error: any) {
-      console.error('Error closing live session:', error)
+      console.error('Error applying remainder split:', error)
+      showToast('Failed to apply split: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  // Proposing a close sums every entry per person and turns that into the
+  // same unanimous-approval flow any other session edit goes through — one
+  // pending row per person with a nonzero total, asking them to confirm it's
+  // right. The closer's own total (if they have one) auto-approves, same as
+  // an ordinary editor's own change elsewhere in this file. Entries
+  // themselves are untouched here — is_live_session_open_for_entry (see the
+  // migration) is what actually freezes them the moment these rows exist.
+  const handleProposeCloseLiveSession = guard(
+    (sessionId: number) => `proposeCloseLiveSession:${sessionId}`,
+    async (sessionId: number) => {
+    if (!userId) return
+
+    try {
+      // Re-fetch fresh rather than trusting local state, in case someone
+      // else's entry hasn't made it into this client yet.
+      const { data: entries, error: entriesError } = await supabase
+        .from('LiveSessionEntry')
+        .select('target_user_id, amount')
+        .eq('session_id', sessionId)
+
+      if (entriesError) throw entriesError
+
+      const centsByUser = new Map<number, number>()
+      for (const e of entries || []) {
+        const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
+        centsByUser.set(e.target_user_id, (centsByUser.get(e.target_user_id) || 0) + cents)
+      }
+
+      const totalCents = [...centsByUser.values()].reduce((sum, c) => sum + c, 0)
+      if (totalCents !== 0) {
+        showToast(`Sum must equal $0.00 to close. Current sum: $${(totalCents / 100).toFixed(2)}`)
+        return
+      }
+
+      const participants = [...centsByUser.entries()].filter(([, cents]) => cents !== 0)
+
+      if (participants.length === 0) {
+        // Nobody ends up with a nonzero total (an empty session, or entries
+        // that cancelled out per-person too) — nothing for anyone to
+        // approve, so just finalize outright.
+        await supabase.from('LiveSessionEntry').delete().eq('session_id', sessionId)
+        await supabase.from('Session').update({ is_live: false }).eq('id', sessionId)
+        closeLiveSessionPanel()
+        await loadSessions()
+        await loadDues()
+        showToast('Session closed — nobody had a balance to settle.')
+        return
+      }
+
+      const { error: insertError } = await supabase.from('SessionEditApproval').insert(
+        participants.map(([targetId, cents]) => ({
+          session_id: sessionId,
+          editor_user_id: userId,
+          approver_user_id: targetId,
+          status: targetId === userId ? 'approved' : 'pending',
+          old_amount: 0,
+          new_amount: cents / 100,
+          is_live_close: true,
+        }))
+      )
+
+      if (insertError) throw insertError
+
+      // Covers the edge case where the closer's own auto-approval was the
+      // only vote actually needed (e.g. they're the only participant with a
+      // nonzero total) — there's no separate approver click to trigger this
+      // otherwise.
+      const outcome = await finalizeSessionIfFullyApproved(sessionId)
+
+      closeLiveSessionPanel()
+      await loadSessions()
+      await loadDues()
+      await loadPendingApprovals()
+      showToast(outcome === 'applied' ? 'Session closed.' : 'Close requested. waiting on everyone to confirm their total.')
+    } catch (error: any) {
+      console.error('Error proposing close:', error)
       showToast('Failed to close session: ' + (error.message || 'Unknown error'))
     }
     }
   )
 
-  // Cancel (abandon) a live session — discards every payment entered so far and
-  // removes the session entirely. Distinct from "Close," which finalizes it.
+  // Cancel (abandon) a live session — discards every entry so far and removes
+  // the session entirely, including any close vote currently in progress.
+  // Restricted to whoever started the session (see cancel_live_session in
+  // the migration) — unlike everyday entry add/edit/delete, which stays open
+  // to the whole group, cancelling isn't reversible by anyone else.
   const handleCancelLiveSession = guard(
     (sessionId: number) => `cancelLiveSession:${sessionId}`,
     async (sessionId: number) => {
     try {
-      const { error: paymentsError } = await supabase
-        .from('SessionPayment')
-        .delete()
-        .eq('session_id', sessionId)
-
-      if (paymentsError) throw paymentsError
-
-      const { error: sessionError } = await supabase
-        .from('Session')
-        .delete()
-        .eq('id', sessionId)
-
-      if (sessionError) throw sessionError
+      const { error } = await supabase.rpc('cancel_live_session', { target_session_id: sessionId })
+      if (error) throw error
 
       setConfirmCancelSessionId(null)
-      setSelectedLiveSession(null)
-      setLiveSessionAmount('')
-      setSessionDetails([])
+      closeLiveSessionPanel()
       await loadSessions()
       await loadDues()
     } catch (error: any) {
@@ -4273,9 +4583,24 @@ export default function GroupDetailPage() {
 
           {activeTab === 'sessions' && (
             <div>
-              <div className="flex items-center justify-between mb-6">
-                <div>
-                  <h2 className="font-display text-2xl font-semibold">Sessions</h2>
+              <h2 className="font-display text-2xl font-semibold mb-6">Sessions</h2>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+                <div className="segmented">
+                  <button
+                    type="button"
+                    onClick={() => setSessionsScope('mine')}
+                    className={`segmented-btn ${sessionsScope === 'mine' ? 'selected' : ''}`}
+                  >
+                    My sessions
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSessionsScope('all')}
+                    className={`segmented-btn ${sessionsScope === 'all' ? 'selected' : ''}`}
+                  >
+                    All sessions
+                  </button>
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => setShowMakePaymentModal(true)} className="btn-secondary">
@@ -4451,24 +4776,116 @@ export default function GroupDetailPage() {
                             </div>
                           ))}
                           </div>
-                          <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
-                            <div className="flex items-center justify-between">
-                              <span className="text-sm font-medium">Total sum</span>
-                              <span
-                                className="amount text-lg font-semibold"
-                                style={{
-                                  color: Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) < 0.01
-                                    ? 'var(--accent)'
-                                    : 'var(--negative)',
-                                }}
-                              >
-                                ${sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0).toFixed(2)}
-                              </span>
-                            </div>
-                            {Math.abs(sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0)) >= 0.01 && (
-                              <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to create session</p>
-                            )}
-                          </div>
+                          {(() => {
+                            const totalCents = Math.round(
+                              sessionMembers.reduce((sum, sm) => sum + parseFloat(sm.amount || '0'), 0) * 100
+                            )
+                            const isBalanced = totalCents === 0
+                            const hasWinner = sessionMembers.some(sm => Math.round(parseFloat(sm.amount || '0') * 100) > 0)
+                            const hasLoser = sessionMembers.some(sm => Math.round(parseFloat(sm.amount || '0') * 100) < 0)
+
+                            const options: { mode: RemainderSplitMode; label: string; disabled: boolean }[] = [
+                              { mode: 'evenly', label: 'Evenly', disabled: false },
+                              { mode: 'winners', label: 'Winners', disabled: !hasWinner },
+                              { mode: 'losers', label: 'Losers', disabled: !hasLoser },
+                              { mode: 'biggestWinner', label: 'Biggest winner', disabled: !hasWinner },
+                              { mode: 'biggestLoser', label: 'Biggest loser', disabled: !hasLoser },
+                            ]
+
+                            // Live preview of the selected option against the amounts as
+                            // they stand right now — reselecting, or editing an amount by
+                            // hand while an option is picked, recomputes it automatically
+                            // since nothing is applied until "Confirm split".
+                            const preview = remainderSplitMode ? computeRemainderSplit(sessionMembers, remainderSplitMode) : null
+                            const changedRows = preview
+                              ? sessionMembers
+                                  .map((sm, i) => ({ sm, next: preview[i] }))
+                                  .filter(({ sm, next }) => sm.amount !== next.amount)
+                              : []
+
+                            return (
+                              <div className="mt-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
+                                <div className="flex items-center justify-between">
+                                  <span className="text-sm font-medium">Total sum</span>
+                                  <span
+                                    className="amount text-lg font-semibold"
+                                    style={{ color: isBalanced ? 'var(--accent)' : 'var(--negative)' }}
+                                  >
+                                    ${(totalCents / 100).toFixed(2)}
+                                  </span>
+                                </div>
+                                {!isBalanced && (
+                                  <>
+                                    <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to create session</p>
+                                    <div className="mt-2">
+                                      <p className="text-xs mb-1.5" style={{ color: 'var(--text-muted)' }}>
+                                        Split the remaining ${(Math.abs(totalCents) / 100).toFixed(2)} between:
+                                      </p>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        {options.map(({ mode, label, disabled }) => (
+                                          <button
+                                            key={mode}
+                                            type="button"
+                                            onClick={() => setRemainderSplitMode(prev => (prev === mode ? null : mode))}
+                                            className="btn-secondary text-xs py-1"
+                                            style={remainderSplitMode === mode ? { borderColor: 'var(--accent)', color: 'var(--accent)', background: 'var(--accent-soft)' } : undefined}
+                                            disabled={disabled}
+                                          >
+                                            {label}
+                                          </button>
+                                        ))}
+                                      </div>
+
+                                      {preview && (
+                                        <div className="mt-3 p-2.5 rounded-lg border" style={{ borderColor: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                                          <p className="text-xs font-medium mb-1.5">Preview</p>
+                                          {changedRows.length === 0 ? (
+                                            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>This option wouldn&apos;t change anything.</p>
+                                          ) : (
+                                            <div className="space-y-1 mb-2">
+                                              {changedRows.map(({ sm, next }) => {
+                                                const member = members.find(m => m.user_id === sm.user_id)
+                                                const displayName = member ? formatDisplayName(members, member) : sm.username
+                                                return (
+                                                  <div key={sm.user_id} className="flex items-center justify-between text-xs">
+                                                    <span>{displayName}</span>
+                                                    <span className="amount">
+                                                      <span style={{ color: 'var(--text-muted)' }}>${sm.amount || '0.00'}</span>
+                                                      {' → '}
+                                                      <span className="font-semibold" style={{ color: parseFloat(next.amount) >= 0 ? 'var(--accent)' : 'var(--negative)' }}>
+                                                        ${next.amount}
+                                                      </span>
+                                                    </span>
+                                                  </div>
+                                                )
+                                              })}
+                                            </div>
+                                          )}
+                                          <div className="flex gap-2">
+                                            <button
+                                              type="button"
+                                              onClick={applyRemainderSplit}
+                                              className="btn-primary text-xs py-1 flex-1"
+                                              disabled={changedRows.length === 0}
+                                            >
+                                              Confirm split
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => setRemainderSplitMode(null)}
+                                              className="btn-secondary text-xs py-1"
+                                            >
+                                              Cancel
+                                            </button>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            )
+                          })()}
                         </>
                       )}
                     </div>
@@ -4485,6 +4902,7 @@ export default function GroupDetailPage() {
                           setSessionMembers([])
                           setSplitTotalAmount('')
                           setSplitPayerId(null)
+                          setRemainderSplitMode(null)
                           setEditingSessionId(null)
                           setViewingSessionId(null)
                           setShowMemberDropdown(false)
@@ -4499,12 +4917,28 @@ export default function GroupDetailPage() {
               )}
 
                 <>
-                  {sessions.length === 0 ? (
-                    <p style={{ color: 'var(--text-muted)' }}>No sessions yet.</p>
-                  ) : (
+                  {(() => {
+                    const visibleSessions = sessions.filter(session =>
+                      session.id !== editingSessionId &&
+                      !session.rejectedByMeAsProposal &&
+                      // Live sessions are still open for anyone to join in on, so
+                      // "My sessions" shouldn't hide one just because you haven't
+                      // put in your own amount yet — only closed sessions get
+                      // filtered down to ones you actually have a payment in.
+                      (sessionsScope === 'all' || session.is_live || (session.userPayment !== null && session.userPayment !== undefined))
+                    )
+                    if (visibleSessions.length === 0) {
+                      return (
+                        <p style={{ color: 'var(--text-muted)' }}>
+                          {sessions.length === 0
+                            ? 'No sessions yet.'
+                            : "You're not part of any sessions yet."}
+                        </p>
+                      )
+                    }
+                    return (
                     <div className="space-y-2">
-                      {sessions
-                        .filter(session => session.id !== editingSessionId && !session.rejectedByMeAsProposal)
+                      {visibleSessions
                         .sort((a, b) => {
                           // Check if sessions have special statuses
                           const aHasSpecialStatus = a.pendingApproval || a.pendingRejection || a.waitingForApproval
@@ -4537,9 +4971,7 @@ export default function GroupDetailPage() {
                                 setViewingSessionId(viewingSessionId === session.id ? null : session.id)
                               } else if (session.is_live) {
                                 if (selectedLiveSession === session.id) {
-                                  setSelectedLiveSession(null)
-                                  setLiveSessionAmount('')
-                                  setSessionDetails([])
+                                  closeLiveSessionPanel()
                                 } else {
                                   handleOpenLiveSession(session.id)
                                 }
@@ -4551,11 +4983,15 @@ export default function GroupDetailPage() {
                             }}
                             id={`session-row-${session.id}`}
                             className="card cursor-pointer transition-colors hover:border-[var(--accent)]"
-                            style={
-                              session.is_live
-                                ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)' }
-                                : undefined
-                            }
+                            // A left accent stripe instead of a full tinted background —
+                            // enough to catch the eye scanning the list without washing
+                            // out the whole card. Every row gets the same 3px border-left
+                            // width (transparent when not live) so live and non-live cards
+                            // still line up exactly.
+                            style={{
+                              borderLeftWidth: 3,
+                              borderLeftColor: session.is_live ? 'var(--accent)' : 'transparent',
+                            }}
                           >
                             <div className="flex items-start justify-between gap-4">
                               <div className="flex-1">
@@ -4615,30 +5051,65 @@ export default function GroupDetailPage() {
                                 </div>
                               </div>
                               <div className="flex items-center gap-2 shrink-0">
-                                {session.is_live && (
+                                {/* Live, open for entry — normal editing state. Cancel (throw the
+                                    whole session away) is creator-only; anyone can propose closing. */}
+                                {session.is_live && !session.waitingForApproval && !session.pendingApproval && (
                                   <>
+                                    {session.created_by === userId && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          setConfirmCancelSessionId(session.id)
+                                        }}
+                                        className="btn-secondary text-sm py-1"
+                                        style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
+                                      >
+                                        Cancel
+                                      </button>
+                                    )}
                                     <button
                                       onClick={(e) => {
                                         e.stopPropagation()
-                                        setConfirmCancelSessionId(session.id)
+                                        setConfirmCloseLiveSessionId(session.id)
                                       }}
-                                      className="btn-secondary text-sm py-1"
-                                      style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
-                                    >
-                                      Cancel
-                                    </button>
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation()
-                                        handleCloseLiveSession(session.id)
-                                      }}
-                                      disabled={isBusy(`closeLiveSession:${session.id}`)}
                                       className="btn-danger text-sm py-1"
                                     >
                                       Close session
                                     </button>
                                   </>
                                 )}
+                                {/* Live, but I proposed closing and I'm waiting on everyone else to
+                                    confirm their total — I can still back out, and the creator can
+                                    still abandon the whole thing even mid-vote. */}
+                                {session.is_live && session.waitingForApproval && (
+                                  <>
+                                    {session.created_by === userId && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          setConfirmCancelSessionId(session.id)
+                                        }}
+                                        className="btn-secondary text-sm py-1"
+                                        style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
+                                      >
+                                        Cancel
+                                      </button>
+                                    )}
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setConfirmCancelEditSessionId(session.id)
+                                      }}
+                                      className="btn-secondary text-sm py-1"
+                                      style={{ borderColor: 'var(--negative)', color: 'var(--negative)' }}
+                                    >
+                                      {cancelActionLabel(pendingSessionKind(session))}
+                                    </button>
+                                  </>
+                                )}
+                                {/* Live, and someone else proposed closing — I need to approve/reject.
+                                    No buttons here; clicking the row routes to the same review UI a
+                                    regular pending edit uses (see the row's onClick above). */}
                                 {!session.is_live && session.waitingForApproval && (
                                   <button
                                     onClick={(e) => {
@@ -4683,115 +5154,293 @@ export default function GroupDetailPage() {
                                 {renderSessionExpansion(session, pendingApproval, pendingRejection, hasUndismissedRejection)}
                               </div>
                             )}
-                            {selectedLiveSession === session.id && (
-                              <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border)' }} onClick={(e) => e.stopPropagation()}>
-                                <p className="eyebrow mb-3">Live session payments</p>
+                            {selectedLiveSession === session.id && (() => {
+                              const isInvolved =
+                                session.created_by === userId ||
+                                liveEntries.some((e) => e.entered_by === userId || e.target_user_id === userId)
+                              const targetIds = [...new Set(liveEntries.map((e) => e.target_user_id))]
+                              const totalCents = liveEntries.reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
 
-                                {/* Show all payments */}
-                                {sessionDetails.length > 0 && (
-                                  <div className="mb-4">
-                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Current payments</p>
-                                    <div className="space-y-2">
-                                      {sessionDetails.map((detail) => (
-                                        <div
-                                          key={detail.user_id}
-                                          className="rounded-lg p-3 flex items-center justify-between border"
-                                          style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}
-                                        >
-                                          <div className="flex items-center gap-3">
-                                            {(() => {
-                                              const member = members.find(m => m.user_id === detail.user_id)
-                                              const displayName = member ? formatDisplayName(members, member) : detail.username
-                                              return (
-                                                <>
-                                                  <Avatar url={member?.avatar_url} name={displayName} size={32} />
-                                                  <div>
-                                                    <p className="font-medium text-sm">
-                                                      {displayName}
-                                                      {detail.user_id === userId && (
-                                                        <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>(You)</span>
-                                                      )}
-                                                    </p>
-                                                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>@{detail.username}</p>
+                              // Same select → preview → confirm remainder-split flow as the
+                              // regular session form, fed each person's current live total
+                              // instead of sessionMembers (see handleApplyLiveRemainderSplit).
+                              const draftMembers: SessionMemberDraft[] = targetIds.map((id) => {
+                                const subtotalCents = liveEntries
+                                  .filter((e) => e.target_user_id === id)
+                                  .reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
+                                return { user_id: id, amount: (subtotalCents / 100).toFixed(2) }
+                              })
+                              const hasWinner = draftMembers.some((sm) => parseFloat(sm.amount) > 0)
+                              const hasLoser = draftMembers.some((sm) => parseFloat(sm.amount) < 0)
+                              const remainderOptions: { mode: RemainderSplitMode; label: string; disabled: boolean }[] = [
+                                { mode: 'evenly', label: 'Evenly', disabled: false },
+                                { mode: 'winners', label: 'Winners', disabled: !hasWinner },
+                                { mode: 'losers', label: 'Losers', disabled: !hasLoser },
+                                { mode: 'biggestWinner', label: 'Biggest winner', disabled: !hasWinner },
+                                { mode: 'biggestLoser', label: 'Biggest loser', disabled: !hasLoser },
+                              ]
+                              const liveRemainderPreview = liveRemainderSplitMode
+                                ? computeRemainderSplit(draftMembers, liveRemainderSplitMode)
+                                : null
+                              const liveRemainderChangedRows = liveRemainderPreview
+                                ? draftMembers
+                                    .map((sm, i) => ({ sm, next: liveRemainderPreview[i] }))
+                                    .filter(({ sm, next }) => sm.amount !== next.amount)
+                                : []
+
+                              return (
+                                <div className="mt-4 pt-4 border-t" style={{ borderColor: 'var(--border)' }} onClick={(e) => e.stopPropagation()}>
+                                  <p className="eyebrow mb-3">Live session entries</p>
+
+                                  {targetIds.length > 0 && (
+                                    <div className="mb-4 space-y-3">
+                                      {targetIds.map((targetId) => {
+                                        const entriesForTarget = liveEntries.filter((e) => e.target_user_id === targetId)
+                                        const subtotalCents = entriesForTarget.reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
+                                        const member = members.find((m) => m.user_id === targetId)
+                                        const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+
+                                        return (
+                                          <div key={targetId} className="rounded-lg border p-3" style={{ borderColor: 'var(--border)' }}>
+                                            <div className="flex items-center justify-between mb-2">
+                                              <div className="flex items-center gap-2">
+                                                <Avatar url={member?.avatar_url} name={displayName} size={28} />
+                                                <p className="font-medium text-sm">
+                                                  {displayName}
+                                                  {targetId === userId && (
+                                                    <span className="text-xs ml-1.5" style={{ color: 'var(--text-muted)' }}>(You)</span>
+                                                  )}
+                                                </p>
+                                              </div>
+                                              <p
+                                                className="amount text-sm font-semibold"
+                                                style={{ color: subtotalCents >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                              >
+                                                {subtotalCents >= 0 ? '+' : ''}${(subtotalCents / 100).toFixed(2)}
+                                              </p>
+                                            </div>
+                                            <div className="space-y-1.5">
+                                              {entriesForTarget.map((entry) =>
+                                                editingLiveEntryId === entry.id ? (
+                                                  <div key={entry.id} className="flex flex-wrap items-center gap-1.5">
+                                                    <input
+                                                      type="number"
+                                                      step="0.01"
+                                                      value={editingLiveEntryAmount}
+                                                      onChange={(e) => setEditingLiveEntryAmount(e.target.value)}
+                                                      onKeyDown={blockNumberArrowKeys}
+                                                      onWheel={blockNumberScroll}
+                                                      className="field amount no-spinner text-sm w-24 px-2 py-1"
+                                                      autoFocus
+                                                    />
+                                                    <input
+                                                      type="text"
+                                                      value={editingLiveEntryNote}
+                                                      onChange={(e) => setEditingLiveEntryNote(e.target.value)}
+                                                      className="field text-sm flex-1 min-w-[80px] px-2 py-1"
+                                                      placeholder="Note (optional)"
+                                                    />
+                                                    <button
+                                                      onClick={() => handleSaveLiveEntryEdit(entry.id, session.id)}
+                                                      disabled={editingLiveEntryAmount === '' || isBusy(`saveLiveEntry:${entry.id}`)}
+                                                      className="btn-primary text-xs py-1"
+                                                    >
+                                                      Save
+                                                    </button>
+                                                    <button
+                                                      onClick={() => setEditingLiveEntryId(null)}
+                                                      className="btn-secondary text-xs py-1"
+                                                    >
+                                                      Cancel
+                                                    </button>
                                                   </div>
-                                                </>
-                                              )
-                                            })()}
+                                                ) : (
+                                                  <div key={entry.id} className="flex items-center justify-between gap-2 text-sm">
+                                                    <div className="min-w-0">
+                                                      <span
+                                                        className="amount"
+                                                        style={{ color: entry.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                                      >
+                                                        {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
+                                                      </span>
+                                                      {entry.note && (
+                                                        <span className="ml-2" style={{ color: 'var(--text-muted)' }}>{entry.note}</span>
+                                                      )}
+                                                      {entry.entered_by !== entry.target_user_id && (
+                                                        <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                          added by {(() => {
+                                                            const enterer = members.find((m) => m.user_id === entry.entered_by)
+                                                            return enterer ? formatDisplayName(members, enterer) : 'Unknown'
+                                                          })()}
+                                                        </span>
+                                                      )}
+                                                    </div>
+                                                    {isInvolved && (
+                                                      <div className="flex gap-2 shrink-0">
+                                                        <button
+                                                          onClick={() => handleStartEditLiveEntry(entry)}
+                                                          className="text-xs font-medium hover:underline"
+                                                          style={{ color: 'var(--text-muted)' }}
+                                                        >
+                                                          Edit
+                                                        </button>
+                                                        <button
+                                                          onClick={() => handleDeleteLiveEntry(entry.id, session.id)}
+                                                          disabled={isBusy(`deleteLiveEntry:${entry.id}`)}
+                                                          className="text-xs font-medium hover:underline"
+                                                          style={{ color: 'var(--negative)' }}
+                                                        >
+                                                          Delete
+                                                        </button>
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                )
+                                              )}
+                                            </div>
                                           </div>
-                                          <p
-                                            className="amount text-sm font-semibold"
-                                            style={{ color: detail.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                                          >
-                                            {detail.amount >= 0 ? '+' : ''}${detail.amount.toFixed(2)}
-                                          </p>
-                                        </div>
-                                      ))}
+                                        )
+                                      })}
+                                    </div>
+                                  )}
+
+                                  {/* Add an entry — for yourself or anyone else in the group, whether
+                                      or not they've shown up in this session yet. */}
+                                  <div className="p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
+                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Add an entry</p>
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <select
+                                        value={newLiveEntryTargetId ?? ''}
+                                        onChange={(e) => setNewLiveEntryTargetId(e.target.value ? Number(e.target.value) : null)}
+                                        className="field text-sm px-2 py-1"
+                                        aria-label="Who this entry is for"
+                                      >
+                                        {activeMembers.map((m) => (
+                                          <option key={m.user_id} value={m.user_id}>
+                                            {m.user_id === userId ? 'You' : formatDisplayName(members, m)}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <input
+                                        type="number"
+                                        step="0.01"
+                                        value={newLiveEntryAmount}
+                                        onChange={(e) => setNewLiveEntryAmount(e.target.value)}
+                                        onKeyDown={blockNumberArrowKeys}
+                                        onWheel={blockNumberScroll}
+                                        className="field amount no-spinner text-sm w-24 px-2 py-1"
+                                        placeholder="0.00"
+                                      />
+                                      <input
+                                        type="text"
+                                        value={newLiveEntryNote}
+                                        onChange={(e) => setNewLiveEntryNote(e.target.value)}
+                                        className="field text-sm flex-1 min-w-[100px] px-2 py-1"
+                                        placeholder="Note (optional)"
+                                      />
+                                      <button
+                                        onClick={() => handleAddLiveEntry(session.id)}
+                                        disabled={newLiveEntryAmount === '' || newLiveEntryTargetId === null || isBusy(`addLiveEntry:${session.id}`)}
+                                        className="btn-primary text-sm py-1"
+                                      >
+                                        Add
+                                      </button>
                                     </div>
                                   </div>
-                                )}
 
-                                {/* User's payment input */}
-                                <div>
-                                  <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Your payment</p>
-                                  <div className="flex gap-2">
-                                    <input
-                                      type="number"
-                                      step="0.01"
-                                      value={liveSessionAmount}
-                                      onChange={(e) => setLiveSessionAmount(e.target.value)}
-                                      onWheel={blockNumberScroll}
-                                      className="field amount flex-1"
-                                      placeholder="0.00"
-                                      autoFocus
-                                    />
-                                    <button
-                                      onClick={() => handleAddToLiveSession(session.id)}
-                                      className="btn-primary"
-                                      disabled={liveSessionAmount === '' || isBusy(`addToLiveSession:${session.id}`)}
-                                    >
-                                      {liveSessionAmount && session.userPayment !== null && session.userPayment !== undefined && parseFloat(liveSessionAmount) !== session.userPayment ? 'Update' : 'Save'}
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        setSelectedLiveSession(null)
-                                        setLiveSessionAmount('')
-                                        setSessionDetails([])
-                                      }}
-                                      className="btn-secondary"
-                                    >
-                                      Dismiss
-                                    </button>
-                                  </div>
-                                </div>
-
-                                {/* Show current total */}
-                                {sessionDetails.length > 0 && (
                                   <div className="mt-3 p-2 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
                                     <div className="flex items-center justify-between">
                                       <span className="text-xs font-medium">Current total</span>
                                       <span
                                         className="amount text-sm font-semibold"
-                                        style={{
-                                          color: Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) < 0.01
-                                            ? 'var(--accent)'
-                                            : 'var(--negative)',
-                                        }}
+                                        style={{ color: totalCents === 0 ? 'var(--accent)' : 'var(--negative)' }}
                                       >
-                                        ${sessionDetails.reduce((sum, d) => sum + d.amount, 0).toFixed(2)}
+                                        ${(totalCents / 100).toFixed(2)}
                                       </span>
                                     </div>
-                                    {Math.abs(sessionDetails.reduce((sum, d) => sum + d.amount, 0)) >= 0.01 && (
-                                      <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to close session</p>
+                                    {totalCents !== 0 && (
+                                      <>
+                                        <p className="text-xs mt-1" style={{ color: 'var(--negative)' }}>Sum must equal $0.00 to close session</p>
+                                        <div className="mt-2">
+                                          <p className="text-xs mb-1.5" style={{ color: 'var(--text-muted)' }}>
+                                            Split the remaining ${(Math.abs(totalCents) / 100).toFixed(2)} between:
+                                          </p>
+                                          <div className="flex flex-wrap gap-1.5">
+                                            {remainderOptions.map(({ mode, label, disabled }) => (
+                                              <button
+                                                key={mode}
+                                                type="button"
+                                                onClick={() => setLiveRemainderSplitMode((prev) => (prev === mode ? null : mode))}
+                                                className="btn-secondary text-xs py-1"
+                                                style={liveRemainderSplitMode === mode ? { borderColor: 'var(--accent)', color: 'var(--accent)', background: 'var(--accent-soft)' } : undefined}
+                                                disabled={disabled}
+                                              >
+                                                {label}
+                                              </button>
+                                            ))}
+                                          </div>
+
+                                          {liveRemainderPreview && (
+                                            <div className="mt-3 p-2.5 rounded-lg border" style={{ borderColor: 'var(--accent)', background: 'var(--accent-soft)' }}>
+                                              <p className="text-xs font-medium mb-1.5">Preview</p>
+                                              {liveRemainderChangedRows.length === 0 ? (
+                                                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>This option wouldn&apos;t change anything.</p>
+                                              ) : (
+                                                <div className="space-y-1 mb-2">
+                                                  {liveRemainderChangedRows.map(({ sm, next }) => {
+                                                    const member = members.find((m) => m.user_id === sm.user_id)
+                                                    const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+                                                    return (
+                                                      <div key={sm.user_id} className="flex items-center justify-between text-xs">
+                                                        <span>{displayName}</span>
+                                                        <span className="amount">
+                                                          <span style={{ color: 'var(--text-muted)' }}>${sm.amount}</span>
+                                                          {' → '}
+                                                          <span className="font-semibold" style={{ color: parseFloat(next.amount) >= 0 ? 'var(--accent)' : 'var(--negative)' }}>
+                                                            ${next.amount}
+                                                          </span>
+                                                        </span>
+                                                      </div>
+                                                    )
+                                                  })}
+                                                </div>
+                                              )}
+                                              <div className="flex gap-2">
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleApplyLiveRemainderSplit(session.id)}
+                                                  className="btn-primary text-xs py-1 flex-1"
+                                                  disabled={liveRemainderChangedRows.length === 0 || isBusy(`applyLiveRemainderSplit:${session.id}`)}
+                                                >
+                                                  Confirm split
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => setLiveRemainderSplitMode(null)}
+                                                  className="btn-secondary text-xs py-1"
+                                                >
+                                                  Cancel
+                                                </button>
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      </>
                                     )}
                                   </div>
-                                )}
-                              </div>
-                            )}
+
+                                  <button onClick={closeLiveSessionPanel} className="btn-secondary text-sm mt-3">
+                                    Dismiss
+                                  </button>
+                                </div>
+                              )
+                            })()}
                           </div>
                           )
                         })}
                     </div>
-                  )}
+                    )
+                  })()}
                 </>
 
               {confirmCancelSessionId !== null && (
@@ -4811,6 +5460,34 @@ export default function GroupDetailPage() {
                       </button>
                       <button onClick={() => setConfirmCancelSessionId(null)} className="btn-secondary">
                         Keep session
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {confirmCloseLiveSessionId !== null && (
+                <div className="modal-overlay">
+                  <div className="modal-panel">
+                    <h3 className="font-display text-xl font-semibold mb-2">Close this live session?</h3>
+                    <p className="text-sm mb-6" style={{ color: 'var(--text-muted)' }}>
+                      This locks the session for editing and asks everyone with money on the line to
+                      confirm their final total. If even one person rejects it, the session reopens
+                      and everything entered stays exactly as it is.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => {
+                          handleProposeCloseLiveSession(confirmCloseLiveSessionId)
+                          setConfirmCloseLiveSessionId(null)
+                        }}
+                        disabled={isBusy(`proposeCloseLiveSession:${confirmCloseLiveSessionId}`)}
+                        className="btn-primary flex-1"
+                      >
+                        Close session
+                      </button>
+                      <button onClick={() => setConfirmCloseLiveSessionId(null)} className="btn-secondary">
+                        Keep editing
                       </button>
                     </div>
                   </div>

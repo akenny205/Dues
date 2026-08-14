@@ -196,7 +196,11 @@ type SessionMemberDraft = { user_id: number; amount: string }
 // applyRemainderSplit below, and the "Split the remaining $X between" UI).
 // Returns null when the mode has nothing to act on (session already
 // balanced, or nobody on the relevant side of $0 for
-// 'winners'/'losers'/'biggestWinner'/'biggestLoser').
+// 'winners'/'losers'/'biggestWinner'/'biggestLoser'). The live-session
+// caller includes guests in sessionMembers right alongside real members
+// (see encodeGuestSplitId) so a guest's total is both counted toward what
+// needs zeroing out and eligible to receive its own share of it, same as
+// anyone else.
 const computeRemainderSplit = <T extends SessionMemberDraft>(
   sessionMembers: T[],
   mode: RemainderSplitMode
@@ -263,6 +267,154 @@ const computeRemainderSplit = <T extends SessionMemberDraft>(
   })
 }
 
+// Encodes a live-entry target select's value ("user:<id>" / "guest:<id>")
+// back into the two mutually-exclusive columns LiveSessionEntry actually
+// stores — see newLiveEntryTarget above.
+const parseLiveEntryTarget = (
+  value: string
+): { targetUserId: number | null; targetGuestId: number | null } | null => {
+  const [kind, idStr] = value.split(':')
+  const id = Number(idStr)
+  if (!kind || !idStr || isNaN(id)) return null
+  if (kind === 'user') return { targetUserId: id, targetGuestId: null }
+  if (kind === 'guest') return { targetUserId: null, targetGuestId: id }
+  return null
+}
+
+// The remainder-split feature (see computeRemainderSplit) pools real members
+// and live-session guests into one recipient list, so a guest can win or
+// lose the split exactly like a member instead of always sitting it out.
+// LiveSessionEntry keys the two in separate id spaces that could otherwise
+// collide (a guest and a member can share the same numeric id), so a guest
+// is encoded here as the negative of their LiveSessionGuest id — real user
+// ids are always positive — letting both share computeRemainderSplit's
+// single user_id-shaped key.
+const encodeGuestSplitId = (guestId: number): number => -guestId
+const isGuestSplitId = (id: number): boolean => id < 0
+const decodeGuestSplitId = (id: number): number => -id
+
+// Builds the remainder-split recipient pool from a live session's raw
+// entries and guest delegations: each real member's own entries plus
+// whatever's been delegated to them, and each guest's still-*undelegated*
+// remainder (a guest can be split across several delegates — see
+// handleAddGuestDelegation — so only what's left uncovered shows up here,
+// never the guest's full total, or a fully-delegated guest's contribution
+// would get counted twice: once via its delegates' own totals, once via the
+// guest itself). Shared by the live split preview and
+// handleApplyLiveRemainderSplit so what's previewed is exactly what gets
+// written — the write targets these same ids (see isGuestSplitId there).
+const buildSplitRecipients = (
+  entries: Array<{ target_user_id: number | null; target_guest_id: number | null; amount: number }>,
+  delegations: Array<{ guest_id: number; user_id: number; amount: number }>,
+  guestIds: number[]
+): SessionMemberDraft[] => {
+  const ownCentsById = new Map<number, number>()
+  const guestCentsByGuestId = new Map<number, number>()
+  for (const e of entries) {
+    const cents = Math.round(e.amount * 100)
+    if (e.target_user_id !== null) {
+      ownCentsById.set(e.target_user_id, (ownCentsById.get(e.target_user_id) || 0) + cents)
+    } else if (e.target_guest_id !== null) {
+      guestCentsByGuestId.set(e.target_guest_id, (guestCentsByGuestId.get(e.target_guest_id) || 0) + cents)
+    }
+  }
+
+  const delegatedCentsByUser = new Map<number, number>()
+  const delegatedCentsByGuestId = new Map<number, number>()
+  for (const d of delegations) {
+    const cents = Math.round(d.amount * 100)
+    delegatedCentsByUser.set(d.user_id, (delegatedCentsByUser.get(d.user_id) || 0) + cents)
+    delegatedCentsByGuestId.set(d.guest_id, (delegatedCentsByGuestId.get(d.guest_id) || 0) + cents)
+  }
+
+  const recipients: SessionMemberDraft[] = []
+  for (const id of new Set([...ownCentsById.keys(), ...delegatedCentsByUser.keys()])) {
+    recipients.push({
+      user_id: id,
+      amount: (((ownCentsById.get(id) || 0) + (delegatedCentsByUser.get(id) || 0)) / 100).toFixed(2),
+    })
+  }
+  // Every guest that's been added is a recipient, even one with no entries
+  // yet (a fresh $0.00 guest) — unlike a member (who's only ever "in" this
+  // split by virtue of having an entry), adding a guest is itself the
+  // deliberate signal that they're part of this session, so "evenly" should
+  // count them in from the moment they're added, not just once they've
+  // accrued something.
+  for (const guestId of guestIds) {
+    const remainingCents = (guestCentsByGuestId.get(guestId) || 0) - (delegatedCentsByGuestId.get(guestId) || 0)
+    recipients.push({ user_id: encodeGuestSplitId(guestId), amount: (remainingCents / 100).toFixed(2) })
+  }
+  return recipients
+}
+
+// Inline "add a delegate" control for one guest — its own little form
+// (rather than more state threaded through the giant GroupDetailPage
+// component) so each guest card can have one open independently. Amount is
+// capped to whatever's still undelegated (remainingCents) and signed to
+// match its direction automatically — you only ever type a positive number.
+function AddGuestDelegateForm({
+  eligibleDelegates,
+  remainingCents,
+  disabled,
+  onAdd,
+}: {
+  eligibleDelegates: Array<{ user_id: number; label: string }>
+  remainingCents: number
+  disabled: boolean
+  onAdd: (userId: number, amount: number) => void
+}) {
+  const [userId, setUserId] = useState('')
+  const [amount, setAmount] = useState('')
+  const maxAbs = Math.abs(remainingCents) / 100
+
+  const submit = () => {
+    const uid = Number(userId)
+    const amt = parseFloat(amount)
+    if (!uid || isNaN(amt) || amt <= 0) return
+    onAdd(uid, remainingCents < 0 ? -amt : amt)
+    setUserId('')
+    setAmount('')
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <select
+        value={userId}
+        onChange={(e) => setUserId(e.target.value)}
+        disabled={disabled}
+        className="field text-xs px-2 py-0.5"
+        aria-label="Delegate to"
+      >
+        <option value="">Delegate to…</option>
+        {eligibleDelegates.map((m) => (
+          <option key={m.user_id} value={m.user_id}>{m.label}</option>
+        ))}
+      </select>
+      <input
+        type="number"
+        step="0.01"
+        min="0"
+        max={maxAbs || undefined}
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+        onKeyDown={blockNumberArrowKeys}
+        onWheel={blockNumberScroll}
+        placeholder={`Up to $${maxAbs.toFixed(2)}`}
+        className="field amount no-spinner text-xs w-28 px-2 py-0.5"
+        aria-label="Delegated amount"
+      />
+      <button
+        type="button"
+        onClick={submit}
+        disabled={disabled || !userId || !amount}
+        className="btn-secondary text-xs py-0.5 px-2"
+      >
+        Add
+      </button>
+    </div>
+  )
+}
+
 // A "make a payment" or "settle up" action creates a brand-new Session that's
 // pending approval — it isn't an edit to an existing one, even though both
 // flows reuse the same SessionEditApproval machinery under the hood (see
@@ -271,7 +423,7 @@ const computeRemainderSplit = <T extends SessionMemberDraft>(
 // Settle-ups are identified by their fixed Description (set once, in
 // handleSettleUp, and never user-editable while pending) since there's no
 // dedicated flag for them.
-type PendingSessionKind = 'deletion' | 'liveClose' | 'settleUp' | 'payment' | 'edit'
+type PendingSessionKind = 'deletion' | 'liveClose' | 'settleUp' | 'payment' | 'creation' | 'edit'
 
 // Both the whole-group plan (handleSettleUp) and the single-member version
 // scoped to just your own balance (handleSettleBalance) write one of these
@@ -285,11 +437,19 @@ const pendingSessionKind = (session: {
   pendingIsLiveClose?: boolean
   is_payment?: boolean | null
   Description?: string | null
+  memberCount?: number
 }): PendingSessionKind => {
   if (session.pendingIsDeletion) return 'deletion'
   if (session.pendingIsLiveClose) return 'liveClose'
   if (isSettleUpDescription(session.Description)) return 'settleUp'
   if (session.is_payment) return 'payment'
+  // No SessionPayment rows exist yet — this session was never actually
+  // created, it's still just a from-scratch proposal awaiting approval (see
+  // handleCreateSession's approval branch below), the same story as a
+  // settle-up/payment that hasn't landed yet. A genuine *edit* is never in
+  // this state: editing only ever targets a session that already has real
+  // payments in it.
+  if ((session.memberCount || 0) === 0) return 'creation'
   return 'edit'
 }
 
@@ -299,6 +459,7 @@ const cancelActionLabel = (kind: PendingSessionKind): string => {
     case 'liveClose': return 'Cancel closing'
     case 'settleUp': return 'Cancel settle up'
     case 'payment': return 'Cancel payment'
+    case 'creation': return 'Cancel session'
     default: return 'Cancel edit'
   }
 }
@@ -324,6 +485,11 @@ const cancelActionCopy = (kind: PendingSessionKind): { title: string; body: stri
       return {
         title: 'Cancel closing this session?',
         body: 'The session reopens for entries — nothing entered so far is lost. Anyone who already confirmed their total will be notified that it was cancelled.',
+      }
+    case 'creation':
+      return {
+        title: 'Cancel this session?',
+        body: "It'll be removed entirely and no balances will change. Anyone who already approved or rejected it will be notified that it was cancelled.",
       }
     default:
       return {
@@ -378,8 +544,18 @@ export default function GroupDetailPage() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [showAddSession, setShowAddSession] = useState(false)
   const [editingSessionId, setEditingSessionId] = useState<number | null>(null)
+  // Who created the session currently loaded in the edit form — null while
+  // creating a brand-new one (you're always its creator). Notes are
+  // creator-gated (see update_session_notes), everything else in the form
+  // isn't, so this is only consulted for the notes field.
+  const [editingSessionCreatedBy, setEditingSessionCreatedBy] = useState<number | null>(null)
   const [viewingSessionId, setViewingSessionId] = useState<number | null>(null)
   const [sessionDescription, setSessionDescription] = useState('')
+  // Notes drafted in the create/edit session form itself — separate from
+  // notesDraft, which backs the standalone inline notes editor further down
+  // renderSessionExpansion (different lifecycle, same underlying Session.notes
+  // column and update_session_notes RPC).
+  const [sessionNotesDraft, setSessionNotesDraft] = useState('')
   const [sessionMembers, setSessionMembers] = useState<Array<{ user_id: number; email: string; username: string; first_name?: string; last_name?: string; amount: string }>>([])
   // The remainder-split option the user has selected but not yet confirmed —
   // null means no option is picked, so no preview is shown. See
@@ -392,15 +568,41 @@ export default function GroupDetailPage() {
   const [selectedLiveSession, setSelectedLiveSession] = useState<number | null>(null)
   // Individual line items for the currently-open live session — distinct from
   // sessionDetails above, which is the one-amount-per-person view used by
-  // renderSessionExpansion for regular (non-live) sessions.
+  // renderSessionExpansion for regular (non-live) sessions. target_user_id
+  // and target_guest_id are mutually exclusive (see the migration's CHECK
+  // constraint) — exactly one is set per entry.
   const [liveEntries, setLiveEntries] = useState<Array<{
     id: number
     entered_by: number
-    target_user_id: number
+    target_user_id: number | null
+    target_guest_id: number | null
     amount: number
     note: string | null
   }>>([])
-  const [newLiveEntryTargetId, setNewLiveEntryTargetId] = useState<number | null>(null)
+  // Guests in the currently-open live session — people without a group
+  // account, added as a placeholder for the duration of the session. Their
+  // total has to be delegated to real, active members before the session
+  // can close (see handleProposeCloseLiveSession).
+  const [liveGuests, setLiveGuests] = useState<Array<{
+    id: number
+    name: string
+    created_by: number
+  }>>([])
+  // How a guest's total is split across delegates — zero, one, or several
+  // rows per guest, each an arbitrary amount (see handleAddGuestDelegation).
+  // Multiple rows can share a guest_id (a split) or a user_id (one person
+  // covering several guests).
+  const [liveGuestDelegations, setLiveGuestDelegations] = useState<Array<{
+    id: number
+    guest_id: number
+    user_id: number
+    amount: number
+  }>>([])
+  const [newGuestName, setNewGuestName] = useState('')
+  // Encodes who a new/edited entry is for as "user:<id>" or "guest:<id>" —
+  // a single <select> naturally only ever has one string value, so this
+  // avoids needing two pieces of state that could disagree with each other.
+  const [newLiveEntryTarget, setNewLiveEntryTarget] = useState('')
   const [newLiveEntryAmount, setNewLiveEntryAmount] = useState('')
   const [newLiveEntryNote, setNewLiveEntryNote] = useState('')
   const [editingLiveEntryId, setEditingLiveEntryId] = useState<number | null>(null)
@@ -414,6 +616,12 @@ export default function GroupDetailPage() {
   // confirmCancelSessionId below, which confirms the destructive "throw the
   // whole session away" action instead.
   const [confirmCloseLiveSessionId, setConfirmCloseLiveSessionId] = useState<number | null>(null)
+  // Guests with a nonzero total who still need a delegate, snapshotted right
+  // before the confirm-close modal opens (see the "Close session" button) —
+  // shown there as a red blocker: delegation itself happens earlier, from
+  // the guest list at the bottom of the live session panel (see
+  // handleAddGuestDelegation), not in this modal.
+  const [closeSessionPendingGuests, setCloseSessionPendingGuests] = useState<Array<{ id: number; name: string; subtotalCents: number }>>([])
   const [pendingApprovals, setPendingApprovals] = useState<Array<{ id: number; session_id: number; editor_user_id: number; old_amount: number; new_amount: number; session_description: string; is_deletion?: boolean }>>([])
   const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean; rejection_reason?: string | null }>>([])
   const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
@@ -1165,7 +1373,9 @@ export default function GroupDetailPage() {
       }])
     }
     setEditingSessionId(null)
+    setEditingSessionCreatedBy(null)
     setSessionDescription('')
+    setSessionNotesDraft('')
     setSplitTotalAmount('')
     setSplitPayerId(userId)
     setShowAddSession(true)
@@ -1198,6 +1408,43 @@ export default function GroupDetailPage() {
     } catch (error: any) {
       console.error('Error loading session details:', error)
       setSessionDetails([])
+    }
+  }
+
+  // Backs the "Member payments" / "All changes" breakdown inside an expanded
+  // session row. Pulled out of the viewingSessionId effect below so it can
+  // also be called explicitly right after an approval lands (see
+  // handleApproveEdit) — the effect only re-fires when *which* session is
+  // being viewed changes, not when the still-viewed one's own approval rows
+  // get updated, which otherwise left this (and loadSessionDetails above)
+  // showing pre-approval amounts even though the collapsed row and the Dues
+  // tab had already picked up the real ones.
+  const loadSessionApprovals = async (sessionId: number) => {
+    // Fetch both pending and approved records to show all changes including the editor's
+    const { data: approvalsData, error } = await supabase
+      .from('SessionEditApproval')
+      .select('approver_user_id, old_amount, new_amount, editor_user_id, status')
+      .eq('session_id', sessionId)
+      .in('status', ['pending', 'approved'])
+
+    if (error) {
+      console.error('Error fetching approval records:', error)
+      setAllSessionApprovals([])
+      setEditorUserId(null)
+      return
+    }
+
+    if (approvalsData && approvalsData.length > 0) {
+      const editorId = approvalsData[0]?.editor_user_id
+      setEditorUserId(editorId || null)
+      setAllSessionApprovals(approvalsData.map((a: any) => ({
+        user_id: a.approver_user_id,
+        old_amount: parseFloat(a.old_amount?.toString() || '0'),
+        new_amount: parseFloat(a.new_amount?.toString() || '0'),
+      })))
+    } else {
+      setAllSessionApprovals([])
+      setEditorUserId(null)
     }
   }
 
@@ -1256,6 +1503,8 @@ export default function GroupDetailPage() {
       })
 
       setSessionDescription(sessionData.Description || '')
+      setSessionNotesDraft(sessionData.notes || '')
+      setEditingSessionCreatedBy(sessionData.created_by ?? null)
       setSessionMembers(paymentsWithUserInfo)
       setSplitTotalAmount('')
       setSplitPayerId(paymentsWithUserInfo.some((p: any) => p.user_id === userId) ? userId : (paymentsWithUserInfo[0]?.user_id ?? null))
@@ -1470,6 +1719,7 @@ export default function GroupDetailPage() {
     if (viewingSessionId === sessionId) setViewingSessionId(null)
     if (editingSessionId === sessionId) {
       setEditingSessionId(null)
+      setEditingSessionCreatedBy(null)
       setShowAddSession(false)
     }
   }
@@ -1546,9 +1796,12 @@ export default function GroupDetailPage() {
     await supabase.from('SessionEditApproval').delete().eq('session_id', sessionId)
 
     if (approvedChanges[0].is_live_close) {
-      // The line items were only ever scratch data — now that everyone's
-      // final total has been applied as a real SessionPayment, they're done.
+      // The line items (and any guests, and their delegations) were only
+      // ever scratch data — now that everyone's final total has been
+      // applied as a real SessionPayment, they're done.
       await supabase.from('LiveSessionEntry').delete().eq('session_id', sessionId)
+      await supabase.from('LiveSessionGuestDelegation').delete().eq('session_id', sessionId)
+      await supabase.from('LiveSessionGuest').delete().eq('session_id', sessionId)
       await supabase.from('Session').update({ is_live: false }).eq('id', sessionId)
     }
 
@@ -1579,6 +1832,18 @@ export default function GroupDetailPage() {
       await loadSessions()
       await loadDues()
       await loadPendingApprovals()
+
+      // The row's collapsed summary and the Dues tab both just picked up the
+      // real numbers via loadSessions/loadDues above — but if this session is
+      // sitting expanded, its "Member payments" breakdown is driven by
+      // sessionDetails/allSessionApprovals, which only reload when
+      // viewingSessionId itself changes (see that effect). Left alone, an
+      // approval landing on the session you're currently looking at would
+      // show stale pre-approval amounts until you collapsed and reopened it.
+      if (viewingSessionId === sessionId) {
+        await loadSessionDetails(sessionId)
+        await loadSessionApprovals(sessionId)
+      }
     } catch (error: any) {
       console.error('Error approving edit:', error)
       showToast('Failed to approve edit: ' + (error.message || 'Unknown error'))
@@ -1734,7 +1999,7 @@ export default function GroupDetailPage() {
     try {
       const targetSession = sessions.find(s => s.id === sessionId)
       const kind = pendingSessionKind(targetSession || {})
-      const isProposal = (kind === 'settleUp' || kind === 'payment') && (targetSession?.memberCount || 0) === 0
+      const isProposal = (kind === 'settleUp' || kind === 'payment' || kind === 'creation') && (targetSession?.memberCount || 0) === 0
 
       const { data: rows, error: fetchError } = await supabase
         .from('SessionEditApproval')
@@ -2019,6 +2284,18 @@ export default function GroupDetailPage() {
           .eq('id', editingSessionId)
 
         if (sessionError) throw sessionError
+
+        // Notes are creator-gated (see update_session_notes) unlike the rest
+        // of this form, so this only fires when you're actually allowed to —
+        // the field itself is disabled for everyone else (see the form JSX).
+        const canEditThisSessionsNotes = editingSessionCreatedBy == null || editingSessionCreatedBy === userId
+        if (canEditThisSessionsNotes) {
+          const { error: notesError } = await supabase.rpc('update_session_notes', {
+            target_session_id: editingSessionId,
+            new_notes: sessionNotesDraft.trim() || null,
+          })
+          if (notesError) throw notesError
+        }
       } else {
         // Create new session
         const { data: sessionData, error: sessionError } = await supabase
@@ -2026,6 +2303,7 @@ export default function GroupDetailPage() {
           .insert([{
             group_id: groupId,
             Description: sessionDescription || null,
+            notes: sessionNotesDraft.trim() || null,
             created_by: userId
           }])
           .select('id')
@@ -2033,19 +2311,50 @@ export default function GroupDetailPage() {
 
         if (sessionError) throw sessionError
 
-        await reconcileSession(sessionData.id, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
+        // A brand-new session that puts a balance on someone else changes
+        // their numbers just as much as editing an existing one does, so it
+        // goes through the exact same SessionEditApproval flow as the edit
+        // branch above (and handleMakePayment/handleSettleUp): your own
+        // entry auto-approves, everyone else's is pending, and nothing lands
+        // in SessionPayment until every pending row clears (see
+        // handleApproveEdit) — otherwise anyone could fabricate a shared
+        // expense that silently puts a debt on someone who never agreed to it.
+        const nonZeroMembers = sessionMembers.filter(sm => Math.abs(parseFloat(sm.amount || '0')) >= 0.01)
+        const others = nonZeroMembers.filter(sm => sm.user_id !== userId)
 
-        showToast('Session created successfully!')
+        if (others.length === 0) {
+          // Nobody else actually has a stake in this session (e.g. you're
+          // the only real participant) — nothing to ask anyone, so it can
+          // just be written directly.
+          await reconcileSession(sessionData.id, sessionMembers.map(sm => ({ user_id: sm.user_id, amount: parseFloat(sm.amount) })))
+          showToast('Session created successfully!')
+        } else {
+          const approvalRecords = nonZeroMembers.map(sm => ({
+            session_id: sessionData.id,
+            editor_user_id: userId,
+            approver_user_id: sm.user_id,
+            status: sm.user_id === userId ? 'approved' : 'pending',
+            old_amount: 0,
+            new_amount: parseFloat(sm.amount),
+          }))
+
+          const { error: approvalError } = await supabase.from('SessionEditApproval').insert(approvalRecords)
+          if (approvalError) throw approvalError
+
+          showToast(`Session created. waiting on ${others.length} approval${others.length === 1 ? '' : 's'}.`)
+        }
       }
 
       // Reset form and reload
       setSessionDescription('')
+      setSessionNotesDraft('')
       setSessionMembers([])
       setSplitTotalAmount('')
       setSplitPayerId(null)
       setRemainderSplitMode(null)
       setOriginalPayments([])
       setEditingSessionId(null)
+      setEditingSessionCreatedBy(null)
       setViewingSessionId(null)
       setShowAddSession(false)
       await loadSessions()
@@ -2090,7 +2399,7 @@ export default function GroupDetailPage() {
   const loadLiveEntries = async (sessionId: number) => {
     const { data, error } = await supabase
       .from('LiveSessionEntry')
-      .select('id, entered_by, target_user_id, amount, note')
+      .select('id, entered_by, target_user_id, target_guest_id, amount, note')
       .eq('session_id', sessionId)
       .order('created_at', { ascending: true })
 
@@ -2105,8 +2414,48 @@ export default function GroupDetailPage() {
         id: e.id,
         entered_by: e.entered_by,
         target_user_id: e.target_user_id,
+        target_guest_id: e.target_guest_id,
         amount: parseFloat(e.amount?.toString() || '0'),
         note: e.note || null,
+      }))
+    )
+  }
+
+  const loadLiveGuests = async (sessionId: number) => {
+    const { data, error } = await supabase
+      .from('LiveSessionGuest')
+      .select('id, name, created_by')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: true })
+
+    if (error) {
+      console.error('Error loading live session guests:', error)
+      setLiveGuests([])
+      return
+    }
+
+    setLiveGuests(data || [])
+  }
+
+  const loadLiveGuestDelegations = async (sessionId: number) => {
+    const { data, error } = await supabase
+      .from('LiveSessionGuestDelegation')
+      .select('id, guest_id, user_id, amount')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: true })
+
+    if (error) {
+      console.error('Error loading live session guest delegations:', error)
+      setLiveGuestDelegations([])
+      return
+    }
+
+    setLiveGuestDelegations(
+      (data || []).map((d: any) => ({
+        id: d.id,
+        guest_id: d.guest_id,
+        user_id: d.user_id,
+        amount: parseFloat(d.amount?.toString() || '0'),
       }))
     )
   }
@@ -2116,18 +2465,21 @@ export default function GroupDetailPage() {
     async (sessionId: number) => {
     if (!userId) return
     setSelectedLiveSession(sessionId)
-    setNewLiveEntryTargetId(userId)
+    setNewLiveEntryTarget(`user:${userId}`)
     setNewLiveEntryAmount('')
     setNewLiveEntryNote('')
     setEditingLiveEntryId(null)
-    await loadLiveEntries(sessionId)
+    setNewGuestName('')
+    await Promise.all([loadLiveEntries(sessionId), loadLiveGuests(sessionId), loadLiveGuestDelegations(sessionId)])
     }
   )
 
   const closeLiveSessionPanel = () => {
     setSelectedLiveSession(null)
     setLiveEntries([])
-    setNewLiveEntryTargetId(null)
+    setLiveGuests([])
+    setNewGuestName('')
+    setNewLiveEntryTarget('')
     setNewLiveEntryAmount('')
     setNewLiveEntryNote('')
     setEditingLiveEntryId(null)
@@ -2137,7 +2489,9 @@ export default function GroupDetailPage() {
   const handleAddLiveEntry = guard(
     (sessionId: number) => `addLiveEntry:${sessionId}`,
     async (sessionId: number) => {
-    if (!userId || newLiveEntryTargetId === null || newLiveEntryAmount === '') return
+    if (!userId || newLiveEntryAmount === '') return
+    const target = parseLiveEntryTarget(newLiveEntryTarget)
+    if (!target) return
 
     const amountValue = parseFloat(newLiveEntryAmount)
     if (isNaN(amountValue)) {
@@ -2149,7 +2503,8 @@ export default function GroupDetailPage() {
       const { error } = await supabase.from('LiveSessionEntry').insert([{
         session_id: sessionId,
         entered_by: userId,
-        target_user_id: newLiveEntryTargetId,
+        target_user_id: target.targetUserId,
+        target_guest_id: target.targetGuestId,
         amount: amountValue,
         note: newLiveEntryNote.trim() || null,
       }])
@@ -2163,6 +2518,98 @@ export default function GroupDetailPage() {
     } catch (error: any) {
       console.error('Error adding live session entry:', error)
       showToast('Failed to add entry: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  // Guests are placeholders for people without a group account — anyone can
+  // add one (same openness as adding an entry), but only involved members
+  // can change who they're delegated to or remove them (see the migration's
+  // RLS, mirroring the entry edit/delete rules).
+  const handleAddLiveGuest = guard(
+    (sessionId: number) => `addLiveGuest:${sessionId}`,
+    async (sessionId: number) => {
+    if (!userId) return
+    const name = newGuestName.trim()
+    if (!name) return
+
+    try {
+      const { data, error } = await supabase
+        .from('LiveSessionGuest')
+        .insert([{ session_id: sessionId, name, created_by: userId }])
+        .select('id')
+        .single()
+
+      if (error) throw error
+
+      setNewGuestName('')
+      await loadLiveGuests(sessionId)
+      // Jump the entry form straight to the guest that was just added — the
+      // obvious next step after adding one is entering their first amount.
+      if (data?.id) setNewLiveEntryTarget(`guest:${data.id}`)
+    } catch (error: any) {
+      console.error('Error adding guest:', error)
+      showToast('Failed to add guest: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  const handleDeleteLiveGuest = guard(
+    (guestId: number, sessionId: number) => `deleteLiveGuest:${guestId}`,
+    async (guestId: number, sessionId: number) => {
+    try {
+      // ON DELETE CASCADE takes their entries with them.
+      const { error } = await supabase.from('LiveSessionGuest').delete().eq('id', guestId)
+      if (error) throw error
+
+      if (newLiveEntryTarget === `guest:${guestId}`) setNewLiveEntryTarget(`user:${userId}`)
+      // ON DELETE CASCADE takes their delegations with them too, same as
+      // their entries — reload both so stale rows don't linger client-side.
+      await Promise.all([loadLiveGuests(sessionId), loadLiveEntries(sessionId), loadLiveGuestDelegations(sessionId)])
+      await loadSessions()
+    } catch (error: any) {
+      console.error('Error deleting guest:', error)
+      showToast('Failed to remove guest: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  // Hands a slice of a guest's running total to a real, active member — a
+  // guest's total can be split across as many delegates as needed, each
+  // covering whatever amount they choose (capped client-side to what's still
+  // undelegated — see the guest card's add-delegate form). Fully delegating
+  // a guest (every cent covered by someone) is required before the session
+  // can close (see guestsNeedingDelegation and the "Close session" button,
+  // which blocks and highlights in red rather than closing when it hasn't).
+  // Nothing about the guest's entries changes; this just says who absorbs
+  // which part of the total once the session finalizes.
+  const handleAddGuestDelegation = guard(
+    (guestId: number, sessionId: number, delegateUserId: number, amount: number) => `addGuestDelegation:${guestId}:${delegateUserId}`,
+    async (guestId: number, sessionId: number, delegateUserId: number, amount: number) => {
+    try {
+      const { error } = await supabase
+        .from('LiveSessionGuestDelegation')
+        .insert([{ session_id: sessionId, guest_id: guestId, user_id: delegateUserId, amount }])
+
+      if (error) throw error
+      await loadLiveGuestDelegations(sessionId)
+    } catch (error: any) {
+      console.error('Error delegating guest:', error)
+      showToast('Failed to add delegation: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  const handleRemoveGuestDelegation = guard(
+    (delegationId: number, sessionId: number) => `removeGuestDelegation:${delegationId}`,
+    async (delegationId: number, sessionId: number) => {
+    try {
+      const { error } = await supabase.from('LiveSessionGuestDelegation').delete().eq('id', delegationId)
+      if (error) throw error
+      await loadLiveGuestDelegations(sessionId)
+    } catch (error: any) {
+      console.error('Error removing guest delegation:', error)
+      showToast('Failed to remove delegation: ' + (error.message || 'Unknown error'))
     }
     }
   )
@@ -2226,29 +2673,42 @@ export default function GroupDetailPage() {
   // the database rather than trusting liveEntries, same reasoning as
   // handleProposeCloseLiveSession: someone else's entry might not have made
   // it into this client yet.
+  //
+  // Guests are full split recipients, same as real members — an
+  // undelegated (or partially delegated) guest can be a "winner" or "loser"
+  // just like anyone else and gets its own adjustment entry, landing on
+  // whatever's still undelegated about it (see buildSplitRecipients). Uses
+  // the exact same recipient-building logic as the live preview below, so
+  // what's previewed is exactly what gets written.
   const handleApplyLiveRemainderSplit = guard(
     (sessionId: number) => `applyLiveRemainderSplit:${sessionId}`,
     async (sessionId: number) => {
     if (!userId || !liveRemainderSplitMode) return
 
     try {
-      const { data: entries, error } = await supabase
-        .from('LiveSessionEntry')
-        .select('target_user_id, amount')
-        .eq('session_id', sessionId)
+      const [{ data: entries, error }, { data: delegations, error: delegationsError }, { data: guests, error: guestsError }] = await Promise.all([
+        supabase.from('LiveSessionEntry').select('target_user_id, target_guest_id, amount').eq('session_id', sessionId),
+        supabase.from('LiveSessionGuestDelegation').select('guest_id, user_id, amount').eq('session_id', sessionId),
+        supabase.from('LiveSessionGuest').select('id').eq('session_id', sessionId),
+      ])
 
       if (error) throw error
+      if (delegationsError) throw delegationsError
+      if (guestsError) throw guestsError
 
-      const centsByUser = new Map<number, number>()
-      for (const e of entries || []) {
-        const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
-        centsByUser.set(e.target_user_id, (centsByUser.get(e.target_user_id) || 0) + cents)
-      }
-
-      const draftMembers = [...centsByUser.entries()].map(([id, cents]) => ({
-        user_id: id,
-        amount: (cents / 100).toFixed(2),
-      }))
+      const draftMembers = buildSplitRecipients(
+        (entries || []).map((e: any) => ({
+          target_user_id: e.target_user_id,
+          target_guest_id: e.target_guest_id,
+          amount: parseFloat(e.amount?.toString() || '0'),
+        })),
+        (delegations || []).map((d: any) => ({
+          guest_id: d.guest_id,
+          user_id: d.user_id,
+          amount: parseFloat(d.amount?.toString() || '0'),
+        })),
+        (guests || []).map((g: any) => g.id)
+      )
 
       const preview = computeRemainderSplit(draftMembers, liveRemainderSplitMode)
       if (!preview) {
@@ -2266,14 +2726,15 @@ export default function GroupDetailPage() {
 
       const rows = draftMembers
         .map((sm, i) => ({
-          target_user_id: sm.user_id,
+          id: sm.user_id,
           deltaCents: Math.round(parseFloat(preview[i].amount) * 100) - Math.round(parseFloat(sm.amount) * 100),
         }))
         .filter((r) => r.deltaCents !== 0)
         .map((r) => ({
           session_id: sessionId,
           entered_by: userId,
-          target_user_id: r.target_user_id,
+          target_user_id: isGuestSplitId(r.id) ? null : r.id,
+          target_guest_id: isGuestSplitId(r.id) ? decodeGuestSplitId(r.id) : null,
           amount: r.deltaCents / 100,
           note: noteByMode[liveRemainderSplitMode],
         }))
@@ -2296,35 +2757,103 @@ export default function GroupDetailPage() {
     }
   )
 
+  // Finds every guest with money on the line who isn't *fully* covered yet —
+  // its delegation rows don't add up to its entries' total — both the gate
+  // handleProposeCloseLiveSession runs as a final safety net, and what the
+  // confirm-close modal shows as a red blocker (see the "Close session"
+  // button below). Delegating itself happens earlier, from the guest list
+  // further down the live session panel (see handleAddGuestDelegation) —
+  // this modal only ever warns, it never lets you pick one.
+  const guestsNeedingDelegation = async (
+    sessionId: number
+  ): Promise<Array<{ id: number; name: string; subtotalCents: number }>> => {
+    const [{ data: guests, error: guestsError }, { data: entries, error: entriesError }, { data: delegations, error: delegationsError }] = await Promise.all([
+      supabase.from('LiveSessionGuest').select('id, name').eq('session_id', sessionId),
+      supabase.from('LiveSessionEntry').select('target_guest_id, amount').eq('session_id', sessionId).not('target_guest_id', 'is', null),
+      supabase.from('LiveSessionGuestDelegation').select('guest_id, amount').eq('session_id', sessionId),
+    ])
+    if (guestsError) throw guestsError
+    if (entriesError) throw entriesError
+    if (delegationsError) throw delegationsError
+
+    const centsByGuest = new Map<number, number>()
+    for (const e of entries || []) {
+      if (e.target_guest_id === null) continue
+      const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
+      centsByGuest.set(e.target_guest_id, (centsByGuest.get(e.target_guest_id) || 0) + cents)
+    }
+
+    const delegatedCentsByGuest = new Map<number, number>()
+    for (const d of delegations || []) {
+      const cents = Math.round(parseFloat(d.amount?.toString() || '0') * 100)
+      delegatedCentsByGuest.set(d.guest_id, (delegatedCentsByGuest.get(d.guest_id) || 0) + cents)
+    }
+
+    const withRemaining: Array<{ id: number; name: string; subtotalCents: number; remainingCents: number }> =
+      (guests || []).map((g: any) => ({
+        id: g.id,
+        name: g.name,
+        subtotalCents: centsByGuest.get(g.id) || 0,
+        remainingCents: (centsByGuest.get(g.id) || 0) - (delegatedCentsByGuest.get(g.id) || 0),
+      }))
+
+    return withRemaining
+      .filter((g: { subtotalCents: number; remainingCents: number }) => g.subtotalCents !== 0 && g.remainingCents !== 0)
+      .map((g: { id: number; name: string; subtotalCents: number }) => ({ id: g.id, name: g.name, subtotalCents: g.subtotalCents }))
+  }
+
   // Proposing a close sums every entry per person and turns that into the
   // same unanimous-approval flow any other session edit goes through — one
   // pending row per person with a nonzero total, asking them to confirm it's
-  // right. The closer's own total (if they have one) auto-approves, same as
-  // an ordinary editor's own change elsewhere in this file. Entries
-  // themselves are untouched here — is_live_session_open_for_entry (see the
-  // migration) is what actually freezes them the moment these rows exist.
+  // right. Each guest delegation's amount is folded into its delegate's own
+  // total before that happens — nobody ever approves "on behalf of" a
+  // guest, they approve their own now-larger total, same as any other
+  // change to their number. The closer's own total (if they have one)
+  // auto-approves, same as an ordinary editor's own change elsewhere in
+  // this file. Entries themselves are untouched here —
+  // is_live_session_open_for_entry (see the migration) is what actually
+  // freezes them the moment these rows exist.
   const handleProposeCloseLiveSession = guard(
     (sessionId: number) => `proposeCloseLiveSession:${sessionId}`,
     async (sessionId: number) => {
     if (!userId) return
 
     try {
-      // Re-fetch fresh rather than trusting local state, in case someone
-      // else's entry hasn't made it into this client yet.
-      const { data: entries, error: entriesError } = await supabase
-        .from('LiveSessionEntry')
-        .select('target_user_id, amount')
-        .eq('session_id', sessionId)
-
-      if (entriesError) throw entriesError
-
-      const centsByUser = new Map<number, number>()
-      for (const e of entries || []) {
-        const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
-        centsByUser.set(e.target_user_id, (centsByUser.get(e.target_user_id) || 0) + cents)
+      const stillNeedDelegation = await guestsNeedingDelegation(sessionId)
+      if (stillNeedDelegation.length > 0) {
+        showToast(`Delegate ${stillNeedDelegation.map((g) => g.name).join(', ')} to a member before closing.`)
+        return
       }
 
-      const totalCents = [...centsByUser.values()].reduce((sum, c) => sum + c, 0)
+      // Re-fetch fresh rather than trusting local state, in case someone
+      // else's entry or delegation hasn't made it into this client yet.
+      const [{ data: entries, error: entriesError }, { data: delegations, error: delegationsError }] = await Promise.all([
+        supabase.from('LiveSessionEntry').select('target_user_id, target_guest_id, amount').eq('session_id', sessionId),
+        supabase.from('LiveSessionGuestDelegation').select('user_id, amount').eq('session_id', sessionId),
+      ])
+
+      if (entriesError) throw entriesError
+      if (delegationsError) throw delegationsError
+
+      const centsByUser = new Map<number, number>()
+      let totalCents = 0
+      // Entries targeting a real member land on them directly. A guest's
+      // entries don't land anywhere themselves — by this point
+      // guestsNeedingDelegation has already confirmed every guest with a
+      // nonzero total is fully covered by its delegation rows, so those
+      // rows (added below) are what actually distribute the guest's total,
+      // potentially across several people.
+      for (const e of entries || []) {
+        const cents = Math.round(parseFloat(e.amount?.toString() || '0') * 100)
+        totalCents += cents
+        if (e.target_user_id === null) continue
+        centsByUser.set(e.target_user_id, (centsByUser.get(e.target_user_id) || 0) + cents)
+      }
+      for (const d of delegations || []) {
+        const cents = Math.round(parseFloat(d.amount?.toString() || '0') * 100)
+        centsByUser.set(d.user_id, (centsByUser.get(d.user_id) || 0) + cents)
+      }
+
       if (totalCents !== 0) {
         showToast(`Sum must equal $0.00 to close. Current sum: $${(totalCents / 100).toFixed(2)}`)
         return
@@ -2337,6 +2866,8 @@ export default function GroupDetailPage() {
         // that cancelled out per-person too) — nothing for anyone to
         // approve, so just finalize outright.
         await supabase.from('LiveSessionEntry').delete().eq('session_id', sessionId)
+        await supabase.from('LiveSessionGuestDelegation').delete().eq('session_id', sessionId)
+        await supabase.from('LiveSessionGuest').delete().eq('session_id', sessionId)
         await supabase.from('Session').update({ is_live: false }).eq('id', sessionId)
         closeLiveSessionPanel()
         await loadSessions()
@@ -2898,62 +3429,14 @@ export default function GroupDetailPage() {
     }
   }, [group?.id, group?.name, group?.description])
 
-  // Load session details when viewing a session
+  // Load session details when viewing a session. Only re-fires on which
+  // session is being viewed changing — see loadSessionApprovals above for
+  // why an approval landing on the still-viewed session needs its own
+  // explicit refresh instead of relying on this.
   useEffect(() => {
     if (viewingSessionId) {
       loadSessionDetails(viewingSessionId)
-      
-      // Load all approval records for this session to show all changes
-      const fetchAllApprovals = async () => {
-        // Fetch both pending and approved records to show all changes including editor's
-        const { data: approvalsData, error } = await supabase
-          .from('SessionEditApproval')
-          .select('approver_user_id, old_amount, new_amount, editor_user_id, status')
-          .eq('session_id', viewingSessionId)
-          .in('status', ['pending', 'approved']) // Include both pending and approved (editor's change)
-        
-        if (error) {
-          console.error('Error fetching approval records:', error)
-          setAllSessionApprovals([])
-          setEditorUserId(null)
-          return
-        }
-        
-        console.log('Fetched approval records for session', viewingSessionId, ':', approvalsData)
-        console.log('Number of approval records found:', approvalsData?.length || 0)
-        
-        if (approvalsData && approvalsData.length > 0) {
-          // Get editor user ID from the first approval record
-          const editorId = approvalsData[0]?.editor_user_id
-          setEditorUserId(editorId || null)
-          console.log('Editor user ID from approval records:', editorId)
-          
-          // Map approval records for all users (including editor)
-          const mappedApprovals = approvalsData.map((a: any) => ({
-            user_id: a.approver_user_id,
-            old_amount: parseFloat(a.old_amount?.toString() || '0'),
-            new_amount: parseFloat(a.new_amount?.toString() || '0'),
-            status: a.status // Keep status for debugging
-          }))
-          
-          console.log('Mapped approval records (including editor):', mappedApprovals)
-          
-          // Check if editor's record is present
-          const editorRecord = mappedApprovals.find((a: any) => a.user_id === editorId)
-          console.log('Editor record found:', editorRecord)
-
-          setAllSessionApprovals(mappedApprovals.map((a: any) => ({
-            user_id: a.user_id,
-            old_amount: a.old_amount,
-            new_amount: a.new_amount
-          })))
-        } else {
-          console.log('No approval records found for session', viewingSessionId)
-          setAllSessionApprovals([])
-          setEditorUserId(null)
-        }
-      }
-      fetchAllApprovals()
+      loadSessionApprovals(viewingSessionId)
     } else {
       setAllSessionApprovals([])
       setEditorUserId(null)
@@ -3533,6 +4016,14 @@ export default function GroupDetailPage() {
 
     // Approval needed — someone else's change (or a deletion) is waiting on this member.
     if (pendingApproval && session.pendingApproval) {
+      const kind = pendingSessionKind(session)
+      // Only a real edit (or a live-session close finalizing a running total)
+      // has a genuine "before" value worth showing as a diff — a brand-new
+      // session, payment, or settle-up is proposing amounts from scratch, so
+      // old_amount is just a zero placeholder and showing it struck through
+      // next to the real number ("$0.00 → $40.00") reads as more confusing
+      // than informative. Those just show the plain proposed amount instead.
+      const showDiff = kind === 'edit' || kind === 'liveClose' || pendingApproval?.is_deletion
       return (
         <div className="card rounded-l-none" style={{ borderLeftWidth: 4, borderLeftColor: 'var(--accent)' }}>
           <div className="mb-4">
@@ -3543,11 +4034,14 @@ export default function GroupDetailPage() {
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
               {pendingApproval?.is_deletion
                 ? 'A group member wants to delete this session. every amount below is going to $0.'
-                : isSettleUpDescription(session.Description)
-                  ? 'A group member started a settle up. Review the changes below.'
-                  : session.is_payment
-                    ? 'A group member recorded a payment. Review the changes below.'
-                    : 'This session has been edited. Review the changes below.'}
+                : (() => {
+                    switch (kind) {
+                      case 'settleUp': return 'A group member started a settle up. Review the amounts below.'
+                      case 'payment': return 'A group member recorded a payment. Review the amounts below.'
+                      case 'creation': return 'A group member added a new session that includes you. Review the amounts below.'
+                      default: return 'This session has been edited. Review the changes below.'
+                    }
+                  })()}
             </p>
             {session.is_payment && session.payment_method && (
               <p className="text-sm mt-1 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
@@ -3560,7 +4054,7 @@ export default function GroupDetailPage() {
           <div className="mb-4">
             {/* Show all members' changes */}
             <div className="mb-4">
-              <p className="eyebrow mb-2">All changes</p>
+              <p className="eyebrow mb-2">{showDiff ? 'All changes' : 'Amounts'}</p>
               <div>
                 {(() => {
                   // Combine all members: those with approval records and those in current session
@@ -3615,7 +4109,7 @@ export default function GroupDetailPage() {
                           {isCurrentUser && <span className="badge badge-accent">You</span>}
                         </div>
                         <div className="flex items-center gap-2 amount">
-                          {memberInfo.approvalRecord ? (
+                          {memberInfo.approvalRecord && showDiff ? (
                             <>
                               <span
                                 className="text-sm font-medium"
@@ -3631,6 +4125,13 @@ export default function GroupDetailPage() {
                                 {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
                               </span>
                             </>
+                          ) : memberInfo.approvalRecord ? (
+                            <span
+                              className="text-sm font-semibold"
+                              style={{ color: memberInfo.approvalRecord.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                            >
+                              {memberInfo.approvalRecord.new_amount >= 0 ? '+' : ''}${memberInfo.approvalRecord.new_amount.toFixed(2)}
+                            </span>
                           ) : (
                             <>
                               <span
@@ -4632,6 +5133,37 @@ export default function GroupDetailPage() {
                       />
                     </div>
 
+                    {(() => {
+                      // Notes are creator-gated (see update_session_notes) — you're
+                      // always the creator of a brand-new session, but editing
+                      // someone else's existing one shows notes read-only instead
+                      // of letting you stage a change the save would just reject.
+                      const canEditThisSessionsNotes = editingSessionCreatedBy == null || editingSessionCreatedBy === userId
+                      if (editingSessionId && !canEditThisSessionsNotes) {
+                        return sessionNotesDraft ? (
+                          <div>
+                            <label className="block text-sm font-medium mb-1">Notes</label>
+                            <p className="text-sm p-3 rounded-lg border whitespace-pre-wrap" style={{ borderColor: 'var(--border)', background: 'var(--canvas)', color: 'var(--text-muted)' }}>
+                              {sessionNotesDraft}
+                            </p>
+                            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>Only the session creator can edit notes.</p>
+                          </div>
+                        ) : null
+                      }
+                      return (
+                        <div>
+                          <label className="block text-sm font-medium mb-1">Notes (optional)</label>
+                          <textarea
+                            value={sessionNotesDraft}
+                            onChange={(e) => setSessionNotesDraft(e.target.value)}
+                            className="field"
+                            rows={2}
+                            placeholder="e.g., Includes tip and delivery fee"
+                          />
+                        </div>
+                      )
+                    })()}
+
                     <div className="p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
                       <label className="block text-sm font-medium mb-2">Quick split</label>
                       <div className="flex flex-wrap items-end gap-2">
@@ -4899,11 +5431,13 @@ export default function GroupDetailPage() {
                         onClick={() => {
                           setShowAddSession(false)
                           setSessionDescription('')
+                          setSessionNotesDraft('')
                           setSessionMembers([])
                           setSplitTotalAmount('')
                           setSplitPayerId(null)
                           setRemainderSplitMode(null)
                           setEditingSessionId(null)
+                          setEditingSessionCreatedBy(null)
                           setViewingSessionId(null)
                           setShowMemberDropdown(false)
                         }}
@@ -5064,8 +5598,14 @@ export default function GroupDetailPage() {
                                       </button>
                                     )}
                                     <button
-                                      onClick={(e) => {
+                                      onClick={async (e) => {
                                         e.stopPropagation()
+                                        // Snapshot who still needs a delegate so the confirm modal can
+                                        // show it as a red blocker — delegating itself happens from
+                                        // the guest list further down this panel (see
+                                        // handleAddGuestDelegation), not in that modal.
+                                        const pending = await guestsNeedingDelegation(session.id)
+                                        setCloseSessionPendingGuests(pending)
                                         setConfirmCloseLiveSessionId(session.id)
                                       }}
                                       className="btn-danger text-sm py-1"
@@ -5153,21 +5693,76 @@ export default function GroupDetailPage() {
                             {selectedLiveSession === session.id && (() => {
                               const isInvolved =
                                 session.created_by === userId ||
-                                liveEntries.some((e) => e.entered_by === userId || e.target_user_id === userId)
-                              const targetIds = [...new Set(liveEntries.map((e) => e.target_user_id))]
+                                liveEntries.some((e) => e.entered_by === userId || e.target_user_id === userId) ||
+                                liveGuests.some((g) => g.created_by === userId) ||
+                                liveGuestDelegations.some((d) => d.user_id === userId)
                               const totalCents = liveEntries.reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
 
+                              // Real, active members who've actually touched this session —
+                              // entered something, been entered for, or started it — the only
+                              // people eligible to be picked as a guest delegate (see the
+                              // "Delegate to" form further down, and is_live_session_participant
+                              // in the migration, which enforces this same rule server-side).
+                              const sessionParticipantIds = new Set<number>([
+                                ...(session.created_by !== null && session.created_by !== undefined ? [session.created_by] : []),
+                                ...liveEntries.map((e) => e.entered_by),
+                                ...liveEntries.filter((e) => e.target_user_id !== null).map((e) => e.target_user_id as number),
+                              ])
+                              const eligibleDelegates = activeMembers.filter((m) => sessionParticipantIds.has(m.user_id))
+
+                              // Each delegation's amount counts toward its delegate's balance
+                              // immediately, live — not just once the session closes (see
+                              // handleProposeCloseLiveSession, which folds it in the same way
+                              // when it actually finalizes). ownCentsByUser is just a person's
+                              // own entries; delegatedCentsByUser is what's been handed to them
+                              // across every delegation (possibly from several guests, and a
+                              // single guest can appear under several different delegates);
+                              // every displayed/used balance below is the sum of both.
+                              const ownCentsByUser = new Map<number, number>()
+                              const guestCentsByGuestId = new Map<number, number>()
+                              for (const e of liveEntries) {
+                                const cents = Math.round(e.amount * 100)
+                                if (e.target_user_id !== null) {
+                                  ownCentsByUser.set(e.target_user_id, (ownCentsByUser.get(e.target_user_id) || 0) + cents)
+                                } else if (e.target_guest_id !== null) {
+                                  guestCentsByGuestId.set(e.target_guest_id, (guestCentsByGuestId.get(e.target_guest_id) || 0) + cents)
+                                }
+                              }
+                              const delegatedCentsByUser = new Map<number, number>()
+                              const delegatedGuestsByUser = new Map<number, { name: string; cents: number }[]>()
+                              const delegatedCentsByGuestId = new Map<number, number>()
+                              for (const d of liveGuestDelegations) {
+                                const cents = Math.round(d.amount * 100)
+                                delegatedCentsByUser.set(d.user_id, (delegatedCentsByUser.get(d.user_id) || 0) + cents)
+                                delegatedCentsByGuestId.set(d.guest_id, (delegatedCentsByGuestId.get(d.guest_id) || 0) + cents)
+                                const guest = liveGuests.find((g) => g.id === d.guest_id)
+                                if (guest) {
+                                  const list = delegatedGuestsByUser.get(d.user_id) || []
+                                  list.push({ name: guest.name, cents })
+                                  delegatedGuestsByUser.set(d.user_id, list)
+                                }
+                              }
+                              const targetIds = [...new Set([...ownCentsByUser.keys(), ...delegatedCentsByUser.keys()])]
+
                               // Same select → preview → confirm remainder-split flow as the
-                              // regular session form, fed each person's current live total
-                              // instead of sessionMembers (see handleApplyLiveRemainderSplit).
-                              const draftMembers: SessionMemberDraft[] = targetIds.map((id) => {
-                                const subtotalCents = liveEntries
-                                  .filter((e) => e.target_user_id === id)
-                                  .reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
-                                return { user_id: id, amount: (subtotalCents / 100).toFixed(2) }
-                              })
-                              const hasWinner = draftMembers.some((sm) => parseFloat(sm.amount) > 0)
-                              const hasLoser = draftMembers.some((sm) => parseFloat(sm.amount) < 0)
+                              // regular session form, built the same way handleApplyLiveRemainderSplit
+                              // builds it (see buildSplitRecipients) so the preview matches what
+                              // actually gets written: real members get their own-plus-delegated
+                              // effective total, and every guest — even a freshly-added one with
+                              // no entries yet — contributes whatever's still undelegated about it
+                              // (zero, for a fresh guest, until "evenly" or a manual entry gives
+                              // it one).
+                              const splitDraftMembers: SessionMemberDraft[] = buildSplitRecipients(
+                                liveEntries.map((e) => ({
+                                  target_user_id: e.target_user_id,
+                                  target_guest_id: e.target_guest_id,
+                                  amount: e.amount,
+                                })),
+                                liveGuestDelegations,
+                                liveGuests.map((g) => g.id)
+                              )
+                              const hasWinner = splitDraftMembers.some((sm) => parseFloat(sm.amount) > 0)
+                              const hasLoser = splitDraftMembers.some((sm) => parseFloat(sm.amount) < 0)
                               const remainderOptions: { mode: RemainderSplitMode; label: string; disabled: boolean }[] = [
                                 { mode: 'evenly', label: 'Evenly', disabled: false },
                                 { mode: 'winners', label: 'Winners', disabled: !hasWinner },
@@ -5176,10 +5771,10 @@ export default function GroupDetailPage() {
                                 { mode: 'biggestLoser', label: 'Biggest loser', disabled: !hasLoser },
                               ]
                               const liveRemainderPreview = liveRemainderSplitMode
-                                ? computeRemainderSplit(draftMembers, liveRemainderSplitMode)
+                                ? computeRemainderSplit(splitDraftMembers, liveRemainderSplitMode)
                                 : null
                               const liveRemainderChangedRows = liveRemainderPreview
-                                ? draftMembers
+                                ? splitDraftMembers
                                     .map((sm, i) => ({ sm, next: liveRemainderPreview[i] }))
                                     .filter(({ sm, next }) => sm.amount !== next.amount)
                                 : []
@@ -5192,7 +5787,10 @@ export default function GroupDetailPage() {
                                     <div className="mb-4 space-y-3">
                                       {targetIds.map((targetId) => {
                                         const entriesForTarget = liveEntries.filter((e) => e.target_user_id === targetId)
-                                        const subtotalCents = entriesForTarget.reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
+                                        const ownSubtotalCents = ownCentsByUser.get(targetId) || 0
+                                        const delegatedGuestsForTarget = delegatedGuestsByUser.get(targetId) || []
+                                        const delegatedTotalCents = delegatedCentsByUser.get(targetId) || 0
+                                        const effectiveSubtotalCents = ownSubtotalCents + delegatedTotalCents
                                         const member = members.find((m) => m.user_id === targetId)
                                         const displayName = member ? formatDisplayName(members, member) : 'Unknown'
 
@@ -5210,11 +5808,20 @@ export default function GroupDetailPage() {
                                               </div>
                                               <p
                                                 className="amount text-sm font-semibold"
-                                                style={{ color: subtotalCents >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                                style={{ color: effectiveSubtotalCents >= 0 ? 'var(--accent)' : 'var(--negative)' }}
                                               >
-                                                {subtotalCents >= 0 ? '+' : ''}${(subtotalCents / 100).toFixed(2)}
+                                                {effectiveSubtotalCents >= 0 ? '+' : ''}${(effectiveSubtotalCents / 100).toFixed(2)}
                                               </p>
                                             </div>
+                                            {delegatedGuestsForTarget.length > 0 && (
+                                              <p className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>
+                                                Includes{' '}
+                                                {delegatedGuestsForTarget
+                                                  .map((g) => `$${(g.cents / 100).toFixed(2)} delegated from ${g.name}`)
+                                                  .join(', ')}
+                                                {ownSubtotalCents !== 0 && ` (their own entries: ${ownSubtotalCents >= 0 ? '+' : ''}$${(ownSubtotalCents / 100).toFixed(2)})`}
+                                              </p>
+                                            )}
                                             <div className="space-y-1.5">
                                               {entriesForTarget.map((entry) =>
                                                 editingLiveEntryId === entry.id ? (
@@ -5300,22 +5907,238 @@ export default function GroupDetailPage() {
                                     </div>
                                   )}
 
-                                  {/* Add an entry — for yourself or anyone else in the group, whether
-                                      or not they've shown up in this session yet. */}
+                                  {/* Guests — people without a group account, tracked as a
+                                      placeholder for the duration of this session only. Their
+                                      total has to be split across real members (delegated) before
+                                      the session can close — see handleProposeCloseLiveSession.
+                                      A guest doesn't have to land on just one person: any number
+                                      of session participants can each cover part of it. */}
+                                  {liveGuests.length > 0 && (
+                                    <div className="mb-4 space-y-3">
+                                      <p className="eyebrow">Guests</p>
+                                      {liveGuests.map((guest) => {
+                                        const entriesForGuest = liveEntries.filter((e) => e.target_guest_id === guest.id)
+                                        const subtotalCents = entriesForGuest.reduce((sum, e) => sum + Math.round(e.amount * 100), 0)
+                                        const guestDelegations = liveGuestDelegations.filter((d) => d.guest_id === guest.id)
+                                        const delegatedCents = guestDelegations.reduce((sum, d) => sum + Math.round(d.amount * 100), 0)
+                                        const remainingCents = subtotalCents - delegatedCents
+                                        const needsDelegation = subtotalCents !== 0 && remainingCents !== 0
+
+                                        return (
+                                          <div
+                                            key={guest.id}
+                                            className="rounded-lg border p-3"
+                                            style={{ borderColor: needsDelegation ? 'var(--negative)' : 'var(--border)' }}
+                                          >
+                                            <div className="flex items-center justify-between mb-2 gap-2">
+                                              <div className="flex items-center gap-2 min-w-0">
+                                                <UserPlus size={16} style={{ color: 'var(--text-muted)' }} />
+                                                <p className="font-medium text-sm truncate">{guest.name}</p>
+                                                <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>(guest)</span>
+                                              </div>
+                                              <div className="flex items-center gap-2 shrink-0">
+                                                <p
+                                                  className="amount text-sm font-semibold"
+                                                  style={{ color: subtotalCents >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                                >
+                                                  {subtotalCents >= 0 ? '+' : ''}${(subtotalCents / 100).toFixed(2)}
+                                                </p>
+                                                {isInvolved && (
+                                                  <button
+                                                    onClick={() => handleDeleteLiveGuest(guest.id, session.id)}
+                                                    disabled={isBusy(`deleteLiveGuest:${guest.id}`)}
+                                                    className="text-xs font-medium hover:underline"
+                                                    style={{ color: 'var(--negative)' }}
+                                                  >
+                                                    Remove
+                                                  </button>
+                                                )}
+                                              </div>
+                                            </div>
+
+                                            <div className="mb-2 space-y-1.5">
+                                              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Delegated to:</span>
+                                              {guestDelegations.length > 0 && (
+                                                <div className="space-y-1">
+                                                  {guestDelegations.map((d) => {
+                                                    const delegate = activeMembers.find((m) => m.user_id === d.user_id)
+                                                    const name = d.user_id === userId ? 'You' : delegate ? formatDisplayName(members, delegate) : 'Unknown'
+                                                    return (
+                                                      <div key={d.id} className="flex items-center justify-between gap-2 text-xs">
+                                                        <span>{name}</span>
+                                                        <div className="flex items-center gap-1.5">
+                                                          <span className="amount" style={{ color: 'var(--text-muted)' }}>
+                                                            ${Math.abs(d.amount).toFixed(2)}
+                                                          </span>
+                                                          {isInvolved && (
+                                                            <button
+                                                              onClick={() => handleRemoveGuestDelegation(d.id, session.id)}
+                                                              disabled={isBusy(`removeGuestDelegation:${d.id}`)}
+                                                              className="font-medium hover:underline"
+                                                              style={{ color: 'var(--negative)' }}
+                                                            >
+                                                              Remove
+                                                            </button>
+                                                          )}
+                                                        </div>
+                                                      </div>
+                                                    )
+                                                  })}
+                                                </div>
+                                              )}
+                                              {isInvolved && remainingCents !== 0 && (
+                                                <AddGuestDelegateForm
+                                                  eligibleDelegates={eligibleDelegates
+                                                    .filter((m) => !guestDelegations.some((d) => d.user_id === m.user_id))
+                                                    .map((m) => ({ user_id: m.user_id, label: m.user_id === userId ? 'You' : formatDisplayName(members, m) }))}
+                                                  remainingCents={remainingCents}
+                                                  disabled={isBusy(`addGuestDelegation:${guest.id}`)}
+                                                  onAdd={(delegateUserId, amount) => handleAddGuestDelegation(guest.id, session.id, delegateUserId, amount)}
+                                                />
+                                              )}
+                                              {needsDelegation && (
+                                                <span className="text-xs font-medium block" style={{ color: 'var(--negative)' }}>
+                                                  ${(Math.abs(remainingCents) / 100).toFixed(2)} still needs to be delegated before closing
+                                                </span>
+                                              )}
+                                            </div>
+
+                                            <div className="space-y-1.5">
+                                              {entriesForGuest.map((entry) =>
+                                                editingLiveEntryId === entry.id ? (
+                                                  <div key={entry.id} className="flex flex-wrap items-center gap-1.5">
+                                                    <input
+                                                      type="number"
+                                                      step="0.01"
+                                                      value={editingLiveEntryAmount}
+                                                      onChange={(e) => setEditingLiveEntryAmount(e.target.value)}
+                                                      onKeyDown={blockNumberArrowKeys}
+                                                      onWheel={blockNumberScroll}
+                                                      className="field amount no-spinner text-sm w-24 px-2 py-1"
+                                                      autoFocus
+                                                    />
+                                                    <input
+                                                      type="text"
+                                                      value={editingLiveEntryNote}
+                                                      onChange={(e) => setEditingLiveEntryNote(e.target.value)}
+                                                      className="field text-sm flex-1 min-w-[80px] px-2 py-1"
+                                                      placeholder="Note (optional)"
+                                                    />
+                                                    <button
+                                                      onClick={() => handleSaveLiveEntryEdit(entry.id, session.id)}
+                                                      disabled={editingLiveEntryAmount === '' || isBusy(`saveLiveEntry:${entry.id}`)}
+                                                      className="btn-primary text-xs py-1"
+                                                    >
+                                                      Save
+                                                    </button>
+                                                    <button
+                                                      onClick={() => setEditingLiveEntryId(null)}
+                                                      className="btn-secondary text-xs py-1"
+                                                    >
+                                                      Cancel
+                                                    </button>
+                                                  </div>
+                                                ) : (
+                                                  <div key={entry.id} className="flex items-center justify-between gap-2 text-sm">
+                                                    <div className="min-w-0">
+                                                      <span
+                                                        className="amount"
+                                                        style={{ color: entry.amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                                      >
+                                                        {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
+                                                      </span>
+                                                      {entry.note && (
+                                                        <span className="ml-2" style={{ color: 'var(--text-muted)' }}>{entry.note}</span>
+                                                      )}
+                                                      <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+                                                        added by {(() => {
+                                                          const enterer = members.find((m) => m.user_id === entry.entered_by)
+                                                          return enterer ? formatDisplayName(members, enterer) : 'Unknown'
+                                                        })()}
+                                                      </span>
+                                                    </div>
+                                                    {isInvolved && (
+                                                      <div className="flex gap-2 shrink-0">
+                                                        <button
+                                                          onClick={() => handleStartEditLiveEntry(entry)}
+                                                          className="text-xs font-medium hover:underline"
+                                                          style={{ color: 'var(--text-muted)' }}
+                                                        >
+                                                          Edit
+                                                        </button>
+                                                        <button
+                                                          onClick={() => handleDeleteLiveEntry(entry.id, session.id)}
+                                                          disabled={isBusy(`deleteLiveEntry:${entry.id}`)}
+                                                          className="text-xs font-medium hover:underline"
+                                                          style={{ color: 'var(--negative)' }}
+                                                        >
+                                                          Delete
+                                                        </button>
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                )
+                                              )}
+                                              {entriesForGuest.length === 0 && (
+                                                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>No entries yet.</p>
+                                              )}
+                                            </div>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  )}
+
+                                  {/* Add a guest — someone without a group account, for this
+                                      session only. */}
+                                  <div className="mb-4 p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
+                                    <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Add a guest</p>
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <input
+                                        type="text"
+                                        value={newGuestName}
+                                        onChange={(e) => setNewGuestName(e.target.value)}
+                                        className="field text-sm flex-1 min-w-[120px] px-2 py-1"
+                                        placeholder="Guest's name"
+                                      />
+                                      <button
+                                        onClick={() => handleAddLiveGuest(session.id)}
+                                        disabled={!newGuestName.trim() || isBusy(`addLiveGuest:${session.id}`)}
+                                        className="btn-secondary text-sm py-1"
+                                      >
+                                        Add guest
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Add an entry — for yourself, anyone else in the group, or any
+                                      guest already added above, whether or not they've shown up in
+                                      this session yet. */}
                                   <div className="p-3 rounded-lg border" style={{ borderColor: 'var(--border)', background: 'var(--canvas)' }}>
                                     <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Add an entry</p>
                                     <div className="flex flex-wrap items-center gap-1.5">
                                       <select
-                                        value={newLiveEntryTargetId ?? ''}
-                                        onChange={(e) => setNewLiveEntryTargetId(e.target.value ? Number(e.target.value) : null)}
+                                        value={newLiveEntryTarget}
+                                        onChange={(e) => setNewLiveEntryTarget(e.target.value)}
                                         className="field text-sm px-2 py-1"
                                         aria-label="Who this entry is for"
                                       >
-                                        {activeMembers.map((m) => (
-                                          <option key={m.user_id} value={m.user_id}>
-                                            {m.user_id === userId ? 'You' : formatDisplayName(members, m)}
-                                          </option>
-                                        ))}
+                                        <optgroup label="Members">
+                                          {activeMembers.map((m) => (
+                                            <option key={`user:${m.user_id}`} value={`user:${m.user_id}`}>
+                                              {m.user_id === userId ? 'You' : formatDisplayName(members, m)}
+                                            </option>
+                                          ))}
+                                        </optgroup>
+                                        {liveGuests.length > 0 && (
+                                          <optgroup label="Guests">
+                                            {liveGuests.map((g) => (
+                                              <option key={`guest:${g.id}`} value={`guest:${g.id}`}>
+                                                {g.name}
+                                              </option>
+                                            ))}
+                                          </optgroup>
+                                        )}
                                       </select>
                                       <input
                                         type="number"
@@ -5336,7 +6159,7 @@ export default function GroupDetailPage() {
                                       />
                                       <button
                                         onClick={() => handleAddLiveEntry(session.id)}
-                                        disabled={newLiveEntryAmount === '' || newLiveEntryTargetId === null || isBusy(`addLiveEntry:${session.id}`)}
+                                        disabled={newLiveEntryAmount === '' || !parseLiveEntryTarget(newLiveEntryTarget) || isBusy(`addLiveEntry:${session.id}`)}
                                         className="btn-primary text-sm py-1"
                                       >
                                         Add
@@ -5384,8 +6207,12 @@ export default function GroupDetailPage() {
                                               ) : (
                                                 <div className="space-y-1 mb-2">
                                                   {liveRemainderChangedRows.map(({ sm, next }) => {
-                                                    const member = members.find((m) => m.user_id === sm.user_id)
-                                                    const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+                                                    const displayName = isGuestSplitId(sm.user_id)
+                                                      ? (liveGuests.find((g) => g.id === decodeGuestSplitId(sm.user_id))?.name || 'Unknown guest') + ' (guest)'
+                                                      : (() => {
+                                                          const member = members.find((m) => m.user_id === sm.user_id)
+                                                          return member ? formatDisplayName(members, member) : 'Unknown'
+                                                        })()
                                                     return (
                                                       <div key={sm.user_id} className="flex items-center justify-between text-xs">
                                                         <span>{displayName}</span>
@@ -5471,18 +6298,41 @@ export default function GroupDetailPage() {
                       confirm their final total. If even one person rejects it, the session reopens
                       and everything entered stays exactly as it is.
                     </p>
+
+                    {closeSessionPendingGuests.length > 0 && (
+                      <div
+                        className="mb-6 p-3 rounded-lg border text-sm"
+                        style={{ borderColor: 'var(--negative)', background: 'var(--negative-soft)', color: 'var(--negative)' }}
+                      >
+                        <p className="font-medium mb-1">Delegate every guest before closing</p>
+                        <p className="text-xs">
+                          Head down to the guest list in the live session and pick who covers{' '}
+                          {closeSessionPendingGuests.map((g) => g.name).join(', ')} — this session can&apos;t close until then.
+                        </p>
+                      </div>
+                    )}
+
                     <div className="flex gap-2">
                       <button
                         onClick={() => {
                           handleProposeCloseLiveSession(confirmCloseLiveSessionId)
                           setConfirmCloseLiveSessionId(null)
                         }}
-                        disabled={isBusy(`proposeCloseLiveSession:${confirmCloseLiveSessionId}`)}
+                        disabled={
+                          isBusy(`proposeCloseLiveSession:${confirmCloseLiveSessionId}`) ||
+                          closeSessionPendingGuests.length > 0
+                        }
                         className="btn-primary flex-1"
                       >
                         Close session
                       </button>
-                      <button onClick={() => setConfirmCloseLiveSessionId(null)} className="btn-secondary">
+                      <button
+                        onClick={() => {
+                          setConfirmCloseLiveSessionId(null)
+                          setCloseSessionPendingGuests([])
+                        }}
+                        className="btn-secondary"
+                      >
                         Keep editing
                       </button>
                     </div>

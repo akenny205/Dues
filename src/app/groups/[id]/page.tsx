@@ -4983,15 +4983,11 @@ export default function GroupDetailPage() {
                             }}
                             id={`session-row-${session.id}`}
                             className="card cursor-pointer transition-colors hover:border-[var(--accent)]"
-                            // A left accent stripe instead of a full tinted background —
-                            // enough to catch the eye scanning the list without washing
-                            // out the whole card. Every row gets the same 3px border-left
-                            // width (transparent when not live) so live and non-live cards
-                            // still line up exactly.
-                            style={{
-                              borderLeftWidth: 3,
-                              borderLeftColor: session.is_live ? 'var(--accent)' : 'transparent',
-                            }}
+                            style={
+                              session.is_live
+                                ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)' }
+                                : undefined
+                            }
                           >
                             <div className="flex items-start justify-between gap-4">
                               <div className="flex-1">

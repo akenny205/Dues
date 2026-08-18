@@ -453,6 +453,52 @@ const pendingSessionKind = (session: {
   return 'edit'
 }
 
+// Backs the "who has/hasn't approved" breakdown shown alongside a pending
+// proposal's per-member amounts (both in the review card a co-approver sees
+// while deciding, and in the read-only "waiting for confirmation" view the
+// editor/already-decided members see). A rejection anywhere in the batch
+// kills the whole proposal, so a row still sitting at 'pending' once that's
+// happened no longer means "still deciding" — it's relabeled rather than
+// shown as if it still mattered.
+type ApprovalStatusInfo = { label: string; icon: 'check' | 'hourglass' | 'x'; className: string; faded?: boolean }
+
+const approvalStatusInfo = (
+  approval: { status: 'pending' | 'approved' | 'rejected'; auto_approved: boolean },
+  isEditor: boolean,
+  batchHasRejection: boolean
+): ApprovalStatusInfo => {
+  if (approval.status === 'rejected') {
+    return { label: 'Rejected', icon: 'x', className: 'badge badge-negative' }
+  }
+  if (approval.status === 'approved') {
+    // The editor's own row auto-approves the instant they propose the
+    // change — that's not a decision anyone made, so it reads as "Proposed"
+    // rather than "Approved". A row pre-approved via someone's
+    // auto_approve_sessions preference (see 20260814000006) is a real,
+    // self-granted decision too, just not an in-the-moment click — "Approved"
+    // would overstate how attentive they were, so it gets its own label.
+    if (isEditor) return { label: 'Proposed', icon: 'check', className: 'badge badge-outline', faded: true }
+    if (approval.auto_approved) return { label: 'Auto-approved', icon: 'check', className: 'badge badge-outline', faded: true }
+    return { label: 'Approved', icon: 'check', className: 'badge badge-accent' }
+  }
+  if (batchHasRejection) return { label: 'Not needed', icon: 'hourglass', className: 'badge badge-outline', faded: true }
+  return { label: 'Pending', icon: 'hourglass', className: 'badge badge-outline' }
+}
+
+// Pending (still actionable, or already dead and explaining why) floats
+// above approved — that's the info people open this list to see.
+const approvalStatusRank = (approval: { status: 'pending' | 'approved' | 'rejected' }): number =>
+  approval.status === 'approved' ? 1 : 0
+
+function ApprovalStatusBadge({ info }: { info: ApprovalStatusInfo }) {
+  const Icon = info.icon === 'check' ? Check : info.icon === 'x' ? X : Hourglass
+  return (
+    <span className={info.className} style={info.faded ? { opacity: 0.65 } : undefined}>
+      <Icon size={11} /> {info.label}
+    </span>
+  )
+}
+
 const cancelActionLabel = (kind: PendingSessionKind): string => {
   switch (kind) {
     case 'deletion': return 'Cancel deletion request'
@@ -627,7 +673,7 @@ export default function GroupDetailPage() {
   const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
   const [pendingRejectionNotices, setPendingRejectionNotices] = useState<Array<{ id: number; session_id: number; session_description: string; rejected_by_name?: string; is_deletion?: boolean }>>([])
   const [originalPayments, setOriginalPayments] = useState<Array<{ user_id: number; amount: number }>>([])
-  const [allSessionApprovals, setAllSessionApprovals] = useState<Array<{ user_id: number; old_amount: number; new_amount: number }>>([])
+  const [allSessionApprovals, setAllSessionApprovals] = useState<Array<{ user_id: number; old_amount: number; new_amount: number; status: 'pending' | 'approved' | 'rejected'; auto_approved: boolean; rejection_reason: string | null; is_deletion: boolean }>>([])
   const [editorUserId, setEditorUserId] = useState<number | null>(null)
   const [confirmCancelSessionId, setConfirmCancelSessionId] = useState<number | null>(null)
   const [confirmDeleteSessionId, setConfirmDeleteSessionId] = useState<number | null>(null)
@@ -1423,12 +1469,15 @@ export default function GroupDetailPage() {
   // showing pre-approval amounts even though the collapsed row and the Dues
   // tab had already picked up the real ones.
   const loadSessionApprovals = async (sessionId: number) => {
-    // Fetch both pending and approved records to show all changes including the editor's
+    // Fetch pending, approved, *and* rejected records — a rejection kills the
+    // whole batch, but the other members' rows can still be sitting there
+    // (see the "who has/hasn't approved" list below), so excluding 'rejected'
+    // here would silently hide the very row that explains why nothing's
+    // finalizing.
     const { data: approvalsData, error } = await supabase
       .from('SessionEditApproval')
-      .select('approver_user_id, old_amount, new_amount, editor_user_id, status')
+      .select('approver_user_id, old_amount, new_amount, editor_user_id, status, auto_approved, rejection_reason, is_deletion')
       .eq('session_id', sessionId)
-      .in('status', ['pending', 'approved'])
 
     if (error) {
       console.error('Error fetching approval records:', error)
@@ -1444,6 +1493,10 @@ export default function GroupDetailPage() {
         user_id: a.approver_user_id,
         old_amount: parseFloat(a.old_amount?.toString() || '0'),
         new_amount: parseFloat(a.new_amount?.toString() || '0'),
+        status: a.status,
+        auto_approved: !!a.auto_approved,
+        rejection_reason: a.rejection_reason || null,
+        is_deletion: !!a.is_deletion,
       })))
     } else {
       setAllSessionApprovals([])
@@ -4134,6 +4187,16 @@ export default function GroupDetailPage() {
                     return <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Loading session details...</p>
                   }
 
+                  // Whoever's still actually pending (or explains why nothing's
+                  // finalizing) floats to the top; members with no stake in
+                  // this particular proposal sink to the bottom.
+                  const batchHasRejection = allSessionApprovals.some(a => a.status === 'rejected')
+                  allMembersToShow.sort((a, b) => {
+                    const rankA = a.approvalRecord ? approvalStatusRank(a.approvalRecord) : 2
+                    const rankB = b.approvalRecord ? approvalStatusRank(b.approvalRecord) : 2
+                    return rankA - rankB
+                  })
+
                   return allMembersToShow.map((memberInfo) => {
                     const isCurrentUser = memberInfo.user_id === userId
                     // For a live-session close, the number by itself doesn't say
@@ -4150,11 +4213,20 @@ export default function GroupDetailPage() {
                     return (
                       <div key={memberInfo.user_id} className="mb-2">
                         <div className="ledger-row">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <span className="text-sm font-medium">
                               {memberInfo.displayName}
                             </span>
                             {isCurrentUser && <span className="badge badge-accent">You</span>}
+                            {memberInfo.approvalRecord && (
+                              <ApprovalStatusBadge
+                                info={approvalStatusInfo(
+                                  memberInfo.approvalRecord,
+                                  memberInfo.user_id === editorUserId,
+                                  batchHasRejection
+                                )}
+                              />
+                            )}
                           </div>
                           <div className="flex items-center gap-2 amount">
                             {memberInfo.approvalRecord && showDiff ? (
@@ -4195,6 +4267,11 @@ export default function GroupDetailPage() {
                             )}
                           </div>
                         </div>
+                        {memberInfo.approvalRecord?.status === 'rejected' && memberInfo.approvalRecord.rejection_reason && (
+                          <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                            &ldquo;{memberInfo.approvalRecord.rejection_reason}&rdquo;
+                          </p>
+                        )}
                         {(ownEntries.length > 0 || delegatedFromGuests.length > 0) && (
                           <div className="ml-1 mt-0.5 space-y-0.5">
                             {ownEntries.map((entry) => (
@@ -4321,71 +4398,114 @@ export default function GroupDetailPage() {
 
         <div>
           <p className="eyebrow mb-3">Member payments</p>
-          {sessionDetails.length === 0 && allSessionApprovals.length > 0 ? (
-            // Nothing has landed in SessionPayment yet — this is a just-created
-            // payment still waiting on the other side to confirm (see
-            // handleMakePayment/handleApproveEdit). Show the proposed amounts
-            // from the approval records instead of falsely claiming there are
-            // no payments.
-            <>
-              <p className="text-sm mb-3 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
-                <Hourglass size={14} />
-                Not final yet. waiting for confirmation.
-              </p>
-              <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
-                {allSessionApprovals.map((approval) => {
-                  const member = members.find(m => m.user_id === approval.user_id)
-                  const displayName = member ? formatDisplayName(members, member) : 'Unknown'
-                  // Same reasoning as the pendingApproval/liveClose branch above:
-                  // a live close's total is a sum of line items (and maybe
-                  // guest delegations), so show what it's made of, not just the
-                  // number — whoever's still waiting on someone else's approval
-                  // gets the same detail the approver themselves sees.
-                  const isLiveClose = pendingSessionKind(session) === 'liveClose'
-                  const ownEntries = isLiveClose ? liveEntries.filter((e) => e.target_user_id === approval.user_id) : []
-                  const delegatedFromGuests = isLiveClose ? liveGuestDelegations.filter((d) => d.user_id === approval.user_id) : []
-                  return (
-                    <div key={approval.user_id} className="py-3">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <Avatar url={member?.avatar_url} name={displayName} size={32} />
-                          <p className="font-medium text-sm">{displayName}</p>
-                        </div>
-                        <p
-                          className="amount text-lg font-semibold"
-                          style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
-                        >
-                          {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
-                        </p>
-                      </div>
-                      {(ownEntries.length > 0 || delegatedFromGuests.length > 0) && (
-                        <div className="ml-11 mt-1 space-y-0.5">
-                          {ownEntries.map((entry) => (
-                            <div key={`entry-${entry.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
-                              <span className="truncate">{entry.note || 'Entry'}</span>
-                              <span className="amount shrink-0 ml-2">
-                                {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
-                              </span>
-                            </div>
-                          ))}
-                          {delegatedFromGuests.map((d) => {
-                            const guest = liveGuests.find((g) => g.id === d.guest_id)
-                            return (
-                              <div key={`delegation-${d.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
-                                <span className="truncate">{guest?.name || 'Guest'} (delegated)</span>
-                                <span className="amount shrink-0 ml-2">
-                                  {d.amount >= 0 ? '+' : ''}${d.amount.toFixed(2)}
-                                </span>
+          {allSessionApprovals.length > 0 ? (
+            // A proposal is in flight for this session. Whether or not *this*
+            // viewer still has to act on it themselves (see the pendingApproval
+            // card above for that case — editors and members who already
+            // approved/rejected land here instead), everyone affected gets the
+            // same read-only view of where it stands: the proposed amounts
+            // (with a real edit's before → after, same as the reviewer sees)
+            // plus who has/hasn't approved yet.
+            (() => {
+              const kind = pendingSessionKind(session)
+              const showDiff = kind === 'edit' || allSessionApprovals.some(a => a.is_deletion)
+              const batchHasRejection = allSessionApprovals.some(a => a.status === 'rejected')
+              const sortedApprovals = [...allSessionApprovals].sort(
+                (a, b) => approvalStatusRank(a) - approvalStatusRank(b)
+              )
+              return (
+                <>
+                  <p className="text-sm mb-3 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+                    <Hourglass size={14} />
+                    Not final yet. waiting for confirmation.
+                  </p>
+                  <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+                    {sortedApprovals.map((approval) => {
+                      const member = members.find(m => m.user_id === approval.user_id)
+                      const displayName = member ? formatDisplayName(members, member) : 'Unknown'
+                      // Same reasoning as the pendingApproval/liveClose branch above:
+                      // a live close's total is a sum of line items (and maybe
+                      // guest delegations), so show what it's made of, not just the
+                      // number — whoever's still waiting on someone else's approval
+                      // gets the same detail the approver themselves sees.
+                      const isLiveClose = kind === 'liveClose'
+                      const ownEntries = isLiveClose ? liveEntries.filter((e) => e.target_user_id === approval.user_id) : []
+                      const delegatedFromGuests = isLiveClose ? liveGuestDelegations.filter((d) => d.user_id === approval.user_id) : []
+                      return (
+                        <div key={approval.user_id} className="py-3">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <Avatar url={member?.avatar_url} name={displayName} size={32} />
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <p className="font-medium text-sm">{displayName}</p>
+                                {approval.user_id === userId && <span className="badge badge-accent">You</span>}
+                                <ApprovalStatusBadge
+                                  info={approvalStatusInfo(approval, approval.user_id === editorUserId, batchHasRejection)}
+                                />
                               </div>
-                            )
-                          })}
+                            </div>
+                            <div className="flex items-center gap-2 amount">
+                              {showDiff ? (
+                                <>
+                                  <span
+                                    className="text-sm font-medium"
+                                    style={{ color: 'var(--text-muted)', textDecoration: 'line-through' }}
+                                  >
+                                    {approval.old_amount >= 0 ? '+' : ''}${approval.old_amount.toFixed(2)}
+                                  </span>
+                                  <ArrowRight size={14} style={{ color: 'var(--text-muted)' }} />
+                                  <span
+                                    className="text-lg font-semibold"
+                                    style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                  >
+                                    {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
+                                  </span>
+                                </>
+                              ) : (
+                                <span
+                                  className="text-lg font-semibold"
+                                  style={{ color: approval.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}
+                                >
+                                  {approval.new_amount >= 0 ? '+' : ''}${approval.new_amount.toFixed(2)}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          {approval.status === 'rejected' && approval.rejection_reason && (
+                            <p className="text-xs mt-0.5 ml-11" style={{ color: 'var(--text-muted)' }}>
+                              &ldquo;{approval.rejection_reason}&rdquo;
+                            </p>
+                          )}
+                          {(ownEntries.length > 0 || delegatedFromGuests.length > 0) && (
+                            <div className="ml-11 mt-1 space-y-0.5">
+                              {ownEntries.map((entry) => (
+                                <div key={`entry-${entry.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                                  <span className="truncate">{entry.note || 'Entry'}</span>
+                                  <span className="amount shrink-0 ml-2">
+                                    {entry.amount >= 0 ? '+' : ''}${entry.amount.toFixed(2)}
+                                  </span>
+                                </div>
+                              ))}
+                              {delegatedFromGuests.map((d) => {
+                                const guest = liveGuests.find((g) => g.id === d.guest_id)
+                                return (
+                                  <div key={`delegation-${d.id}`} className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                                    <span className="truncate">{guest?.name || 'Guest'} (delegated)</span>
+                                    <span className="amount shrink-0 ml-2">
+                                      {d.amount >= 0 ? '+' : ''}${d.amount.toFixed(2)}
+                                    </span>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-            </>
+                      )
+                    })}
+                  </div>
+                </>
+              )
+            })()
           ) : sessionDetails.length === 0 ? (
             <p style={{ color: 'var(--text-muted)' }}>No payments in this session.</p>
           ) : (

@@ -113,16 +113,23 @@ export const mockSessionPayments = [
 
 export const mockSessionEditApprovals = [
   // Morgan (editor) proposed the gas bill was actually $120, not $96 — needs
-  // you, Jordan, and Sam to sign off. You (Alex) haven't acted yet.
-  { id: 5001, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 1, status: 'pending', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null },
-  { id: 5002, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 2, status: 'pending', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null },
-  { id: 5003, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 3, status: 'pending', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null },
-  { id: 5004, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 4, status: 'approved', old_amount: 72, new_amount: 90, is_deletion: false, dismissed_at: null },
+  // you, Jordan, and Sam to sign off. You (Alex) haven't acted yet. Sam has
+  // auto_approve_sessions set to "all", so their row landed pre-approved.
+  { id: 5001, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 1, status: 'pending', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  { id: 5002, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 2, status: 'pending', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  { id: 5003, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 3, status: 'approved', old_amount: -24, new_amount: -30, is_deletion: false, dismissed_at: null, auto_approved: true, rejection_reason: null },
+  { id: 5004, created_at: daysAgo(1), session_id: 106, editor_user_id: 4, approver_user_id: 4, status: 'approved', old_amount: 72, new_amount: 90, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
   // You (editor) proposed changing Sam's streaming share — waiting on Sam.
-  { id: 5005, created_at: daysAgo(1), session_id: 107, editor_user_id: 1, approver_user_id: 3, status: 'pending', old_amount: -10, new_amount: -15, is_deletion: false, dismissed_at: null },
-  { id: 5006, created_at: daysAgo(1), session_id: 107, editor_user_id: 1, approver_user_id: 1, status: 'approved', old_amount: 30, new_amount: 35, is_deletion: false, dismissed_at: null },
-  // Your edit to the cleaning supplies split was rejected by Jordan.
-  { id: 5007, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 2, status: 'rejected', old_amount: -6, new_amount: -10, is_deletion: false, dismissed_at: null },
+  { id: 5005, created_at: daysAgo(1), session_id: 107, editor_user_id: 1, approver_user_id: 3, status: 'pending', old_amount: -10, new_amount: -15, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  { id: 5006, created_at: daysAgo(1), session_id: 107, editor_user_id: 1, approver_user_id: 1, status: 'approved', old_amount: 30, new_amount: 35, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  // Your edit to the cleaning supplies split was rejected by Jordan, with a
+  // reason — Sam and Morgan's rows are still sitting 'pending' even though
+  // it no longer matters, same as it would mid-flight against the real
+  // backend (nobody's dismissed the rejection notice yet).
+  { id: 5007, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 2, status: 'rejected', old_amount: -6, new_amount: -10, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: "Wasn't part of this one — I was out of town." },
+  { id: 5008, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 1, status: 'approved', old_amount: 18, new_amount: 30, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  { id: 5009, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 3, status: 'pending', old_amount: -6, new_amount: -10, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
+  { id: 5010, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 4, status: 'pending', old_amount: -6, new_amount: -10, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
 ]
 
 // Auto-increment counters, seeded past the highest id already in use above.

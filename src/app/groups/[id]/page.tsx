@@ -10,7 +10,9 @@ import {
   Camera,
   Check,
   ClipboardList,
+  History,
   Hourglass,
+  Pencil,
   Trash2,
   TriangleAlert,
   Undo2,
@@ -64,6 +66,7 @@ interface Session {
   waitingForApproval?: boolean // Editor is waiting for others to approve
   pendingIsDeletion?: boolean // The in-flight approval (either direction above) is a deletion request, not an amount edit
   pendingIsLiveClose?: boolean // The in-flight approval is a live-session close proposal, not a deletion or a plain amount edit
+  hasEditHistory?: boolean // At least one edit has been applied to this session since it was created (see SessionEditHistory) — shows the row's "Edited" button
   rejectedByMeAsProposal?: boolean // I rejected this and it never had any real SessionPayment rows (a brand-new payment/session proposal) — hide it from my list entirely rather than showing an empty shell
 }
 
@@ -150,6 +153,8 @@ const formatDisplayName = (members: GroupMember[], currentMember: GroupMember): 
 
   return `${capitalizedFirstName} ${lastInitial}.`
 }
+
+const formatSignedAmount = (amount: number): string => `${amount >= 0 ? '+' : '-'}$${Math.abs(amount).toFixed(2)}`
 
 // The overlapping avatar stack on a session's collapsed row — who's in it,
 // at a glance, without expanding. There's no measuring of the row's actual
@@ -729,6 +734,14 @@ export default function GroupDetailPage() {
   const [pendingRejections, setPendingRejections] = useState<Array<{ id: number; session_id: number; approver_user_id: number; session_description: string; approver_name?: string; approver_email?: string; rejected_at?: string; is_deletion?: boolean; rejection_reason?: string | null }>>([])
   const [pendingCancellations, setPendingCancellations] = useState<Array<{ id: number; session_id: number; session_description: string; old_amount: number; new_amount: number; is_deletion?: boolean }>>([])
   const [pendingRejectionNotices, setPendingRejectionNotices] = useState<Array<{ id: number; session_id: number; session_description: string; rejected_by_name?: string; is_deletion?: boolean }>>([])
+  // Edits that were applied to a session I'm in without me ever seeing them
+  // (my approval was auto-approved) — one per edit, until dismissed. See
+  // recordSessionEdit / the SessionEditHistory migration.
+  const [editNotices, setEditNotices] = useState<Array<{ id: number; session_id: number; session_description: string; editor_user_id: number | null; old_amount: number; new_amount: number; created_at: string }>>([])
+  // Version history modal: which session it's open for, and that session's
+  // SessionEditHistory rows (null while they're loading).
+  const [historySessionId, setHistorySessionId] = useState<number | null>(null)
+  const [sessionHistory, setSessionHistory] = useState<Array<{ id: number; edit_id: string; created_at: string; editor_user_id: number | null; user_id: number; old_amount: number; new_amount: number }> | null>(null)
   const [originalPayments, setOriginalPayments] = useState<Array<{ user_id: number; amount: number }>>([])
   const [allSessionApprovals, setAllSessionApprovals] = useState<Array<{ user_id: number; old_amount: number; new_amount: number; status: 'pending' | 'approved' | 'rejected'; auto_approved: boolean; rejection_reason: string | null; is_deletion: boolean }>>([])
   const [editorUserId, setEditorUserId] = useState<number | null>(null)
@@ -1224,7 +1237,19 @@ export default function GroupDetailPage() {
         })
       )
 
-      setSessions(sessionsWithApprovals)
+      // Which of these have ever been edited — one query for the whole list
+      // rather than one per session. Just drives the row's "Edited" button;
+      // the history itself is only fetched when that's opened.
+      const editedSessionIds = new Set<number>()
+      if (sessionsWithApprovals.length > 0) {
+        const { data: historyRows } = await supabase
+          .from('SessionEditHistory')
+          .select('session_id')
+          .in('session_id', sessionsWithApprovals.map((s) => s.id))
+        ;(historyRows || []).forEach((h: any) => editedSessionIds.add(h.session_id))
+      }
+
+      setSessions(sessionsWithApprovals.map((s) => ({ ...s, hasEditHistory: editedSessionIds.has(s.id) })))
     } catch (error) {
       console.error('Error loading sessions:', error)
     }
@@ -1483,6 +1508,35 @@ export default function GroupDetailPage() {
         })
 
         setPendingRejectionNotices(formattedRejectionNotices)
+      }
+
+      // Edits that were applied to one of my sessions without me seeing them
+      // — my row was auto-approved, so there was never a review step to tell
+      // me about it (see recordSessionEdit).
+      const { data: editNoticesData } = await supabase
+        .from('SessionEditHistory')
+        .select(`
+          *,
+          Session!inner(id, Description, group_id)
+        `)
+        .eq('user_id', userId)
+        .is('dismissed_at', null)
+
+      if (editNoticesData) {
+        setEditNotices(
+          editNoticesData
+            .filter((n: any) => n.Session?.group_id === groupId)
+            .map((n: any) => ({
+              id: n.id,
+              session_id: n.session_id,
+              session_description: n.Session?.Description || 'Untitled Session',
+              editor_user_id: n.editor_user_id ?? null,
+              old_amount: parseFloat(n.old_amount?.toString() || '0'),
+              new_amount: parseFloat(n.new_amount?.toString() || '0'),
+              created_at: n.created_at,
+            }))
+            .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+        )
       }
     } catch (error) {
       console.error('Error loading pending approvals:', error)
@@ -1892,6 +1946,31 @@ export default function GroupDetailPage() {
     if (viewingSessionId === sessionId) setViewingSessionId(null)
   }
 
+  // Writes an applied edit into SessionEditHistory: the session's version
+  // history, and — for anyone whose approval was auto-approved, so they
+  // never actually saw the change — an alert in their Notifications (see
+  // the migration). The editor's own row and anyone who clicked Approve by
+  // hand are written already-dismissed: it's history for them, not news.
+  //
+  // Never throws: the edit itself has already been decided by this point,
+  // and failing to log it shouldn't stop it from being applied.
+  const recordSessionEdit = async (sessionId: number, approvedChanges: any[]) => {
+    const editId = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const { error } = await supabase.from('SessionEditHistory').insert(
+      approvedChanges.map((change: any) => ({
+        session_id: sessionId,
+        edit_id: editId,
+        editor_user_id: change.editor_user_id,
+        user_id: change.approver_user_id,
+        old_amount: change.old_amount ?? 0,
+        new_amount: change.new_amount ?? 0,
+        dismissed_at: change.auto_approved ? null : now,
+      }))
+    )
+    if (error) console.error('Error recording session edit history:', error)
+  }
+
   // Applies every approved change once no pending rows remain for a session,
   // then cleans up. Shared by handleApproveEdit (called after an approver
   // votes) and handleProposeCloseLiveSession (called right after proposing —
@@ -1924,6 +2003,17 @@ export default function GroupDetailPage() {
       return 'deleted'
     }
 
+    // An *edit* is a change to a session that already had real amounts — as
+    // opposed to a brand-new session / payment / settle up (nothing in
+    // SessionPayment yet; this is what creates it) or a live session
+    // closing. Only edits go into the version history. Has to be checked
+    // before the loop below starts writing SessionPayment rows.
+    const { data: paymentsBeforeApplying } = await supabase
+      .from('SessionPayment')
+      .select('id')
+      .eq('session_id', sessionId)
+    const isEdit = !approvedChanges[0].is_live_close && (paymentsBeforeApplying || []).length > 0
+
     // Apply each approved change. Only the changed rows are known here (not
     // the session's full membership), so this upserts each one directly
     // rather than reconciling against the full set — anyone whose amount
@@ -1931,6 +2021,8 @@ export default function GroupDetailPage() {
     for (const change of approvedChanges) {
       await upsertPayment(sessionId, change.approver_user_id, change.new_amount)
     }
+
+    if (isEdit) await recordSessionEdit(sessionId, approvedChanges)
 
     await supabase.from('SessionEditApproval').delete().eq('session_id', sessionId)
 
@@ -2241,6 +2333,56 @@ export default function GroupDetailPage() {
     }
     }
   )
+
+  // Acknowledges an "X edited this session" alert. Only clears the alert —
+  // the row itself stays, as part of the session's version history.
+  const handleDismissEditNotice = guard(
+    (id: number) => `dismissEditNotice:${id}`,
+    async (id: number) => {
+    try {
+      const { error } = await supabase
+        .from('SessionEditHistory')
+        .update({ dismissed_at: new Date().toISOString() })
+        .eq('id', id)
+
+      if (error) throw error
+      setEditNotices(prev => prev.filter(n => n.id !== id))
+    } catch (error: any) {
+      console.error('Error dismissing edit notice:', error)
+      showToast('Failed to dismiss notice: ' + (error.message || 'Unknown error'))
+    }
+    }
+  )
+
+  const handleOpenSessionHistory = async (sessionId: number) => {
+    setSessionHistory(null)
+    setHistorySessionId(sessionId)
+
+    const { data, error } = await supabase
+      .from('SessionEditHistory')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error('Error loading session history:', error)
+      showToast('Failed to load version history: ' + (error.message || 'Unknown error'))
+      setHistorySessionId(null)
+      return
+    }
+
+    setSessionHistory(
+      (data || []).map((h: any) => ({
+        id: h.id,
+        edit_id: h.edit_id,
+        created_at: h.created_at,
+        editor_user_id: h.editor_user_id ?? null,
+        user_id: h.user_id,
+        old_amount: parseFloat(h.old_amount?.toString() || '0'),
+        new_amount: parseFloat(h.new_amount?.toString() || '0'),
+      }))
+    )
+  }
 
   // Helper function to update session payments
   // Thin wrapper: the session-edit form always knows the complete membership, so
@@ -4710,7 +4852,7 @@ export default function GroupDetailPage() {
                 // the only one who can act on them (see isOwner check below), and
                 // they're also the only one RLS returns any rows to in the first
                 // place (see loadJoinRequests).
-                const notificationCount = pendingRejections.length + pendingCancellations.length + pendingRejectionNotices.length
+                const notificationCount = pendingRejections.length + pendingCancellations.length + pendingRejectionNotices.length + editNotices.length
                   + (isOwner ? pendingJoinRequests.length : 0)
 
                 return (
@@ -4761,7 +4903,9 @@ export default function GroupDetailPage() {
 
                     {/* Notifications — resolved edits that still need acknowledging:
                         your edit got rejected, your review got cancelled by the editor,
-                        or an edit you were reviewing got rejected by someone else. Owners
+                        an edit you were reviewing got rejected by someone else, or an
+                        edit was applied to one of your sessions without you reviewing
+                        it at all (auto-approved — see recordSessionEdit). Owners
                         also get pending join requests here, mirroring the Members tab's
                         own "Pending requests" section — same handlers, same busy keys, so
                         approving/rejecting from either place stays in sync. */}
@@ -4851,6 +4995,48 @@ export default function GroupDetailPage() {
                               </button>
                             </div>
                           ))}
+                          {editNotices.map((en) => {
+                            const editor = members.find((m) => m.user_id === en.editor_user_id)
+                            const editorName = editor ? formatDisplayName(members, editor) : 'Someone'
+                            return (
+                              <div
+                                key={`edit-notice-${en.id}`}
+                                className="flex items-center justify-between gap-4 rounded-lg border p-4"
+                                style={{ borderColor: 'var(--border)', background: 'var(--surface)' }}
+                              >
+                                <div className="flex items-center gap-3">
+                                  <Pencil size={18} className="shrink-0" style={{ color: 'var(--accent)' }} />
+                                  <div>
+                                    <p className="text-sm font-medium">
+                                      {editorName} edited &ldquo;{en.session_description}&rdquo;
+                                    </p>
+                                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                                      Your amount went from <span className="amount">{formatSignedAmount(en.old_amount)}</span> to{' '}
+                                      <span className="amount">{formatSignedAmount(en.new_amount)}</span> · {new Date(en.created_at).toLocaleDateString()}
+                                    </p>
+                                  </div>
+                                </div>
+                                <div className="flex gap-2 shrink-0">
+                                  <button
+                                    onClick={() => {
+                                      setActiveTab('sessions')
+                                      setViewingSessionId(en.session_id)
+                                    }}
+                                    className="btn-secondary text-sm"
+                                  >
+                                    View
+                                  </button>
+                                  <button
+                                    onClick={() => handleDismissEditNotice(en.id)}
+                                    disabled={isBusy(`dismissEditNotice:${en.id}`)}
+                                    className="btn-secondary text-sm"
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              </div>
+                            )
+                          })}
                           {pendingCancellations.map((pc) => (
                             <div
                               key={`cancel-${pc.id}`}
@@ -5811,6 +5997,16 @@ export default function GroupDetailPage() {
                                 setViewingSessionId(viewingSessionId === session.id ? null : session.id)
                               } else if (hasUndismissedRejection) {
                                 setViewingSessionId(viewingSessionId === session.id ? null : session.id)
+                              } else if (session.waitingForApproval) {
+                                // A live session stays is_live until its close is fully
+                                // approved (see finalizeSessionIfFullyApproved) — so a
+                                // close that's still waiting on other people would
+                                // otherwise fall through to the is_live branch below and
+                                // reopen the live entry panel as if nothing were pending.
+                                // Route to the same accordion the "Pending approval"
+                                // widget's View button shows instead, so both entry
+                                // points land on the same read-only waiting view.
+                                setViewingSessionId(viewingSessionId === session.id ? null : session.id)
                               } else if (session.is_live) {
                                 if (selectedLiveSession === session.id) {
                                   closeLiveSessionPanel()
@@ -5858,6 +6054,19 @@ export default function GroupDetailPage() {
                                     members={members}
                                     ringColor={session.is_live ? 'var(--accent-soft)' : 'var(--surface)'}
                                   />
+                                  {session.hasEditHistory && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleOpenSessionHistory(session.id)
+                                      }}
+                                      className="badge badge-outline flex items-center gap-1 cursor-pointer transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                                      title="See what changed, and when"
+                                    >
+                                      <History size={12} />
+                                      Edited · History
+                                    </button>
+                                  )}
                                   {session.is_payment && session.payment_method && (
                                     <span
                                       className="inline-flex"
@@ -6578,6 +6787,96 @@ export default function GroupDetailPage() {
                     )
                   })()}
                 </>
+
+              {historySessionId !== null && (() => {
+                const historySession = sessions.find((s) => s.id === historySessionId)
+                const nameOf = (id: number | null) => {
+                  const member = members.find((m) => m.user_id === id)
+                  return member ? formatDisplayName(members, member) : 'Former member'
+                }
+
+                // One version per edit: rows arrive newest-first, and every
+                // row written for the same edit shares an edit_id.
+                const versions: Array<{ edit_id: string; created_at: string; editor_user_id: number | null; changes: NonNullable<typeof sessionHistory> }> = []
+                ;(sessionHistory || []).forEach((row) => {
+                  let version = versions.find((v) => v.edit_id === row.edit_id)
+                  if (!version) {
+                    version = { edit_id: row.edit_id, created_at: row.created_at, editor_user_id: row.editor_user_id, changes: [] }
+                    versions.push(version)
+                  }
+                  version.changes.push(row)
+                })
+
+                return (
+                  <div className="modal-overlay" onClick={() => setHistorySessionId(null)}>
+                    <div className="modal-panel max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-start justify-between gap-4 mb-1">
+                        <h3 className="font-display text-xl font-semibold">Version history</h3>
+                        <button
+                          onClick={() => setHistorySessionId(null)}
+                          className="p-1 rounded-md transition-colors text-[var(--text-muted)] hover:text-[var(--text)]"
+                          aria-label="Close version history"
+                        >
+                          <X size={18} />
+                        </button>
+                      </div>
+                      <p className="text-sm mb-5" style={{ color: 'var(--text-muted)' }}>
+                        {historySession?.Description || 'Untitled Session'} · every edit since it was created, newest first. Only the people whose amount changed are listed.
+                      </p>
+
+                      {sessionHistory === null ? (
+                        <div className="space-y-3">
+                          <Skeleton className="h-4 w-40" />
+                          <Skeleton className="h-16 w-full" />
+                        </div>
+                      ) : versions.length === 0 ? (
+                        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No edits recorded.</p>
+                      ) : (
+                        <div className="space-y-5">
+                          {versions.map((version, i) => (
+                            <div key={version.edit_id}>
+                              <div className="flex items-baseline justify-between gap-3 mb-2">
+                                <p className="text-sm font-semibold">
+                                  Edit {versions.length - i} · {nameOf(version.editor_user_id)}
+                                </p>
+                                <p className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+                                  {new Date(version.created_at).toLocaleString()}
+                                </p>
+                              </div>
+                              <div className="rounded-lg border divide-y" style={{ borderColor: 'var(--border)' }}>
+                                {version.changes.map((change) => {
+                                  const member = members.find((m) => m.user_id === change.user_id)
+                                  const displayName = nameOf(change.user_id)
+                                  return (
+                                    <div key={change.id} className="flex items-center justify-between gap-3 px-3 py-2" style={{ borderColor: 'var(--border)' }}>
+                                      <div className="flex items-center gap-2 min-w-0">
+                                        <Avatar url={member?.avatar_url} name={displayName} size={24} />
+                                        <p className="text-sm truncate">
+                                          {displayName}
+                                          {change.user_id === userId && (
+                                            <span className="text-xs ml-1.5" style={{ color: 'var(--text-muted)' }}>(You)</span>
+                                          )}
+                                        </p>
+                                      </div>
+                                      <p className="amount text-sm shrink-0 flex items-center gap-1.5">
+                                        <span style={{ color: 'var(--text-muted)' }}>{formatSignedAmount(change.old_amount)}</span>
+                                        <ArrowRight size={12} style={{ color: 'var(--text-muted)' }} />
+                                        <span className="font-semibold" style={{ color: change.new_amount >= 0 ? 'var(--accent)' : 'var(--negative)' }}>
+                                          {formatSignedAmount(change.new_amount)}
+                                        </span>
+                                      </p>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })()}
 
               {confirmCancelSessionId !== null && (
                 <div className="modal-overlay">

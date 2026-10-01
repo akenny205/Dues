@@ -132,6 +132,18 @@ export const mockSessionEditApprovals = [
   { id: 5010, created_at: daysAgo(1), session_id: 108, editor_user_id: 1, approver_user_id: 4, status: 'pending', old_amount: -6, new_amount: -10, is_deletion: false, dismissed_at: null, auto_approved: false, rejection_reason: null },
 ]
 
+// Applied edits (see the SessionEditHistory migration) — version history,
+// plus an alert for anyone the edit landed on without them reviewing it.
+export const mockSessionEditHistory: Array<{ id: number; created_at: string; session_id: number; edit_id: string; editor_user_id: number | null; user_id: number; old_amount: number; new_amount: number; dismissed_at: string | null }> = [
+  // 101 — Jordan first logged the Costco run as $160, then corrected it to
+  // $180 two days later. Your (Alex's) share auto-approved, so you were
+  // never asked — it's sitting in Notifications as an undismissed alert.
+  { id: 7001, created_at: daysAgo(10), session_id: 101, edit_id: 'demo-edit-101-1', editor_user_id: 2, user_id: 2, old_amount: 120, new_amount: 135, dismissed_at: daysAgo(10) },
+  { id: 7002, created_at: daysAgo(10), session_id: 101, edit_id: 'demo-edit-101-1', editor_user_id: 2, user_id: 1, old_amount: -40, new_amount: -45, dismissed_at: null },
+  { id: 7003, created_at: daysAgo(10), session_id: 101, edit_id: 'demo-edit-101-1', editor_user_id: 2, user_id: 3, old_amount: -40, new_amount: -45, dismissed_at: null },
+  { id: 7004, created_at: daysAgo(10), session_id: 101, edit_id: 'demo-edit-101-1', editor_user_id: 2, user_id: 4, old_amount: -40, new_amount: -45, dismissed_at: null },
+]
+
 // Auto-increment counters, seeded past the highest id already in use above.
 export const mockNextId: Record<string, number> = {
   User: 8,
@@ -139,6 +151,7 @@ export const mockNextId: Record<string, number> = {
   Session: 301,
   SessionPayment: 3001,
   SessionEditApproval: 6001,
+  SessionEditHistory: 8001,
   JoinRequest: 2,
   Invite: 1,
 }

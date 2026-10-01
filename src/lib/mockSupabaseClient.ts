@@ -12,6 +12,7 @@ import {
   mockJoinRequests,
   mockNextId,
   mockSessionEditApprovals,
+  mockSessionEditHistory,
   mockSessionPayments,
   mockSessions,
   mockUsers,
@@ -26,6 +27,7 @@ const tables: Record<string, Row[]> = {
   Session: mockSessions,
   SessionPayment: mockSessionPayments,
   SessionEditApproval: mockSessionEditApprovals,
+  SessionEditHistory: mockSessionEditHistory,
   JoinRequest: mockJoinRequests,
   Invite: mockInvites,
 }
@@ -48,7 +50,7 @@ function matchesFilters(row: Row, filters: Filter[]) {
 function attachEmbeds(table: string, select: string | undefined, row: Row): Row {
   if (!select) return row
   const out = { ...row }
-  if (table === 'SessionEditApproval' && select.includes('Session!inner')) {
+  if ((table === 'SessionEditApproval' || table === 'SessionEditHistory') && select.includes('Session!inner')) {
     const session = mockSessions.find((s) => s.id === row.session_id)
     if (!session) return null as unknown as Row // inner join: exclude if missing
     out.Session = { id: session.id, Description: session.Description, group_id: session.group_id }
@@ -346,6 +348,47 @@ function rpc(name: string, params: Row) {
       }
       session.notes = params.new_notes
       return { data: null, error: null }
+    }
+    // Mirrors create_session_edit_approvals: each row's status comes from the
+    // *target's* auto_approve_sessions preference, never from the caller.
+    // Seeded users don't carry that column — it defaults to 'all', same as
+    // the real one now does.
+    case 'create_session_edit_approvals': {
+      const caller = mockUsers.find((u) => u.auth_user_id === currentAuthUserId)
+      if (!caller) return { data: null, error: { message: 'Not authenticated' } }
+      const result = (params.p_rows as Row[]).map((row) => {
+        const isLiveClose = !!row.is_live_close
+        let status = 'pending'
+        let autoApproved = false
+        if (row.approver_user_id === caller.id) {
+          status = 'approved'
+        } else {
+          const pref = (mockUsers.find((u) => u.id === row.approver_user_id) as Row | undefined)?.auto_approve_sessions ?? 'all'
+          if (pref === 'all' || (pref === 'live_only' && isLiveClose)) {
+            status = 'approved'
+            autoApproved = true
+          }
+        }
+        const id = mockNextId.SessionEditApproval
+        mockNextId.SessionEditApproval = id + 1
+        ;(mockSessionEditApprovals as Row[]).push({
+          id,
+          created_at: new Date().toISOString(),
+          session_id: params.p_session_id,
+          editor_user_id: caller.id,
+          approver_user_id: row.approver_user_id,
+          status,
+          old_amount: Number(row.old_amount ?? 0),
+          new_amount: Number(row.new_amount ?? 0),
+          is_deletion: !!row.is_deletion,
+          is_live_close: isLiveClose,
+          dismissed_at: null,
+          auto_approved: autoApproved,
+          rejection_reason: null,
+        })
+        return { approver_user_id: row.approver_user_id, status }
+      })
+      return { data: result, error: null }
     }
     default:
       return { data: null, error: { message: `Mock: unknown RPC "${name}"` } }

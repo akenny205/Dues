@@ -56,6 +56,7 @@ interface Session {
   is_payment?: boolean | null
   payment_method?: string | null
   memberCount?: number
+  participantIds?: number[] // Everyone involved, for the avatar stack on the collapsed row (see SessionParticipants)
   totalAmount?: number
   userPayment?: number | null
   pendingApproval?: boolean
@@ -148,6 +149,62 @@ const formatDisplayName = (members: GroupMember[], currentMember: GroupMember): 
   }
 
   return `${capitalizedFirstName} ${lastInitial}.`
+}
+
+// The overlapping avatar stack on a session's collapsed row — who's in it,
+// at a glance, without expanding. There's no measuring of the row's actual
+// free width; instead it caps at 3 on a phone-width screen and 6 from `sm`
+// up, with a "+N" chip standing in for everyone past the cap. The full list
+// of names is always on the stack's tooltip either way.
+const PARTICIPANTS_MAX_NARROW = 3
+const PARTICIPANTS_MAX_WIDE = 6
+const PARTICIPANT_AVATAR_SIZE = 22
+
+function SessionParticipants({ userIds, members, ringColor }: { userIds: number[]; members: GroupMember[]; ringColor: string }) {
+  if (userIds.length === 0) return null
+
+  const people = userIds.map((id) => {
+    const member = members.find((m) => m.user_id === id)
+    // Not in `members` means they've since left the group.
+    return { id, name: member ? formatDisplayName(members, member) : 'Former member', avatar_url: member?.avatar_url }
+  })
+  const names = people.map((p) => p.name).join(', ')
+
+  // A ring in the card's own background color, so each overlapping avatar
+  // reads as a separate circle instead of bleeding into the one under it.
+  const ring = { boxShadow: `0 0 0 2px ${ringColor}` }
+  const overflowChip = (hiddenCount: number, visibility: string) => (
+    <span
+      className={`${visibility} -ml-1 rounded-full items-center justify-center font-semibold shrink-0`}
+      style={{
+        ...ring,
+        minWidth: PARTICIPANT_AVATAR_SIZE,
+        height: PARTICIPANT_AVATAR_SIZE,
+        padding: '0 5px',
+        fontSize: 10,
+        background: 'var(--border)',
+        color: 'var(--text-muted)',
+      }}
+    >
+      +{hiddenCount}
+    </span>
+  )
+
+  return (
+    <div className="flex items-center" title={names} aria-label={`In this session: ${names}`}>
+      {people.slice(0, PARTICIPANTS_MAX_WIDE).map((person, i) => (
+        <span
+          key={person.id}
+          className={`${i >= PARTICIPANTS_MAX_NARROW ? 'hidden sm:inline-flex' : 'inline-flex'} ${i > 0 ? '-ml-1' : ''} rounded-full`}
+          style={ring}
+        >
+          <Avatar url={person.avatar_url} name={person.name} size={PARTICIPANT_AVATAR_SIZE} />
+        </span>
+      ))}
+      {people.length > PARTICIPANTS_MAX_NARROW && overflowChip(people.length - PARTICIPANTS_MAX_NARROW, 'inline-flex sm:hidden')}
+      {people.length > PARTICIPANTS_MAX_WIDE && overflowChip(people.length - PARTICIPANTS_MAX_WIDE, 'hidden sm:inline-flex')}
+    </div>
+  )
 }
 
 // Turns a set of net balances into the smallest possible set of payments that
@@ -1017,12 +1074,37 @@ export default function GroupDetailPage() {
             return {
               ...session,
               memberCount: 0,
+              participantIds: [],
               totalAmount: 0,
               userPayment: null
             }
           }
 
           const memberCount = paymentsData?.length || 0
+
+          // Who to show in the row's avatar stack. Normally that's just
+          // whoever has a SessionPayment — but two kinds of session have none
+          // yet: a proposal still waiting on approval (a new session /
+          // payment / settle up — its amounts only exist as approval rows
+          // until everyone signs off), and a live session that's still open
+          // (line items live in LiveSessionEntry until it closes). Those
+          // fall back to the people named on those rows instead.
+          const participantIds = new Set<number>((paymentsData || []).map((p: any) => p.user_id))
+          if (session.is_live) {
+            const { data: liveEntryRows } = await supabase
+              .from('LiveSessionEntry')
+              .select('target_user_id')
+              .eq('session_id', session.id)
+            ;(liveEntryRows || []).forEach((e: any) => participantIds.add(e.target_user_id))
+          }
+          if (participantIds.size === 0) {
+            const { data: proposalRows } = await supabase
+              .from('SessionEditApproval')
+              .select('approver_user_id')
+              .eq('session_id', session.id)
+              .in('status', ['pending', 'approved'])
+            ;(proposalRows || []).forEach((a: any) => participantIds.add(a.approver_user_id))
+          }
           // Sum of absolute values of amounts
           const totalAmount = (paymentsData || []).reduce((sum: number, payment: any) => {
             return sum + Math.abs(parseFloat(payment.amount?.toString() || '0'))
@@ -1035,6 +1117,7 @@ export default function GroupDetailPage() {
           return {
             ...session,
             memberCount,
+            participantIds: [...participantIds],
             totalAmount,
             userPayment
           }
@@ -5770,6 +5853,11 @@ export default function GroupDetailPage() {
                                       {session.userPayment >= 0 ? '+' : '-'}${Math.abs(session.userPayment).toFixed(2)}
                                     </p>
                                   )}
+                                  <SessionParticipants
+                                    userIds={session.participantIds || []}
+                                    members={members}
+                                    ringColor={session.is_live ? 'var(--accent-soft)' : 'var(--surface)'}
+                                  />
                                   {session.is_payment && session.payment_method && (
                                     <span
                                       className="inline-flex"

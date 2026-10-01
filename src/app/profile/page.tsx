@@ -70,7 +70,7 @@ export default function ProfilePage() {
   const [savingPayment, setSavingPayment] = useState(false)
   const [paymentError, setPaymentError] = useState('')
 
-  const [autoApprove, setAutoApprove] = useState<AutoApproveSessions>('off')
+  const [autoApprove, setAutoApprove] = useState<AutoApproveSessions>('all')
   const [savingApprovals, setSavingApprovals] = useState(false)
 
   const [deletedGroups, setDeletedGroups] = useState<DeletedGroup[]>([])
@@ -107,7 +107,7 @@ export default function ProfilePage() {
       setPaypal(data?.paypal_username || '')
       setZelle(data?.zelle_handle || '')
       setPreferredMethod(data?.preferred_payment_method || '')
-      setAutoApprove((data?.auto_approve_sessions as AutoApproveSessions) || 'off')
+      setAutoApprove((data?.auto_approve_sessions as AutoApproveSessions) || 'all')
       setLoading(false)
     })
     return () => {
@@ -644,15 +644,15 @@ export default function ProfilePage() {
           <p className="eyebrow mb-3">Approvals</p>
           <p className="text-sm mb-4" style={{ color: 'var(--text-muted)' }}>
             By default, anything that changes your balance — a new session, an edit,
-            a payment, a settle up — waits for you to approve it. Auto-approve skips
-            that click for the cases you pick below.
+            a payment, a settle up — is approved for you automatically. Pick below
+            if you&apos;d rather review some or all of those yourself first.
           </p>
           <form onSubmit={handleSaveApprovals} className="space-y-3">
             {(
               [
-                { value: 'off', label: 'Off', description: "Approve everything yourself — the default." },
+                { value: 'all', label: 'All sessions', description: 'Skip approving anything that lands on you — new sessions, edits, payments, settle ups, and deletions included. The default.' },
                 { value: 'live_only', label: 'Live sessions only', description: "Skip approving a live session's final total when it closes. Its total already had to sum to $0.00 before anyone could even propose closing, so there's little left to review. Everything else still waits for you." },
-                { value: 'all', label: 'All sessions', description: 'Skip approving anything that lands on you — new sessions, edits, payments, settle ups, and deletions included. Only turn this on for groups you fully trust.' },
+                { value: 'off', label: 'Off', description: 'Approve everything yourself. Nothing that changes your balance goes through until you click Approve.' },
               ] as { value: AutoApproveSessions; label: string; description: string }[]
             ).map((option) => (
               <label

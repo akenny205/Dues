@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Pings the dues-app dev and prod Supabase projects on a schedule so neither
+  gets paused for inactivity. Deploy with `npm run keepalive:deploy`.
+
+Parameters:
+  DevSupabaseUrl:
+    Type: String
+    Default: https://keqfynzhyyenbadmndps.supabase.co
+  DevSupabaseAnonKey:
+    Type: String
+  ProdSupabaseUrl:
+    Type: String
+    Default: https://oymugzcytglrxglorbvq.supabase.co
+  ProdSupabaseAnonKey:
+    Type: String
+  # Supabase pauses a free project after 7 days without activity, so the
+  # interval has to stay comfortably under that — at 3 days, one missed or
+  # failed run still leaves a second attempt inside the window. A flat
+  # weekly schedule would land right on the limit.
+  PingSchedule:
+    Type: String
+    Default: rate(3 days)
+  # Where the "a ping failed" email goes. AWS sends this address a
+  # confirmation link when the stack is first deployed (or the address
+  # changes) — nothing is delivered until that link is clicked.
+  AlertEmail:
+    Type: String
+
+Resources:
+  KeepAliveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dues-supabase-keepalive
+      Description: Pings the dues-app dev and prod Supabase databases to keep them from pausing.
+      CodeUri: src/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          DEV_SUPABASE_URL: !Ref DevSupabaseUrl
+          DEV_SUPABASE_ANON_KEY: !Ref DevSupabaseAnonKey
+          PROD_SUPABASE_URL: !Ref ProdSupabaseUrl
+          PROD_SUPABASE_ANON_KEY: !Ref ProdSupabaseAnonKey
+      Events:
+        Ping:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref PingSchedule
+            Description: Supabase keep-alive ping for dues-app (dev + prod)
+      # A scheduled run is an async invocation: if the handler throws, Lambda
+      # retries it twice (about 1 and then 2 minutes later) and only then
+      # gives up — at which point the failed invocation, error message
+      # included, is published to the alert topic. So a blip that clears
+      # within a few minutes never sends an email; one that doesn't, does.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref AlertTopic
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: dues-supabase-keepalive-alerts
+      DisplayName: Dues Supabase keep-alive
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  KeepAliveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${KeepAliveFunction}
+      RetentionInDays: 30
+
+Outputs:
+  FunctionName:
+    Value: !Ref KeepAliveFunction

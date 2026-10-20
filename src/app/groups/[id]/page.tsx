@@ -159,8 +159,8 @@ const formatSignedAmount = (amount: number): string => `${amount >= 0 ? '+' : '-
 // The overlapping avatar stack on a session's collapsed row — who's in it,
 // at a glance, without expanding. There's no measuring of the row's actual
 // free width; instead it caps at 3 on a phone-width screen and 6 from `sm`
-// up, with a "+N" chip standing in for everyone past the cap. The full list
-// of names is always on the stack's tooltip either way.
+// up, with a "+N" chip standing in for everyone past the cap. Hovering an
+// avatar shows that person's name; hovering the chip lists who it hides.
 const PARTICIPANTS_MAX_NARROW = 3
 const PARTICIPANTS_MAX_WIDE = 6
 const PARTICIPANT_AVATAR_SIZE = 22
@@ -178,8 +178,9 @@ function SessionParticipants({ userIds, members, ringColor }: { userIds: number[
   // A ring in the card's own background color, so each overlapping avatar
   // reads as a separate circle instead of bleeding into the one under it.
   const ring = { boxShadow: `0 0 0 2px ${ringColor}` }
-  const overflowChip = (hiddenCount: number, visibility: string) => (
+  const overflowChip = (shownCount: number, visibility: string) => (
     <span
+      title={people.slice(shownCount).map((p) => p.name).join(', ')}
       className={`${visibility} -ml-1 rounded-full items-center justify-center font-semibold shrink-0`}
       style={{
         ...ring,
@@ -191,23 +192,24 @@ function SessionParticipants({ userIds, members, ringColor }: { userIds: number[
         color: 'var(--text-muted)',
       }}
     >
-      +{hiddenCount}
+      +{people.length - shownCount}
     </span>
   )
 
   return (
-    <div className="flex items-center" title={names} aria-label={`In this session: ${names}`}>
+    <div className="flex items-center" aria-label={`In this session: ${names}`}>
       {people.slice(0, PARTICIPANTS_MAX_WIDE).map((person, i) => (
         <span
           key={person.id}
+          title={person.name}
           className={`${i >= PARTICIPANTS_MAX_NARROW ? 'hidden sm:inline-flex' : 'inline-flex'} ${i > 0 ? '-ml-1' : ''} rounded-full`}
           style={ring}
         >
           <Avatar url={person.avatar_url} name={person.name} size={PARTICIPANT_AVATAR_SIZE} />
         </span>
       ))}
-      {people.length > PARTICIPANTS_MAX_NARROW && overflowChip(people.length - PARTICIPANTS_MAX_NARROW, 'inline-flex sm:hidden')}
-      {people.length > PARTICIPANTS_MAX_WIDE && overflowChip(people.length - PARTICIPANTS_MAX_WIDE, 'hidden sm:inline-flex')}
+      {people.length > PARTICIPANTS_MAX_NARROW && overflowChip(PARTICIPANTS_MAX_NARROW, 'inline-flex sm:hidden')}
+      {people.length > PARTICIPANTS_MAX_WIDE && overflowChip(PARTICIPANTS_MAX_WIDE, 'hidden sm:inline-flex')}
     </div>
   )
 }

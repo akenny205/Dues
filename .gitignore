@@ -49,3 +49,7 @@ next-env.d.ts
 
 .env.local
 .env
+
+# sam build output for aws/supabase-keepalive
+.aws-sam
+aws/supabase-keepalive/src/node_modules

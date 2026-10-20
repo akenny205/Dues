@@ -1,20 +1,19 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Pings the dues-app dev and prod Supabase projects on a schedule so neither
-  gets paused for inactivity. Deploy with `npm run keepalive:deploy`.
+  Writes to the dues-app dev and prod Supabase databases on a schedule so
+  neither gets paused for inactivity. Deploy with `npm run keepalive:deploy`.
 
 Parameters:
-  DevSupabaseUrl:
+  # Names of the SSM SecureString parameters holding each database's
+  # connection string. scripts/deploy-keepalive.js writes them before
+  # deploying — CloudFormation can't create SecureStrings itself.
+  DevDbUrlParam:
     Type: String
-    Default: https://keqfynzhyyenbadmndps.supabase.co
-  DevSupabaseAnonKey:
+    Default: /dues-app/keepalive/dev-db-url
+  ProdDbUrlParam:
     Type: String
-  ProdSupabaseUrl:
-    Type: String
-    Default: https://oymugzcytglrxglorbvq.supabase.co
-  ProdSupabaseAnonKey:
-    Type: String
+    Default: /dues-app/keepalive/prod-db-url
   # Supabase pauses a free project after 7 days without activity, so the
   # interval has to stay comfortably under that — at 3 days, one missed or
   # failed run still leaves a second attempt inside the window. A flat
@@ -33,7 +32,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: dues-supabase-keepalive
-      Description: Pings the dues-app dev and prod Supabase databases to keep them from pausing.
+      Description: Writes to the dues-app dev and prod Supabase databases to keep them from pausing.
       CodeUri: src/
       Handler: index.handler
       Runtime: nodejs22.x
@@ -42,10 +41,13 @@ Resources:
       Timeout: 60
       Environment:
         Variables:
-          DEV_SUPABASE_URL: !Ref DevSupabaseUrl
-          DEV_SUPABASE_ANON_KEY: !Ref DevSupabaseAnonKey
-          PROD_SUPABASE_URL: !Ref ProdSupabaseUrl
-          PROD_SUPABASE_ANON_KEY: !Ref ProdSupabaseAnonKey
+          DEV_DB_URL_PARAM: !Ref DevDbUrlParam
+          PROD_DB_URL_PARAM: !Ref ProdDbUrlParam
+      # Reading a SecureString encrypted with the default aws/ssm key needs
+      # no KMS permission of its own — only ssm:GetParameter.
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: dues-app/keepalive/*
       Events:
         Ping:
           Type: Schedule

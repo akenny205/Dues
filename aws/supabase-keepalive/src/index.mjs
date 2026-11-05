@@ -8,6 +8,10 @@
 // in Oct 2026 despite being pinged every 3 days. A real write over a real
 // connection is as close to actual usage as it gets.
 //
+// How often matters as much as what: with one write every 3 days, dev was
+// still paused (and prod warned) in late Oct 2026. Supabase wants activity
+// on most days of the week, so the schedule is now every 6 hours.
+//
 // The connection strings (passwords included) live in SSM Parameter Store
 // as SecureStrings, put there by scripts/deploy-keepalive.js — only the
 // parameter names are in the environment. They're the transaction-pooler

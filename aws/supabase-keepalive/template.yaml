@@ -14,13 +14,6 @@ Parameters:
   ProdDbUrlParam:
     Type: String
     Default: /dues-app/keepalive/prod-db-url
-  # Supabase pauses a free project after 7 days without activity, so the
-  # interval has to stay comfortably under that — at 3 days, one missed or
-  # failed run still leaves a second attempt inside the window. A flat
-  # weekly schedule would land right on the limit.
-  PingSchedule:
-    Type: String
-    Default: rate(3 days)
   # Where the "a ping failed" email goes. AWS sends this address a
   # confirmation link when the stack is first deployed (or the address
   # changes) — nothing is delivered until that link is clicked.
@@ -52,7 +45,15 @@ Resources:
         Ping:
           Type: Schedule
           Properties:
-            Schedule: !Ref PingSchedule
+            # Supabase pauses a free project that hasn't seen "sufficient
+            # activity" over the past 7 days, and its docs put that as "a few
+            # user requests to the database each day" — a single write every
+            # 3 days wasn't enough: both projects were paused in Oct 2026 with
+            # every run succeeding. So this pings several times a day.
+            # (Set here rather than as a stack parameter: `sam deploy` keeps a
+            # parameter's previous value on update, so changing its Default
+            # silently does nothing.)
+            Schedule: rate(6 hours)
             Description: Supabase keep-alive ping for dues-app (dev + prod)
       # A scheduled run is an async invocation: if the handler throws, Lambda
       # retries it twice (about 1 and then 2 minutes later) and only then
